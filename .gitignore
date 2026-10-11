@@ -1,0 +1,5 @@
+.build/
+__pycache__/
+*.o
+emb/real_data.bin
+emb/real_texts.json

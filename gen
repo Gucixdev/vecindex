@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# gen - regenerate q2.c / q4.c / q5.c from q1.c, the template.
+#
+# q1.c is the single source of truth for the bit-packed scalar
+# quantizer: calibration, packing, per-query LUT, the two search
+# scores, the *_into scratch forms, the cascade primitives, the qn2 /
+# l2_lambda machinery. q2/q4/q5 differ only in LEVELS / BITS / DPB and
+# the demo's self-retrieval bar, so they are pure sed derivations - not
+# separate code to keep in sync by hand. (q3.c is radix-3 and is NOT
+# generated; it is maintained field-for-field against this template.)
+#
+#   ./gen           rewrite q2.c q4.c q5.c
+#   ./gen --check    exit non-zero if any is stale vs q1.c (used by ./run)
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+emit() {   # U L LEVELS BITS DPB DESC THRESHOLD
+    local U=$1 L=$2 LV=$3 BITS=$4 DPB=$5 DESC=$6 THR=$7
+    sed -e "s/Q1_/${U}_/g" \
+        -e "s/q1_/${L}_/g" \
+        -e "s/q1d_/${L}d_/g" \
+        -e "s/Q1Index/${U}Index/g" \
+        -e "s/#define ${U}_LEVELS 2\$/#define ${U}_LEVELS ${LV}/" \
+        -e "s/#define ${U}_BITS   1\$/#define ${U}_BITS   ${BITS}/" \
+        -e "s|#define ${U}_DPB    8 .*|#define ${U}_DPB    ${DPB}|" \
+        -e "s|^/\\* q1\\.c - 1-bit (binary, 2-level).*|/* ${L}.c - ${DESC} quantized flat vector index, one file.|" \
+        -e "s/print_cstr(\"q1  dim=\")/print_cstr(\"${L}  dim=\")/" \
+        -e "s|return (hit1 \\* 100 / n >= 90)|return (hit1 * 100 / n >= ${THR})|" \
+        q1.c
+}
+
+declare -a SPEC=(
+    "Q2 q2 4   2 4 '2-bit (4-level)'                     92"
+    "Q4 q4 16  4 2 '4-bit (16-level)'                    95"
+    "Q5 q5 256 8 1 '8-bit (256-level, near-lossless)'    95"
+)
+
+check=0
+[[ "${1:-}" == "--check" ]] && check=1
+
+rc=0
+for line in "${SPEC[@]}"; do
+    eval "set -- $line"
+    U=$1 L=$2
+    if (( check )); then
+        if ! diff -q <(emit "$@") "$L.c" >/dev/null 2>&1; then
+            echo "gen: $L.c is STALE vs q1.c - run ./gen" >&2
+            rc=1
+        fi
+    else
+        emit "$@" > "$L.c"
+        echo "gen: wrote $L.c"
+    fi
+done
+exit $rc

@@ -1,0 +1,8 @@
+# generated benchmark data - rebuild with real_gen.py (needs a venv with
+# transformers + datasets + torch). ~77 MB, not committed. real_texts.json
+# (real_texts.py) is the same idea one level up: the raw corpus/query text
+# real_gen.py itself never saved, needed by eval_rerank.py - ~21 MB, also
+# just rebuild it, don't commit it.
+*.bin
+*.out
+*.json

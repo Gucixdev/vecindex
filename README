@@ -1,0 +1,399 @@
+vecindex
+========
+
+Compact quantized vector index for approximate nearest-neighbour search.
+Single-file C89, zero libc in the core (own sqrt / sort / rng), every
+allocation in one caller-supplied Arena - there is no free, you drop the
+arena.
+
+Self-contained: the five project base headers it needs are vendored here
+(base.h, contracts.h, arena_alloc.h, print.h, fine_grained.h), so the
+whole thing builds with `-I.` and nothing else. store.c / bench.c / cmp.c
+pull <stdio.h> as consumer layers.
+
+Ported from the Rust vecindex (which was itself ported from this
+project's earlier, since-deleted C reference). The Rust port kept only
+the ternary scheme; this brings the full 1/2/3/4/8-bit family back, the
+adaptive engine, and store.c - a RAG-shaped layer (doc ids, incremental
+add/delete, persistence) over the index kernel.
+
+
+the files
+---------
+
+Each qN.c is standalone: its own calibration, packing, per-query LUT
+scoring and brute-force top-k. No shared header. Build any one alone.
+
+  q1.c    2 levels    1    bit/dim    binary
+  q3.c    3 levels    1.585          ternary / BitNet b1.58 (radix-3, 5 dims/byte)
+  q2.c    4 levels    2
+  q4.c   16 levels    4
+  q5.c  256 levels    8              near-lossless 8-bit scalar
+
+  qmix.c   per-dimension mixed depth: variance-ranks the dims and gives
+           the top 25% 4 bits, the next 40% 2 bits, the bottom 35% 1 bit
+           (~2.15 bits/dim avg). Three real q4/q2/q1 sub-indexes over
+           disjoint permuted dim slabs, LUT gathers summed. On a corpus
+           with concentrated variance it lands recall a uniform 2-bit
+           quantiser needs far more bytes for (demo: 90% vs q2's 68% at
+           ~equal size). Composition only - #includes q1/q2/q4.c.
+
+  q4fs.c   FAISS 4-bit fast-scan. Wraps a built Q4Index: transposes 32
+           codes' nibbles so one _mm256_shuffle_epi8 (pshufb) does 32
+           LUT lookups, accumulates u16, shortlists, then re-ranks the
+           shortlist on q4's exact f32 LUT - so recall is identical to
+           q4 and the scan is ~12x faster on wide dims (demo: 3400 ->
+           285 us/q at dim=384, n=20000, top-10 agreement 100%).
+
+  ivf.c      coarse k-means router + CSR inverted lists. Turns the O(n)
+             fine-quantizer scan into O(routed subset). The plain
+             nearest-centroid ranking (ivf_route) is the fallback router.
+
+  hnsw.c     HNSW graph over the IVF centroids, squared-L2. engine uses
+             it as the cell selector: greedy graph descent picks the
+             nprobe cells instead of a full nearest-centroid scan, so
+             routing stays sub-linear when there are many cells (which is
+             what lets the coarse quantizer use a finer grid, the real
+             lever on the nprobe>1 recall plateau). Built on ~sqrt(n)
+             nodes, seeded/deterministic (engine rebuilds it on .vxi load
+             rather than serialising the adjacency). No libc.
+
+  engine.c   the adaptive layer. Measures, against an exact-f32 recall@k
+             probe on a corpus sample, every candidate and keeps the one
+             meeting the goal (ENG_MIN_SIZE smallest code >= target, or
+             ENG_MAX_ACC best recall within a byte budget):
+               - 6 flat quantizers (q1-q5 + qmix)
+               - IVF x each, at the coarse nprobe set {1,4,16}
+               - ENG_HNSW: an exact-f32 HNSW graph over the unit-norm
+                 vectors (dim*4 B/vec) - built only when it could win
+                 (a MIN_SIZE target no quantiser reached, or a MAX_ACC
+                 budget admitting f32)
+             It also measures the IVF cell count (sqrt(n) vs 4*sqrt(n),
+             q4-probed on a probe half + held-out half, the finer grid
+             adopted only past the probe noise and with no held-out
+             regression) and builds an hnsw.c graph router when nc >= 48.
+             Post-selection it (a) refines nprobe over {1,2,4,8,16,32} -
+             smallest that saturates recall, capped by goal.max_candidates
+             (a machine-independent query-cost budget); (b) retunes the
+             IVF L2 term-3 blend (l2_lambda) under the same probe/held-out
+             test; (c) swaps a chosen q4 for q4fs once the index is large
+             enough. All adopt-decisions use a binomial-noise margin, not
+             a fixed constant. #includes ivf.c + hnsw.c + q1..q5.c +
+             qmix.c + q4fs.c.
+
+  store.c    RAG-shaped wrapper over engine.c: your doc ids on results,
+             incremental add / delete (tombstone), i64 metadata tag +
+             filtered search, a pending tail scanned exactly until the
+             next build, NaN/Inf-vector rejection, a writer-preferring
+             rwlock (concurrent store_search), a ping-pong data arena
+             (rebuilds/growth do not accumulate), and .vxi save/load that
+             serialises the built index so load is O(file) not O(rebuild).
+             <stdio.h> + <pthread.h>, 16 GiB arena reservation.
+             .vxi is explicit little-endian (engine block v3 'VGX3', store
+             wrapper v3 'VIX3'): scalars written as typed i32/i64/f32,
+             never raw structs; a big-endian host byte-swaps on I/O.
+             Each fine code carries two f32 side values now - the true
+             residual norm and the reconstruction norm qn2 (v3 bump).
+
+  bench.c    timings, next to the Rust port's criterion numbers.
+  cmp.c      head-to-head on a fixed dataset (turbovec, Rust, this).
+  stress.c   long churn vs a brute-force f32 oracle on an EMBEDDING-
+             REALISTIC corpus (anisotropic per-cluster covariance, fat
+             per-dim tail, unit norm) - recall@10 ~98% there; plus edge
+             cases, 8 concurrent readers against a churning writer, the
+             metadata filter, .vxi round-trip, determinism. `./run stress`.
+  gen        regenerates q2/q4/q5 from q1.c (the template) by sed;
+             `./gen --check` fails if they have drifted, and `run` calls
+             it on every build.
+  run        build (-Werror, only if stale) + run every self-test.
+
+
+calibration
+-----------
+
+Equal-POPULATION per dimension: bucket boundaries are the empirical
+l/LEVELS residual percentiles, each codebook value is the real mean of
+that bucket's own members - a 1-D Lloyd-Max scalar quantizer, not a
+fixed +-3-sigma range cut into equal-width slices. On near-Gaussian
+residuals equal-width buckets let the middle one swallow the common
+case and waste resolution on outliers.
+
+FLAT (qN_build): one calibration against the whole dataset's mean. Good
+on diffuse data; collapses on genuinely clustered data (embeddings),
+where the 3 levels get spent on "which cluster" instead of "where
+within it" - measured here as flat recall@10 ~10% on a 15-topic corpus.
+
+IVF (engine, per cluster): qN_build_cluster calibrates each coarse
+cluster's members against that cluster's own centroid. Same corpus,
+recall@10 recovers to ~90%+.
+
+
+scoring
+-------
+
+qN_search    - cosine-style similarity of (query-centroid) vs
+               (vector-centroid) residuals via the LUT. Valid only when
+               every candidate shares one centroid (the flat scheme).
+
+qN_search_l2 - the IVFPQ squared-L2 estimate
+                 ||q-c||^2 - 2*(q-c).(v-c) + ||v-c||^2
+               returned as -dist^2. Comparable ACROSS clusters
+               calibrated against different centroids, so it is what the
+               engine's multi-cluster merge uses. (Ported bug fix: the
+               cosine score is not cross-cluster comparable - recall
+               dropped as nprobe rose, impossible for a correct merge.)
+
+
+api
+---
+
+  QNIndex *qN_build         (Arena*, const f32 *vecs, i32 n, i32 dim);
+  QNIndex *qN_build_cluster (Arena*, const f32 *vecs, const i64 *ids,
+                             i32 n_ids, i32 dim, const f32 *centroid);
+  i32      qN_search        (const QNIndex*, const f32 *q, i32 k,
+                             i64 *out_ids, f32 *out_scores);   /* -> count */
+  i32      qN_search_l2     (const QNIndex*, ... same ... );
+  void     qN_encode        (const QNIndex*, const f32 *v, u8 *row, f32 *rnorm);
+  i32      qN_code_bytes     (i32 dim);
+
+  Ivf *ivf_train  (Arena*, const f32 *vecs, i32 n, i32 dim,
+                   i32 n_clusters, i32 n_iters, u32 seed);
+  void ivf_assign_full (Ivf*, const f32 *full_vecs, i32 full_n);
+  i32  ivf_route  (const Ivf*, const f32 *q, i32 nprobe, i32 *out_clusters);
+  const i64 *ivf_members (const Ivf*, i32 cluster, i32 *out_count);
+  i32  ivf_suggest_clusters (i32 n);          /* round(sqrt(n)) */
+
+  EngIndex *engine_build  (Arena*, const f32 *vecs, i32 n, i32 dim, EngGoal);
+  i32       engine_search (const EngIndex*, const f32 *q, i32 k,
+                           i64 *out_ids, f32 *out_scores);
+
+  EngGoal { mode: ENG_MIN_SIZE | ENG_MAX_ACC;
+            k;                  recall@k to optimise (default 10)
+            target_recall;      ENG_MIN_SIZE: smallest code that reaches it
+            max_code_bytes;     ENG_MAX_ACC:  best recall that fits
+            max_candidates;     IVF nprobe cap: <= this many vectors/query
+            eval_q, n_eval_q;   representative QUERIES to tune against
+                                (asymmetric workloads); NULL -> corpus rows
+            eval_queries;       recall-probe sample (default 96)
+            n_iters; seed; }    IVF Lloyd rounds / seed (default 12 / 0x5eed)
+
+  RagStore *store_new     (Arena*, i32 dim);
+  void      store_add     (RagStore*, const f32 *vec, i64 doc_id);
+  void      store_add_batch(RagStore*, const f32*, const i64*, i32 m);
+  i32       store_delete  (RagStore*, i64 doc_id);   /* -> rows tombstoned */
+  void      store_build   (RagStore*);               /* compact + rebuild  */
+  i32       store_search  (RagStore*, const f32 *q, i32 k,
+                           i64 *out_doc_ids, f32 *out_scores);
+  i32       store_save    (RagStore*, const char *path);
+  RagStore *store_load    (Arena*, const char *path);
+  i32       store_count / store_pending (const RagStore*);
+
+Store notes: vectors are unit-normalised on add (cosine). Rows added
+after the last store_build are a "pending tail" scanned exactly on every
+query and merged with the index result (same -||q-v||^2 scale) - call
+store_build to fold them in and drop tombstones. The index lives in its
+own arena, reset per build, so rebuilds do not accumulate; the raw
+vectors do (geometric growth, <2x live). store_save writes the compacted
+vectors + doc ids + build goal; store_load rebuilds the index (derived).
+
+
+building
+--------
+
+  ./run              # everything, -Werror, self-tests must pass
+  ./run bench        # + timings
+
+  gcc -std=c89 -pedantic -Wall -Wextra -D_POSIX_C_SOURCE=200112L -O2 \
+      -I. q3.c -DQ3_DEMO -lm -o q3 && ./q3      # one quantizer alone
+
+Threaded batch: build the engine consumer (or cmp.c) with
+`-DENGINE_THREADS -lpthread`. It enables engine_search_batch() +
+engine_search_into(); without the flag only the single-thread
+engine_search() is compiled. engine_search_batch allocates
+nq * (dim + code_bytes*256) f32 of transient scratch on the arena, so
+very large batches (nq in the thousands at dim ~400) should be chunked.
+
+Types follow base.h: i8..i64 / u8..u64 / f32 / f64, size_t for indexing,
+zero libc in the seven core files (print.h only under *_DEMO,
+pthread via fine_grained.h only under -DENGINE_THREADS).
+
+
+measured (gcc -O2, one thread; see bench.c)
+-------------------------------------------
+
+flat encode, dim=384          q1 580ns  q3 1.9us  q2 3.3us  q4 4.5us  q5 22us
+  (Rust ternary_encode_one_vector_dim384 ~1.34us - LLVM vectorises the
+   pack loop better; ~1.5x, closeable with SIMD intrinsics)
+
+engine build, clustered dim=128, measures 20 configs:
+  n=5000   ~0.8 s     n=20000  ~4.3 s
+  (Rust VecIndex build is ONE ternary config: 0.38 s / 2.9 s)
+
+engine query (IVF+q4, nprobe=16):  ~0.9 ms
+  (Rust VecIndex search nprobe=16: 0.67 ms - same recall tier, ~1.3x)
+
+
+head-to-head, identical dataset (cmp.c, -DENGINE_THREADS)
+-------------------------------------------------------
+
+dim=384, n=100000, 200 queries, clustered (200 blobs, within-std 0.15),
+cosine ground-truth. Same .bin fed to all three. 12-core box.
+
+                        build     us/query        recall@10   code
+  --- this, IVF path (-march=native -DENGINE_THREADS; subsample-trained;
+      1T = single-thread, 12T = pool of 12) ---
+  IVF+q3  nprobe 1     5.9 s   1T 114 / 12T  30     50%          77 B
+  IVF+q3  nprobe 8     5.9 s   1T 1051 / 12T 183     54%          77 B
+  IVF+q3  nprobe 24    5.9 s   1T 2198 / 12T 372     54%          77 B
+  IVF+q4  nprobe 1     6.0 s   1T 163 / 12T  59     68%         192 B
+  IVF+q4  nprobe 8     6.0 s   1T 1999 / 12T 373     74%         192 B
+  IVF+q4  nprobe 24    6.0 s   1T 3896 / 12T 745     74%         192 B
+  --- Rust vecindex VecIndex (IVF k-means on all 100k + per-cluster ternary) ---
+  nprobe 1            119 s          274           50%          81 B
+  nprobe 8            119 s         1704           56%          81 B
+  nprobe 24           119 s         3662           56%          81 B
+  --- turbovec 0.8.0 TurboQuantIndex (flat, tuned C, multithreaded) ---
+  bit_width 2          1.0 s          79           13%           96 B
+  bit_width 3          1.1 s         162           14%          144 B
+  bit_width 4          1.3 s         151           14%          192 B
+  --- this, flat q2/q3/q4 (naive single-thread LUT scan) ---
+  flat q3              2.8 s        6621            8%           77 B
+  flat q4              3.1 s       18400           13%          192 B
+
+vs Rust (a port of its algorithm):
+  query   ~9x faster threaded (183 vs 1704 us at np=8; 372 vs 3662 at
+          np=24), ~1.6x faster even single-thread (LUT-build restructure
+          + AVX2 + gcc)
+  build   ~20x faster (6 vs 119 s; subsample-train + AVX2 k-means)
+  recall  parity, within 2 points (same algorithm)
+
+vs turbovec:
+  turbovec has NO IVF, so on clustered / embedding data it is stuck at
+  ~14% recall@10 at any speed. This engine, same 192 B code size:
+    - IVF+q3 np=1  -> 30 us/query (5.4x FASTER than turbovec bw3's 162)
+      at 50% recall (3.6x turbovec), 77 B (1.9x smaller)
+    - IVF+q4 np=1  -> 59 us/query (2.6x faster than bw4's 151) at 68%
+      recall (4.9x turbovec), same 192 B
+    - IVF+q3 np=8  -> 183 us (parity, +13%) at 54% recall (3.9x)
+  There is no operating point on this data where turbovec wins now.
+  (Flat-vs-flat on DIFFUSE data turbovec's tuned parallel scan still
+  wins raw throughput - that is its niche, not clustered embeddings.)
+
+
+known limitations
+-----------------
+
+- nprobe>1 recall: the IVF plateau is largely ROUTING-bound (the true
+  neighbours are often not in any probed cell), not a scoring-scale
+  problem. The levers, all now measured per corpus:
+  * cross-cluster L2 term-3: each code stores the true residual norm
+    ||v-c||^2 AND the reconstruction norm ||vhat-c||^2 (qn2); the
+    per-index l2_lambda blends them, swept for the chosen IVF config on a
+    probe half + a held-out half, adopted only past the binomial noise
+    and with no held-out regression. lambda=1 keeps winning on tested
+    corpora - the term-3 scale was not the bottleneck.
+  * cell count: sqrt(n) vs 4*sqrt(n), same held-out test. Tightly
+    clustered synthetics keep sqrt(n); a 5k/40-topic synthetic and real
+    MiniLM adopt the finer grid for ~1-2 recall points AND lower latency.
+  * nprobe: refined over {1,2,4,8,16,32} to the smallest that saturates
+    recall (halves query time at equal recall on the bench corpus), and
+    hard-capped by goal.max_candidates.
+  * ENG_HNSW topology: an exact-f32 graph over the vectors, selected when
+    a MIN_SIZE target exceeds every quantiser (demo: 97% target -> 99%
+    recall@10) or a MAX_ACC budget admits dim*4 B/vec.
+  The graph router itself is recall-neutral vs a full nearest-centroid
+  scan at equal nc - it makes the many-cell / high-nprobe options cheap.
+- tuning is only as representative as its probe set. By default the
+  probe uses corpus rows as queries; for an ASYMMETRIC workload (RAG:
+  questions retrieving passages) that is optimistic - on the SQuAD
+  benchmark a corpus-row probe picks flat q2 at a real 80%, a real-
+  question probe (goal.eval_q) picks IVF+q4fs at 92%. Pass eval_q for
+  those.
+- engine_build cost: measures ~20 configs plus a 2-way cell-count bake-off
+  (cheap challenger, q4 clusters reused into the sweep) and a lazy
+  ENG_HNSW build; ~3 s for 20k x dim128 vs the Rust port's ~2.9 s single
+  config, ~30 s per goal on the 49k x dim384 real set. IVF Lloyd is
+  bounded (min(n, max(40*nc, 25000)), <= 50000).
+- SIMD: vsimd.h gives AVX2+FMA vs_sqdist / vs_sub_normsq / vs_dot /
+  vs_lut_gather_dot (scalar fallback). Needs -march=native (or -mavx2
+  -mfma); `run` passes it. The q4 LUT scan additionally has the full
+  pshufb fast-scan path in q4fs.c (see below).
+- q5's per-dim level lookup is a binary search over its 255 bounds
+  (linear for q1-q4, where the branch predictor wins).
+- ENG_CASCADE (engine_build_cascade): lo quantizes v, hi quantizes the
+  reconstruction residual; search does a lo shortlist + lo+hi rerank.
+  Beats a single flat scheme per byte on DIFFUSE data (measured: q1+q2
+  36 B -> recall@10 74% vs flat q2 24 B -> 68%). Not batched (uses the
+  arena internally), and it leaves an n*dim*4 residual slab on the arena
+  for the index's life - use IVF for large / clustered corpora.
+- Per-dim mixed depth: DONE, qmix.c (ENG_QMIX in the sweep). Composed
+  from q4/q2/q1 sub-indexes over variance-ranked disjoint dim slabs; a
+  transient column slab is malloc/free'd so nothing is left on the arena
+  (unlike ENG_CASCADE). engine picks it only when it measures better.
+- 4-bit pshufb fast-scan: DONE, q4fs.c (ENG_Q4FS). Not a sweep
+  candidate - a post-selection swap-in for a chosen q4 once the index
+  has >= ENG_Q4FS_MIN (2048) rows. Quantised u16 shortlist + exact f32
+  rerank of the shortlist, so recall equals the plain q4 build; ~12x
+  faster scan at dim 384. Serialises as its wrapped Q4Index (the
+  transpose is rebuilt on load).
+- graph coarse router: DONE, hnsw.c (see "the files"). Full HNSW over
+  the vectors: DONE, ENG_HNSW topology, .vxi stores the unit-norm
+  vectors + seed and rebuilds the graph on load.
+- q2/q4/q5 are sed-derived from q1.c by `./gen`; `./gen --check` (run on
+  every build) fails the build if they drift. q3.c (radix-3) is the one
+  hand-maintained sibling and is checked against q1.c field-for-field
+  by eye - the two-search-score / qn2 / l2_lambda edits were applied to
+  both.
+- store.c now covers doc-id mapping, incremental add, delete, a pending
+  tail, i64 metadata filtering (over-fetch 4x + an exact filtered
+  fallback scan when a selective mask empties the IVFPQ neighbourhood),
+  NaN/Inf rejection, concurrent readers (writer-preferring rwlock,
+  arena-free search path), a ping-pong data arena, and .vxi persistence
+  that serialises centroids + CSR + per-cluster codes so store_load is
+  O(file).
+
+
+validation
+----------
+
+- real RAG retrieval: SQuAD Wikipedia passages (18.9k unique) + 30k
+  AG-News snippets = 48.9k real docs, MiniLM-L6-v2 384-dim; 1000 SQuAD
+  questions, the first 200 handed to engine_build as goal.eval_q (real
+  asymmetric tuning), the rest scored. Against exact cosine top-10 and
+  the gold passage (real_val.c):
+    goal          chosen            recall@10   gold@10   us/q   .vxi
+    min >= 85%     IVF q4fs np=32      92.2%      83.1%    2456   identical
+    min >= 95%     ENG_HNSW           99.1%      85.6%     435   identical
+    max <= 96 B    flat q2            80.2%      83.6%    4435   identical
+    max-acc        ENG_HNSW           99.1%      85.6%     425   identical
+    scan <= n/40   IVF q5 np=4        86.0%      76.2%     592   identical
+    store wrapper  (min >= 90%)       97.1%      83.5%    6214    -
+  Tuning on real questions instead of corpus rows is what lifts min>=85%
+  from flat-q2/80% to IVF-q4fs/92% - the eval set must match the query
+  distribution for an asymmetric workload. ENG_HNSW reaches the
+  exact-cosine ceiling (gold@10 85.6 vs the 87.1 oracle) at ~10x the
+  flat brute scan's speed. Every config's .vxi round-trips bit-identical
+  on the 48.9k real vectors.
+- real embeddings (templated): all-MiniLM-L6-v2, 384-dim, 8000 vectors +
+  200 queries, cosine ground truth. engine_build picks flat q3 (77 B/vec,
+  ~20% of f32) at recall@10 = 88-91%; IVF+q4 reaches 94%. .vxi save ->
+  load leaves recall unchanged and top-1 identical on 200/200.
+- qmix on a variance-skewed corpus: recall@10 90% vs a uniform 2-bit
+  quantiser's 68% at ~equal bytes; round-trips through .vxi (top-1
+  identical on 200/200 in the engine self-test).
+- q4fs vs plain q4: dim 384, n 20000 - scan 3400 -> ~285 us/query
+  (~12x), top-10 agreement 100%; round-trips through .vxi.
+- hnsw.c router: on ~sqrt(n) clustered centroids, nearest-1 and
+  recall@10 vs a brute nprobe scan are both 100% (uniform-random points
+  are the curse-of-dimensionality worst case and no graph beats brute
+  there - not the router's operating point). In engine: build is
+  deterministic (same seed -> identical routing) and the .vxi round-trip
+  rebuilds the graph from the loaded centroids to route identically
+  (engine self-test: top-1 load 200/200, rebuild 200/200).
+- ASan + UBSan (-fsanitize=address,undefined -fno-sanitize-recover):
+  every self-test - q1..q5, qmix, q4fs, hnsw, ivf, engine (incl. the
+  serialiser + HNSW router), store, and the threaded stress harness (8
+  concurrent readers vs a churning writer) - runs clean, no leak/OOB/UB.
+- endianness: .vxi is written and read as explicit little-endian, magic
+  + version guarded, scalars as typed i32/i64/f32 (no raw struct
+  writes); a big-endian host byte-swaps on the way in and out.

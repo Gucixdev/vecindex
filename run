@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# vecindex - the bit-packed quantizers (q1-q5 + qmix), the IVF coarse
+# router + HNSW graph router, the 4-bit fast-scan, and the adaptive
+# engine. Builds each *.c self-test (only if its source or a dependency
+# changed) with -Werror and runs it; a non-zero exit fails.
+#   (self-contained: base headers vendored, builds with -I.)
+#   ./run          quantizers + ivf + hnsw + engine self-tests
+#   ./run bench    also build+run bench.c (timings vs the Rust port) and mbench.c (mem.c timings,
+#                  including the mem_consolidate cost-vs-N sweep - takes a couple of minutes)
+#   ./run stress   also build+run stress.c (churn + oracle + edge cases) and mstress.c (mem.c
+#                  churn + real invariant checks, one layer up)
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+CC="${CC:-gcc}"
+CFLAGS=(-std=c89 -pedantic -Wall -Wextra -Werror
+        -D_POSIX_C_SOURCE=200112L -O2 -march=native -I.)
+OUT=.build
+mkdir -p "$OUT"
+
+# q2/q4/q5 are sed-derived from q1.c - fail loudly if they have drifted.
+./gen --check
+
+declare -A MACRO=(
+    [q1]=Q1_DEMO [q2]=Q2_DEMO [q3]=Q3_DEMO [q4]=Q4_DEMO [q5]=Q5_DEMO
+    [qmix]=QMIX_DEMO [q4fs]=Q4FS_DEMO [hnsw]=HNSW_DEMO
+    [ivf]=IVF_DEMO [engine]=ENGINE_DEMO [bench]=BENCH [store]=STORE_DEMO [stress]=STRESS
+    [real_val]=REAL_VAL [hdict]=HDICT_DEMO [lex]=LEX_DEMO [vecdb]=VECDB_DEMO [mem]=MEM_DEMO
+)
+QDEPS=(q1.c q2.c q3.c q4.c q5.c qmix.c q4fs.c vsimd.h)
+
+fail=0
+for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf engine store vecdb mem ${1:+$1}; do
+    bin="$OUT/$name"
+    src="$name.c"
+    deps=("$src")
+    libs=(-lm -lpthread)
+    case $name in
+        qmix)   deps+=(q1.c q2.c q4.c vsimd.h) ;;
+        q4fs)   deps+=(q4.c vsimd.h) ;;
+        hnsw)   deps+=(vsimd.h) ;;
+        engine) deps+=("${QDEPS[@]}" ivf.c hnsw.c vsimd.h) ;;
+        store)  deps+=("${QDEPS[@]}" ivf.c hnsw.c vsimd.h engine.c hdict.c tq.c); libs+=(-lpthread) ;;
+        vecdb)  deps+=("${QDEPS[@]}" ivf.c hnsw.c vsimd.h engine.c store.c hdict.c lex.c tq.c); libs+=(-lpthread) ;;
+        mem)    deps+=("${QDEPS[@]}" ivf.c hnsw.c vsimd.h engine.c store.c hdict.c lex.c tq.c vecdb.c); libs+=(-lpthread) ;;
+        bench)  deps+=("${QDEPS[@]}" ivf.c hnsw.c engine.c) ;;
+        stress) deps+=("${QDEPS[@]}" ivf.c hnsw.c vsimd.h engine.c store.c hdict.c tq.c); libs+=(-lpthread) ;;
+        real_val) deps+=("${QDEPS[@]}" ivf.c hnsw.c engine.c store.c); libs+=(-lpthread)
+                  # needs the real corpus - skip cleanly if it is absent
+                  [[ -f emb/real_data.bin ]] || { echo "real_val: emb/real_data.bin absent (run emb/real_gen.py) - skipped"; continue; } ;;
+    esac
+    extra=()
+    [[ $name == engine ]] && extra=(-DENGINE_SERIALIZE)   # exercise the .vxi round-trip in-demo
+    stale=0
+    [[ -x $bin ]] || stale=1
+    for d in "${deps[@]}"; do [[ $d -nt $bin ]] && stale=1; done
+    (( stale )) && "$CC" "${CFLAGS[@]}" "$src" "-D${MACRO[$name]}" "${extra[@]}" "${libs[@]}" -o "$bin"
+    runargs=()
+    [[ $name == real_val ]] && runargs=(emb)
+    if ! "./$bin" "${runargs[@]}"; then echo "  ^ $name FAILED"; fail=1; fi
+    echo
+done
+
+# ---- vecdb command line, end to end (built-in embedder, no model server) ----
+echo "vecdb cli end-to-end"
+cli="$OUT/vecdb_cli"
+"$CC" "${CFLAGS[@]}" vecdb.c -DVECDB_CLI -lm -lpthread -o "$cli" || fail=1
+T=$(mktemp -d)
+mkdir "$T/notes"
+printf 'Physics of light. See [[Quantum]] and [[Optics]]. #physics\n' > "$T/notes/light.md"
+printf 'Quantum mechanics and entanglement. Links: [[Light]]. #physics/quantum\n' > "$T/notes/quantum.md"
+printf 'Cooking pasta with tomato. #food\n' > "$T/notes/pasta.md"
+step() { local want="$1"; shift; local out; out=$("$@" 2>&1 || true); if grep -q -- "$want" <<<"$out"; then echo "  ok   $want"; else echo "  FAIL expected '$want' from: $*"; echo "$out" | head -5; fail=1; fi; }
+DB="$T/x.vdb"
+step "3 notes" "$cli" "$DB" index "$T/notes"
+step "quantum.md" "$cli" "$DB" search "entanglement #physics"
+step "light.md" "$cli" "$DB" backlinks quantum
+step "optics" "$cli" "$DB" ghosts
+step "#physics/quantum" "$cli" "$DB" tags
+step "pasta.md" "$cli" "$DB" tag food
+printf 'Cooking risotto.\n' > "$T/notes/pasta.md"; rm "$T/notes/light.md"
+step "1 notes removed" "$cli" "$DB" update "$T/notes"
+step "2 notes" "$cli" "$DB" stats
+step "risotto\|pasta" "$cli" "$DB" search risotto
+step "removed quantum" "$cli" "$DB" remove quantum
+step "1 notes" "$cli" "$DB" stats
+step "not a directory" "$cli" "$DB" index "$T/nope"
+rm -rf "$T"
+
+# ---- random input under the address/undefined-behaviour sanitizers ----
+echo "vecdb fuzz"
+if "$CC" -std=gnu99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -I. vfuzz.c -lm -lpthread -o "$OUT/vfuzz" 2>/dev/null; then
+    "./$OUT/vfuzz" 3000 || { echo "  ^ fuzz FAILED"; fail=1; }
+else
+    echo "  (sanitizers unavailable - skipped)"
+fi
+
+# ---- readers + a writer on one database, under the thread sanitizer ----
+echo "vecdb threads"
+if "$CC" -std=gnu99 -g -O1 -fsanitize=thread -I. vthreads.c -lm -lpthread -o "$OUT/vthreads" 2>/dev/null; then
+    "./$OUT/vthreads" || { echo "  ^ thread test FAILED"; fail=1; }
+else
+    echo "  (thread sanitizer unavailable - skipped)"
+fi
+
+# ---- crash safety: kill -9 a writer at random moments, the database must reload with everything it synced ----
+echo "vecdb crash test"
+"$CC" -std=gnu99 -O2 -march=native -I. vcrash.c -lm -lpthread -o "$OUT/vcrash" && "./$OUT/vcrash" 25 || { echo "  ^ crash test FAILED"; fail=1; }
+
+# ---- crash safety: same, but re-indexing an EXISTING path from scratch (vecdb_new, no load) - the one place a
+# ---- full file replacement happens, so it needs its own generation-suffixed-filename atomicity (VecDB.bodygen) ----
+echo "vecdb crash test 2 (re-index over an existing database)"
+"$CC" -std=gnu99 -O2 -march=native -I. vcrash2.c -lm -lpthread -o "$OUT/vcrash2" && "./$OUT/vcrash2" 20 || { echo "  ^ crash test 2 FAILED"; fail=1; }
+
+# ---- readers + a writer on one Mem (mem.c's own rwlock, one layer above vecdb's), under the thread sanitizer ----
+echo "mem threads"
+if "$CC" -std=gnu99 -g -O1 -fsanitize=thread -I. mthreads.c -lm -lpthread -o "$OUT/mthreads" 2>/dev/null; then
+    "./$OUT/mthreads" || { echo "  ^ mem thread test FAILED"; fail=1; }
+else
+    echo "  (thread sanitizer unavailable - skipped)"
+fi
+
+# ---- crash safety for mem.c's own files (PATH.mem, PATH.mem.cold), same discipline as vcrash.c/vcrash2.c ----
+echo "mem crash test"
+"$CC" -std=gnu99 -O2 -march=native -I. mcrash.c -lm -lpthread -o "$OUT/mcrash" && "./$OUT/mcrash" 20 || { echo "  ^ mem crash test FAILED"; fail=1; }
+
+# ---- optional cross-encoder rerank pass over vecdb's hybrid search (rerank.c + rerank_srv.py) -
+# ---- needs a torch/transformers-capable python3; skips cleanly if none is found, same as real_val ----
+echo "rerank demo"
+"$CC" "${CFLAGS[@]}" rerank.c -DRERANK_DEMO -lm -lpthread -o "$OUT/rerank_demo" && "./$OUT/rerank_demo" || { echo "  ^ rerank demo FAILED"; fail=1; }
+
+# ---- random input against the rule parser/evaluator (mirrors vfuzz.c one layer up) ----
+echo "mem rule parser fuzz"
+if "$CC" -std=gnu99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -I. mrfuzz.c -lm -lpthread -o "$OUT/mrfuzz" 2>/dev/null; then
+    "./$OUT/mrfuzz" 5000 || { echo "  ^ mem rule fuzz FAILED"; fail=1; }
+else
+    echo "  (sanitizers unavailable - skipped)"
+fi
+
+# ---- mem.c timings (mirrors bench.c one layer up): ingest/search/touch/archive/recall/save/load,
+# ---- and the mem_consolidate cost-vs-N sweep that is the one gap README calls out ----
+if [[ "${1:-}" == bench ]]; then
+    echo
+    echo "mem bench"
+    "$CC" -std=gnu99 -O2 -march=native -I. mbench.c -lm -lpthread -o "$OUT/mbench" && "./$OUT/mbench" || { echo "  ^ mem bench FAILED"; fail=1; }
+fi
+
+# ---- mem.c adversarial churn + real invariant checks (mirrors stress.c one layer up) ----
+if [[ "${1:-}" == stress ]]; then
+    echo
+    echo "mem stress"
+    "$CC" "${CFLAGS[@]}" mstress.c -lm -lpthread -o "$OUT/mstress" && "./$OUT/mstress" || { echo "  ^ mem stress FAILED"; fail=1; }
+fi
+
+exit $fail
