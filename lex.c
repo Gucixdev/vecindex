@@ -6,7 +6,9 @@
  *
  *   term dictionary   HStr: term -> term id, so a query word costs one hash
  *                     probe and lands on its posting list directly
- *   postings          per term id, (doc id, term frequency) pairs
+ *   postings          per term id, (doc slot, term frequency) pairs, compressed: slot gaps and tf packed
+ *                     into varints (1-2 bytes a posting), kept inside the 24-byte list header while they
+ *                     fit in 8 bytes - a term seen once or twice costs no allocation at all
  *   BM25              k1 = 1.2, b = 0.75, idf = ln(1 + (N-df+0.5)/(df+0.5)),
  *                     scored term-at-a-time into one accumulator array
  *   H64 doc table     doc id -> slot: add replaces, delete is O(1)
@@ -31,10 +33,45 @@
 #define LEX_MAXTOK 64
 
 typedef struct {
-    i32 *slot;          /* doc slot */
-    i32 *tf;
-    i32  n, cap;
+    u32 n;              /* postings (documents) in the list */
+    u32 len;            /* bytes of encoded postings */
+    u32 last;           /* slot of the last posting: the base of the next gap */
+    u32 cap;            /* bytes at b.p; 0 = the postings sit in b.inl */
+    union { u8 inl[8]; u8 *p; } b;
 } LexPost;
+
+#define LEX_PB(pl) ((pl)->cap ? (pl)->b.p : (pl)->b.inl)
+
+static i32 lex_vput_(u8 *o, u64 v)                  /* LEB128 */
+{
+    i32 n = 0;
+    while (v >= 0x80) { o[n++] = (u8)(v | 0x80); v >>= 7; }
+    o[n++] = (u8)v;
+    return n;
+}
+static u64 lex_vget_(const u8 **q)
+{
+    u64 v = 0;
+    i32 sh = 0;
+    while (**q & 0x80) { v |= (u64)(**q & 0x7f) << sh; sh += 7; ++*q; }
+    v |= (u64)**q << sh; ++*q;
+    return v;
+}
+
+/* walk a list: slot/tf of each posting in order */
+typedef struct { const u8 *q, *e; u32 slot; } LexIt;
+static void lex_it_(const LexPost *pl, LexIt *it) { it->q = LEX_PB(pl); it->e = it->q + pl->len; it->slot = 0; }
+static i32 lex_next_post_(LexIt *it, i32 *slot, i32 *tf)
+{
+    u64 v;
+    if (it->q >= it->e) return 0;
+    v = lex_vget_(&it->q);
+    it->slot += (u32)(v >> 3);
+    *slot = (i32)it->slot;
+    *tf = (i32)(v & 7u);
+    if (*tf == 7) *tf = 7 + (i32)lex_vget_(&it->q);
+    return 1;
+}
 
 typedef struct {
     HStr     terms;
@@ -64,7 +101,7 @@ void lex_init(Lex *x)
 void lex_free(Lex *x)
 {
     i32 t;
-    for (t = 0; t < x->nterms; ++t) { free(x->post[t].slot); free(x->post[t].tf); }
+    for (t = 0; t < x->nterms; ++t) if (x->post[t].cap) free(x->post[t].b.p);
     free(x->acc); free(x->touched);
     free(x->post); free(x->doc_id); free(x->doc_len); free(x->doc_dead);
     hs_free(&x->terms); h64_free(&x->docs);
@@ -148,7 +185,7 @@ static i32 lex_term_id_(Lex *x, const char *t, i32 n, i32 create)
     i32 id = hs_get(&x->terms, t, n);
     if (id >= 0 || !create) return id;
     if (x->nterms == x->tcap) {
-        x->tcap = x->tcap ? x->tcap * 2 : 1024;
+        x->tcap = x->tcap ? x->tcap + x->tcap / 2 : 1024;
         x->post = (LexPost *)realloc(x->post, (size_t)x->tcap * sizeof(LexPost));
     }
     id = x->nterms++;
@@ -159,15 +196,23 @@ static i32 lex_term_id_(Lex *x, const char *t, i32 n, i32 create)
 
 static void lex_post_add_(LexPost *p, i32 slot, i32 tf)
 {
-    if (p->n == p->cap) {
-        p->cap = p->cap ? p->cap * 2 : 4;
-        p->slot = (i32 *)realloc(p->slot, (size_t)p->cap * sizeof(i32));
-        p->tf   = (i32 *)realloc(p->tf,   (size_t)p->cap * sizeof(i32));
+    u8 enc[20];
+    i32 k = lex_vput_(enc, ((u64)((u32)slot - p->last) << 3) | (u64)(tf < 7 ? tf : 7));
+    if (tf >= 7) k += lex_vput_(enc + k, (u64)(tf - 7));
+    if (!p->cap && p->len + (u32)k > sizeof(p->b.inl)) {      /* outgrew the inline bytes */
+        u8 *h = (u8 *)malloc(32);
+        memcpy(h, p->b.inl, p->len);
+        p->b.p = h; p->cap = 32;
+    } else if (p->cap && p->len + (u32)k > p->cap) {
+        p->cap = p->cap + p->cap / 2 + (u32)k;
+        p->b.p = (u8 *)realloc(p->b.p, p->cap);
     }
-    p->slot[p->n] = slot; p->tf[p->n] = tf; ++p->n;
+    memcpy(LEX_PB(p) + p->len, enc, (size_t)k);
+    p->len += (u32)k; p->last = (u32)slot; ++p->n;
 }
 
-/* drop dead slots and renumber: postings, doc arrays, the doc table */
+/* drop dead slots and renumber: postings, doc arrays, the doc table. Gaps only shrink under the renumbering,
+ * so each list is re-encoded in place. */
 static void lex_compact_(Lex *x)
 {
     i32 *remap = (i32 *)malloc((size_t)(x->ndocs ? x->ndocs : 1) * sizeof(i32));
@@ -183,10 +228,21 @@ static void lex_compact_(Lex *x)
     for (s = 0; s < w; ++s) h64_put(&x->docs, x->doc_id[s], s);
     for (t = 0; t < x->nterms; ++t) {
         LexPost *p = &x->post[t];
-        i32 i, k = 0;
-        for (i = 0; i < p->n; ++i)
-            if (remap[p->slot[i]] >= 0) { p->slot[k] = remap[p->slot[i]]; p->tf[k] = p->tf[i]; ++k; }
-        p->n = k;
+        LexIt it;
+        i32 sl, tf;
+        u8 *o = LEX_PB(p);
+        u32 len = 0, last = 0, n = 0;
+        lex_it_(p, &it);
+        while (lex_next_post_(&it, &sl, &tf)) {
+            u8 enc[20];
+            i32 k;
+            if (remap[sl] < 0) continue;
+            k = lex_vput_(enc, ((u64)((u32)remap[sl] - last) << 3) | (u64)(tf < 7 ? tf : 7));
+            if (tf >= 7) k += lex_vput_(enc + k, (u64)(tf - 7));
+            memcpy(o + len, enc, (size_t)k);                       /* never ahead of the reader */
+            len += (u32)k; last = (u32)remap[sl]; ++n;
+        }
+        p->len = len; p->last = last; p->n = n;
     }
     free(remap);
 }
@@ -213,7 +269,7 @@ i32 lex_add(Lex *x, i64 doc_id, const char *text, i32 len)
 
     lex_delete(x, doc_id);
     if (x->ndocs == x->dcap) {
-        x->dcap = x->dcap ? x->dcap * 2 : 256;
+        x->dcap = x->dcap ? x->dcap + x->dcap / 2 : 256;
         x->doc_id   = (i64 *)realloc(x->doc_id,   (size_t)x->dcap * sizeof(i64));
         x->doc_len  = (i32 *)realloc(x->doc_len,  (size_t)x->dcap * sizeof(i32));
         x->doc_dead = (u8  *)realloc(x->doc_dead, (size_t)x->dcap);
@@ -259,16 +315,17 @@ static void lex_acc_term_(const Lex *x, i32 id, f32 *acc, i32 *touched, i32 *nto
     const LexPost *pl = &x->post[id];
     const f64 k1 = 1.2, b = 0.75;
     f64 idf, N = (f64)x->live;
-    i32 df = 0, i;
-    if (x->live == x->ndocs) df = pl->n;                       /* no dead docs: the list length is the df */
-    else for (i = 0; i < pl->n; ++i) if (!x->doc_dead[pl->slot[i]]) ++df;
+    i32 df = 0, s, t;
+    LexIt it;
+    if (x->live == x->ndocs) df = (i32)pl->n;                  /* no dead docs: the list length is the df */
+    else { lex_it_(pl, &it); while (lex_next_post_(&it, &s, &t)) if (!x->doc_dead[s]) ++df; }
     if (df == 0) return;
     idf = log(1.0 + (N - (f64)df + 0.5) / ((f64)df + 0.5));
-    for (i = 0; i < pl->n; ++i) {
-        i32 s = pl->slot[i];
+    lex_it_(pl, &it);
+    while (lex_next_post_(&it, &s, &t)) {
         f64 tf, norm;
         if (x->doc_dead[s]) continue;
-        tf = (f64)pl->tf[i];
+        tf = (f64)t;
         norm = tf + k1 * (1.0 - b + b * (f64)x->doc_len[s] / avgdl);
         if (acc[s] == 0.0f) touched[(*ntouched)++] = s;
         acc[s] += (f32)(idf * tf * (k1 + 1.0) / norm);
@@ -314,9 +371,9 @@ i32 lex_search(const Lex *x, const char *query, i32 qlen, i32 k, i64 *out_ids, f
     /* Terms found in > 1/8 of the documents ("the", "of") add almost nothing (idf ~ 0) yet
      * cost a pass over a huge posting list; skip them whenever a rarer term is present. */
     { i32 rare = 0;
-      for (i = 0; i < nq; ++i) if (x->post[qt[i]].n * 8 <= x->live) { rare = 1; break; }
+      for (i = 0; i < nq; ++i) if ((i64)x->post[qt[i]].n * 8 <= (i64)x->live) { rare = 1; break; }
       for (i = 0; i < nq; ++i) {
-          if (rare && x->post[qt[i]].n * 8 > x->live) continue;
+          if (rare && (i64)x->post[qt[i]].n * 8 > (i64)x->live) continue;
           lex_acc_term_(x, qt[i], acc, touched, &ntouched, avgdl);
       } }
     /* top-k by partial insertion into out_* (k is small) */

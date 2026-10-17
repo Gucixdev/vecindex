@@ -42,11 +42,71 @@
 
 typedef struct { i32 *v; i32 n, cap; } VIVec;
 
-static void vivec_add_(VIVec *a, i32 x)
+/* Small allocations of the graph (link lists, node names) come from big chunks instead of malloc: no per-block
+ * header, no rounding to 32 bytes. Link lists use power-of-two classes with a free list each (a list that grows
+ * hands its old block to the next one); lists past VSLAB_MAXC ints and the chunks themselves are malloc'd. */
+#define VSLAB_MAXC 1024
+#define VSLAB_CHUNK ((size_t)1 << 20)
+typedef struct { i32 *free_[11]; char **chunk; i32 nchunk, ccap; char *cur; size_t left; } VSlab;
+
+static void *vslab_raw_(VSlab *s, size_t bytes)
+{
+    void *p;
+    bytes = (bytes + 7u) & ~(size_t)7u;
+    if (bytes > s->left) {
+        size_t sz = bytes > VSLAB_CHUNK ? bytes : VSLAB_CHUNK;
+        if (s->nchunk == s->ccap) { s->ccap = s->ccap ? s->ccap * 2 : 64; s->chunk = (char **)realloc(s->chunk, (size_t)s->ccap * sizeof(char *)); }
+        s->chunk[s->nchunk++] = s->cur = (char *)malloc(sz);
+        s->left = sz;
+    }
+    p = s->cur; s->cur += bytes; s->left -= bytes;
+    return p;
+}
+
+static i32 vslab_cls_(i32 cap) { i32 c = 0; while ((2 << c) < cap) ++c; return c; }   /* cap = 2 << class */
+
+static i32 *vslab_get_(VSlab *s, i32 cap)
+{
+    i32 c = vslab_cls_(cap), *p = s->free_[c];
+    if (p) { memcpy(&s->free_[c], p, sizeof(i32 *)); return p; }
+    return (i32 *)vslab_raw_(s, (size_t)cap * sizeof(i32));
+}
+
+static void vslab_put_(VSlab *s, i32 *p, i32 cap)
+{
+    i32 c = vslab_cls_(cap);
+    memcpy(p, &s->free_[c], sizeof(i32 *));
+    s->free_[c] = p;
+}
+
+static char *vslab_str_(VSlab *s, const char *t, i32 n)
+{
+    char *p = (char *)vslab_raw_(s, (size_t)n + 1);
+    memcpy(p, t, (size_t)n); p[n] = 0;
+    return p;
+}
+
+static void vslab_free_(VSlab *s)
+{
+    i32 i;
+    for (i = 0; i < s->nchunk; ++i) free(s->chunk[i]);
+    free(s->chunk);
+    memset(s, 0, sizeof(*s));
+}
+
+static void vivec_add_(VSlab *s, VIVec *a, i32 x)
 {
     if (a->n == a->cap) {
-        a->cap = a->cap ? a->cap * 2 : 4;
-        a->v = (i32 *)realloc(a->v, (size_t)a->cap * sizeof(i32));
+        i32 nc = a->cap ? a->cap * 2 : 2;
+        if (nc > VSLAB_MAXC) {
+            if (a->cap > VSLAB_MAXC) a->v = (i32 *)realloc(a->v, (size_t)nc * sizeof(i32));
+            else { i32 *nv = (i32 *)malloc((size_t)nc * sizeof(i32)); memcpy(nv, a->v, (size_t)a->n * sizeof(i32)); vslab_put_(s, a->v, a->cap); a->v = nv; }
+        } else {
+            i32 *nv = vslab_get_(s, nc);
+            if (a->cap) { memcpy(nv, a->v, (size_t)a->n * sizeof(i32)); vslab_put_(s, a->v, a->cap); }
+            a->v = nv;
+        }
+        a->cap = nc;
     }
     a->v[a->n++] = x;
 }
@@ -309,15 +369,15 @@ void vecdb_embed(const char *text, i32 len, f32 *out, i32 dim)
 enum { VN_NOTE = 0, VN_TAG = 1, VN_GHOST = 2, VN_DEAD = 3 };
 
 typedef struct {
-    char *name;         /* note title / tag as written the first time */
+    char *name;         /* note title / tag as written the first time (in the db's slab) */
     i64   toff;         /* note body: offset and length in the text file (not held in RAM) */
-    i32   tlen;         /* -1: no body */
-    u8    space;        /* 0 text vectors, 1 image vectors */
     VIVec out;          /* wikilinks (note -> note/ghost) and tag edges (note -> tag) */
     VIVec in;           /* backlinks; for a tag: the notes carrying it */
-    i32   tagbit;       /* tags: bit in the store's i64 meta (0..62), -1 = none */
+    i32   tlen;         /* -1: no body */
+    signed char tagbit; /* tags: bit in the store's i64 meta (0..61), -1 = none */
+    u8    space;        /* 0 text vectors, 1 image vectors */
     u8    kind;
-} VNode;
+} VNode;                /* 56 bytes */
 
 typedef struct {
     RagStore *store;
@@ -358,6 +418,7 @@ typedef struct {
                           * full rewrite would otherwise have to replace an already-existing file of that name
                           * (re-indexing an existing path from scratch); see vdbl_save. */
     struct VECache *ec;   /* content-hash cache of document vectors (vecdb_embed_cache_open) */
+    VSlab  slab;          /* node names and link lists */
 } VecDB;
 
 typedef struct {
@@ -378,13 +439,6 @@ typedef struct {
     f32 gamma;          /* discount per rollout step (default 0.8) */
     u32 seed;           /* rng seed (default 1) */
 } VExplore;
-
-static char *vdb_dup_(const char *s, i32 n)
-{
-    char *p = (char *)malloc((size_t)n + 1);
-    memcpy(p, s, (size_t)n); p[n] = 0;
-    return p;
-}
 
 VecDB *vecdb_new(Arena *a, i32 dim)
 {
@@ -525,8 +579,12 @@ void vecdb_free(VecDB *db)
 {
     i32 i;
     if (!db) return;
-    for (i = 0; i < db->nn; ++i) { free(db->nodes[i].name); free(db->nodes[i].out.v); free(db->nodes[i].in.v); }
+    for (i = 0; i < db->nn; ++i) {                              /* only lists past the slab classes were malloc'd */
+        if (db->nodes[i].out.cap > VSLAB_MAXC) free(db->nodes[i].out.v);
+        if (db->nodes[i].in.cap > VSLAB_MAXC) free(db->nodes[i].in.v);
+    }
     free(db->nodes);
+    vslab_free_(&db->slab);
     hs_free(&db->names); hs_free(&db->tags);
     lex_free(&db->lex);
     if (db->store) store_destroy(db->store);
@@ -544,12 +602,12 @@ static i32 vdb_newnode_(VecDB *db, u8 kind, const char *name, i32 n)
 {
     VNode *v;
     if (db->nn == db->ncap) {
-        db->ncap = db->ncap ? db->ncap * 2 : 256;
+        db->ncap = db->ncap ? db->ncap + db->ncap / 2 : 256;     /* 1.5x: less slack at millions of nodes */
         db->nodes = (VNode *)realloc(db->nodes, (size_t)db->ncap * sizeof(VNode));
     }
     v = &db->nodes[db->nn];
     memset(v, 0, sizeof(*v));
-    v->kind = kind; v->name = vdb_dup_(name, n); v->tagbit = -1; v->tlen = -1;
+    v->kind = kind; v->name = vslab_str_(&db->slab, name, n); v->tagbit = -1; v->tlen = -1;
     return db->nn++;
 }
 
@@ -569,7 +627,7 @@ static i32 vdb_tag_node_(VecDB *db, const char *key, i32 n)
     i32 id = hs_get(&db->tags, key, n);
     if (id < 0) {
         id = vdb_newnode_(db, VN_TAG, key, n);
-        if (db->ntagbits < 62) db->nodes[id].tagbit = db->ntagbits++;
+        if (db->ntagbits < 62) db->nodes[id].tagbit = (signed char)db->ntagbits++;
         hs_put(&db->tags, key, n, id);
     }
     return id;
@@ -578,8 +636,8 @@ static i32 vdb_tag_node_(VecDB *db, const char *key, i32 n)
 static void vdb_edge_(VecDB *db, i32 from, i32 to)
 {
     if (from == to || vivec_has_(&db->nodes[from].out, to)) return;
-    vivec_add_(&db->nodes[from].out, to);
-    vivec_add_(&db->nodes[to].in, from);
+    vivec_add_(&db->slab, &db->nodes[from].out, to);
+    vivec_add_(&db->slab, &db->nodes[to].in, from);
 }
 
 /* remove every edge that starts at id (its links and tags) */
@@ -657,7 +715,7 @@ static i32 vdb_add_(VecDB *db, const char *title, const char *text, const f32 *v
         hs_put(&db->names, key, klen, id);
     }                                                            /* else: a ghost becomes a note, keeping its backlinks */
     v = &db->nodes[id];
-    if (v->kind != VN_NOTE) { free(v->name); v->name = vdb_dup_(title, (i32)strlen(title)); }
+    if (v->kind != VN_NOTE) v->name = vslab_str_(&db->slab, title, (i32)strlen(title));   /* the ghost's spelling stays in the slab */
     v->kind = VN_NOTE; v->space = (u8)space;
     if (persist_text) vdb_text_put_(db, v, text, tlen);
     nv = (f32 *)malloc((size_t)dm * sizeof(f32));

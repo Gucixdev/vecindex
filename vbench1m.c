@@ -11,19 +11,22 @@
 
 static double now_(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec; }
 
-static long rss_mb_(void)
+static long status_mb_(const char *key)
 {
     FILE *f = fopen("/proc/self/status", "r");
-    char line[256]; long kb = 0;
+    char line[256]; long kb = 0; size_t kl = strlen(key);
     if (!f) return -1;
-    while (fgets(line, sizeof line, f)) if (!strncmp(line, "VmRSS:", 6)) { sscanf(line + 6, "%ld", &kb); break; }
+    while (fgets(line, sizeof line, f)) if (!strncmp(line, key, kl)) { sscanf(line + kl, "%ld", &kb); break; }
     fclose(f);
     return kb / 1024;
 }
+static long rss_mb_(void) { return status_mb_("VmRSS:"); }
 
+/* RSS split: anonymous memory (what really has to fit in RAM) and file-backed pages (the spilled or mapped
+ * vectors, dropped by the kernel when memory runs short) */
 static void mark_(const char *what, double t0)
 {
-    printf("  [%6.1fs, RSS %4ld MB] %s\n", now_() - t0, rss_mb_(), what);
+    printf("  [%6.1fs, RSS %4ld MB = %ld anon + %ld file] %s\n", now_() - t0, rss_mb_(), status_mb_("RssAnon:"), status_mb_("RssFile:"), what);
     fflush(stdout);
 }
 
