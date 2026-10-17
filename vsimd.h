@@ -62,13 +62,34 @@ static VS_UNUSED f32 vs_sub_normsq(f32 *out, const f32 *a, const f32 *b, i32 n)
 /* sum over d of a[d] * b[d] */
 static VS_UNUSED f32 vs_dot(const f32 *a, const f32 *b, i32 n)
 {
-    __m256 acc = _mm256_setzero_ps();
+#if defined(__AVX512F__)
+    /* two independent accumulators hide the FMA latency; the tail is one masked load */
+    __m512 s0 = _mm512_setzero_ps(), s1 = _mm512_setzero_ps();
+    i32 d = 0;
+    for (; d + 32 <= n; d += 32) {
+        s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + d), _mm512_loadu_ps(b + d), s0);
+        s1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + d + 16), _mm512_loadu_ps(b + d + 16), s1);
+    }
+    for (; d + 16 <= n; d += 16)
+        s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + d), _mm512_loadu_ps(b + d), s0);
+    if (d < n) {
+        __mmask16 m = (__mmask16)((1u << (n - d)) - 1u);
+        s1 = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(m, a + d), _mm512_maskz_loadu_ps(m, b + d), s1);
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(s0, s1));
+#else
+    __m256 acc = _mm256_setzero_ps(), acc2 = _mm256_setzero_ps();
     f32 r; i32 d = 0;
+    for (; d + 16 <= n; d += 16) {
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + d), _mm256_loadu_ps(b + d), acc);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + d + 8), _mm256_loadu_ps(b + d + 8), acc2);
+    }
     for (; d + 8 <= n; d += 8)
         acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + d), _mm256_loadu_ps(b + d), acc);
-    r = vs_hsum256_(acc);
+    r = vs_hsum256_(_mm256_add_ps(acc, acc2));
     for (; d < n; ++d) r += a[d] * b[d];
     return r;
+#endif
 }
 
 /* sum over g in [0, cb) of lut[g*256 + row[g]] - the per-code LUT

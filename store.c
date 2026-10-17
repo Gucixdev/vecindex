@@ -57,6 +57,18 @@
 #define STORE_IVF_ROWS 2000
 #endif      /* doc id -> row hash map: O(1) delete / has / get, O(1) live count */
 
+/* exact re-scoring touches rows at random: ask for the row a few candidates ahead while scoring this one */
+#define STORE_PF_AHEAD 4
+static void store_prefetch_row_(const f32 *row, i32 dim)
+{
+#if defined(__GNUC__)
+    const char *p = (const char *)row, *end = (const char *)(row + dim);
+    for (; p < end; p += 64) __builtin_prefetch(p, 0, 1);
+#else
+    (void)row; (void)dim;
+#endif
+}
+
 #define STORE_MAGIC   0x34584956u   /* 'VIX4' - v4 = goal gains max_candidates */
 #define STORE_VERSION 4
 #define STORE_GROW    4096
@@ -65,6 +77,8 @@ typedef struct {
     FILE    *jf;            /* write-ahead journal of adds/deletes since the last full save (store_sync) */
     char    *jpath;
     i32      tq_probe;      /* IVF: clusters scanned per query (0 = the index default) */
+    i32      tq_threads;    /* threads one query's scan may use (0 = auto: up to 4 on big stores) */
+    i32      tq_rerank;     /* candidates re-scored exactly per query (0 = auto: max(20 k, 256)) */
     Tq      *tq;            /* fast mode: the TurboQuant-style flat index (rebuilt on load, not saved) */
     i32      fast;          /* 1: store_build skips the auto-tuner (engine_build_fast) */
     f32      fast_target;   /* recall@k the fast build grows nprobe to (default 0.9) */
@@ -179,6 +193,14 @@ void store_destroy(RagStore *s)
 
 /* IVF (large stores): how many clusters a query scans; 0 = the default (~16% of them). More = better recall, slower. */
 void store_set_probe(RagStore *s, i32 nprobe) { s->tq_probe = nprobe; }
+
+/* Threads a single query's scan may use; 0 = auto (up to 4 from 150k rows). 1 suits callers that already run
+ * one query per thread. */
+void store_set_threads(RagStore *s, i32 nthreads) { s->tq_threads = nthreads > 0 ? nthreads : 0; }
+
+/* How many candidates of the 4-bit scan are re-scored exactly; 0 = auto (max(20 k, 256)). Fewer is faster, more
+ * lifts recall when the scan's ranking is coarse. */
+void store_set_rerank(RagStore *s, i32 r) { s->tq_rerank = r > 0 ? r : 0; }
 
 /* fast build: one k-means + q4 instead of the auto-tuner's candidate bake-off */
 void store_set_fast(RagStore *s, f32 target_recall)
@@ -388,12 +410,15 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
     pthread_rwlock_rdlock(&s->lock);
 
     if (s->tq) {
-        i32 R = filtered ? k * 40 + 256 : (k * 20 > 256 ? k * 20 : 256), n = 0, m, nth = 1;
+        i32 R = filtered ? k * 40 + 256 : (s->tq_rerank > 0 ? s->tq_rerank : (k * 20 > 256 ? k * 20 : 256)), n = 0, m, nth = 1;
         i32 *rows = (i32 *)malloc((size_t)R * sizeof(i32));
-        if (s->tq->n >= 150000) { long c = sysconf(_SC_NPROCESSORS_ONLN); nth = c > 4 ? 4 : (c > 1 ? (i32)c : 1); }   /* the scan is memory-bound: 4 threads already saturate the bus */
+        if (s->tq_threads > 0) nth = s->tq_threads;
+        else if (s->tq->n >= 150000) { long c = sysconf(_SC_NPROCESSORS_ONLN); nth = c > 4 ? 4 : (c > 1 ? (i32)c : 1); }   /* the scan is memory-bound: 4 threads already saturate the bus */
         m = tq_search(s->tq, qn, R, rows, s->dead, s->meta, all_bits, any_bits, filtered, nth, s->tq_probe);
         for (i = 0; i < m; ++i) {                               /* exact re-score of the shortlist */
             i32 row = rows[i];
+            if (i + STORE_PF_AHEAD < m && rows[i + STORE_PF_AHEAD] >= 0 && rows[i + STORE_PF_AHEAD] < s->built_upto)
+                store_prefetch_row_(s->vecs + (size_t)rows[i + STORE_PF_AHEAD] * s->dim, s->dim);
             if (row < 0 || row >= s->built_upto) continue;
             eng_topk_(out_doc_ids, out_scores, k, &have, s->ids[row], 2.0f * vs_dot(qn, s->vecs + (size_t)row * s->dim, s->dim) - 2.0f);
         }

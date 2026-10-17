@@ -201,15 +201,39 @@ void tq_free(Tq *t)
 
 /* ---- scanning ---- */
 
-/* score of the 32 vectors of one block: out[32] u16 (bigger = closer) */
-static void tq_block_(const u8 *blk, const u8 *lut, i32 dpad, u16 *out)
+/* Scores of the 32 vectors of one block into out[32] (u16, bigger = closer). Returns a bit mask of the rows
+ * scoring above thr, so the caller only touches those (most rows of a scan never get near the top R).
+ * AVX-512BW: 4 dimensions per 64-byte step; AVX2: 2 per step; the lane sums and the threshold test stay in
+ * registers. */
+static u32 tq_block_(const u8 *blk, const u8 *lut, i32 dpad, u16 thr, u16 *out)
 {
 #if defined(__AVX2__)
-    __m256i a0 = _mm256_setzero_si256(), a1 = a0, b0 = a0, b1 = a0;
+    __m256i a0, a1, b0, b1;
     const __m256i m0f = _mm256_set1_epi8(0x0f), m00ff = _mm256_set1_epi16(0x00ff);
-    u16 A0[16], A1[16], B0[16], B1[16];
-    i32 d, k;
-    for (d = 0; d < dpad; d += 2) {
+    __m128i x0, x1, y0, y1, r0q, r1q, r2q, r3q;
+    i32 d = 0;
+#if defined(__AVX512BW__)
+    {
+        __m512i A0 = _mm512_setzero_si512(), A1 = A0, B0 = A0, B1 = A0;
+        const __m512i M0F = _mm512_set1_epi8(0x0f), M00FF = _mm512_set1_epi16(0x00ff);
+        for (; d + 4 <= dpad; d += 4) {
+            __m512i codes = _mm512_loadu_si512((const void *)(blk + (size_t)d * 16));
+            __m512i lv = _mm512_loadu_si512((const void *)(lut + (size_t)d * 16));
+            __m512i lo = _mm512_and_si512(codes, M0F);
+            __m512i hi = _mm512_and_si512(_mm512_srli_epi16(codes, 4), M0F);
+            __m512i r0 = _mm512_shuffle_epi8(lv, lo), r1 = _mm512_shuffle_epi8(lv, hi);
+            A0 = _mm512_add_epi16(A0, _mm512_and_si512(r0, M00FF)); A1 = _mm512_add_epi16(A1, _mm512_srli_epi16(r0, 8));
+            B0 = _mm512_add_epi16(B0, _mm512_and_si512(r1, M00FF)); B1 = _mm512_add_epi16(B1, _mm512_srli_epi16(r1, 8));
+        }
+        a0 = _mm256_add_epi16(_mm512_castsi512_si256(A0), _mm512_extracti64x4_epi64(A0, 1));
+        a1 = _mm256_add_epi16(_mm512_castsi512_si256(A1), _mm512_extracti64x4_epi64(A1, 1));
+        b0 = _mm256_add_epi16(_mm512_castsi512_si256(B0), _mm512_extracti64x4_epi64(B0, 1));
+        b1 = _mm256_add_epi16(_mm512_castsi512_si256(B1), _mm512_extracti64x4_epi64(B1, 1));
+    }
+#else
+    a0 = _mm256_setzero_si256(); a1 = a0; b0 = a0; b1 = a0;
+#endif
+    for (; d < dpad; d += 2) {
         __m256i codes = _mm256_loadu_si256((const __m256i *)(blk + (size_t)d * 16));
         __m256i lv = _mm256_loadu_si256((const __m256i *)(lut + (size_t)d * 16));
         __m256i lo = _mm256_and_si256(codes, m0f);
@@ -218,14 +242,33 @@ static void tq_block_(const u8 *blk, const u8 *lut, i32 dpad, u16 *out)
         a0 = _mm256_add_epi16(a0, _mm256_and_si256(r0, m00ff)); a1 = _mm256_add_epi16(a1, _mm256_srli_epi16(r0, 8));
         b0 = _mm256_add_epi16(b0, _mm256_and_si256(r1, m00ff)); b1 = _mm256_add_epi16(b1, _mm256_srli_epi16(r1, 8));
     }
-    _mm256_storeu_si256((__m256i *)A0, a0); _mm256_storeu_si256((__m256i *)A1, a1);
-    _mm256_storeu_si256((__m256i *)B0, b0); _mm256_storeu_si256((__m256i *)B1, b1);
-    for (k = 0; k < 8; ++k) {
-        out[2 * k] = (u16)(A0[k] + A0[8 + k]);          out[2 * k + 1] = (u16)(A1[k] + A1[8 + k]);
-        out[16 + 2 * k] = (u16)(B0[k] + B0[8 + k]);     out[16 + 2 * k + 1] = (u16)(B1[k] + B1[8 + k]);
+    /* fold the two dimension lanes; a0/a1 hold the even/odd rows of 0-15, b0/b1 those of 16-31 */
+    x0 = _mm_add_epi16(_mm256_castsi256_si128(a0), _mm256_extracti128_si256(a0, 1));
+    x1 = _mm_add_epi16(_mm256_castsi256_si128(a1), _mm256_extracti128_si256(a1, 1));
+    y0 = _mm_add_epi16(_mm256_castsi256_si128(b0), _mm256_extracti128_si256(b0, 1));
+    y1 = _mm_add_epi16(_mm256_castsi256_si128(b1), _mm256_extracti128_si256(b1, 1));
+    r0q = _mm_unpacklo_epi16(x0, x1); r1q = _mm_unpackhi_epi16(x0, x1);     /* rows 0-7, 8-15 */
+    r2q = _mm_unpacklo_epi16(y0, y1); r3q = _mm_unpackhi_epi16(y0, y1);     /* rows 16-23, 24-31 */
+    _mm_storeu_si128((__m128i *)(void *)out, r0q); _mm_storeu_si128((__m128i *)(void *)(out + 8), r1q);
+    _mm_storeu_si128((__m128i *)(void *)(out + 16), r2q); _mm_storeu_si128((__m128i *)(void *)(out + 24), r3q);
+    {
+#if defined(__AVX512BW__) && defined(__AVX512VL__)
+        __m128i t = _mm_set1_epi16((short)thr);
+        return (u32)_mm_cmpgt_epu16_mask(r0q, t) | ((u32)_mm_cmpgt_epu16_mask(r1q, t) << 8)
+             | ((u32)_mm_cmpgt_epu16_mask(r2q, t) << 16) | ((u32)_mm_cmpgt_epu16_mask(r3q, t) << 24);
+#else
+        /* unsigned v > thr: flip the sign bits, compare signed, pack the 0/-1 lanes to bytes */
+        __m128i bias = _mm_set1_epi16((short)0x8000), t = _mm_set1_epi16((short)(thr ^ 0x8000));
+        u32 m0 = (u32)_mm_movemask_epi8(_mm_packs_epi16(_mm_cmpgt_epi16(_mm_xor_si128(r0q, bias), t),
+                                                        _mm_cmpgt_epi16(_mm_xor_si128(r1q, bias), t)));
+        u32 m1 = (u32)_mm_movemask_epi8(_mm_packs_epi16(_mm_cmpgt_epi16(_mm_xor_si128(r2q, bias), t),
+                                                        _mm_cmpgt_epi16(_mm_xor_si128(r3q, bias), t)));
+        return m0 | (m1 << 16);
+#endif
     }
 #else
     i32 d, j;
+    u32 m = 0;
     for (j = 0; j < 32; ++j) out[j] = 0;
     for (d = 0; d < dpad; ++d)
         for (j = 0; j < 32; ++j) {
@@ -233,6 +276,20 @@ static void tq_block_(const u8 *blk, const u8 *lut, i32 dpad, u16 *out)
             u8 c = j < 16 ? (u8)(byte & 15) : (u8)(byte >> 4);
             out[j] = (u16)(out[j] + lut[(size_t)d * 16 + c]);
         }
+    for (j = 0; j < 32; ++j) if (out[j] > thr) m |= 1u << j;
+    return m;
+#endif
+}
+
+/* index of the lowest set bit of a non-zero mask */
+static i32 tq_ctz_(u32 m)
+{
+#if defined(__GNUC__)
+    return __builtin_ctz(m);
+#else
+    i32 k = 0;
+    while (!(m & 1u)) { m >>= 1; ++k; }
+    return k;
 #endif
 }
 
@@ -274,23 +331,59 @@ static void *tq_job_(void *arg)
     u16 sc[32];
     for (b = j->b0; b < j->b1; ++b) {
         i32 blk = j->blks ? j->blks[b] : b, base = blk * 32;
-        tq_block_(t->codes + (size_t)blk * (size_t)t->dpad * 16, j->lut, t->dpad, sc);
-        for (k = 0; k < 32; ++k) {
-            i32 row = t->slot_row ? t->slot_row[base + k] : base + k;
+        i32 full = j->heap.n == j->heap.cap;
+        u32 m = tq_block_(t->codes + (size_t)blk * (size_t)t->dpad * 16, j->lut, t->dpad,
+                          full ? (u16)(j->heap.h[0] >> 32) : (u16)0, sc);
+        if (!full) m = 0xffffffffu;                              /* still filling the heap: every row counts */
+        while (m) {
+            i32 row;
             u64 v;
+            k = tq_ctz_(m); m &= m - 1u;
+            row = t->slot_row ? t->slot_row[base + k] : base + k;
             if (row < 0 || row >= t->n) continue;                /* padding */
-            if (j->heap.n == j->heap.cap && (u64)sc[k] << 32 <= j->heap.h[0]) continue;
             if (j->dead && j->dead[row]) continue;
             if (j->filtered) {
-                i64 m = j->meta[row];
-                if ((m & j->all) != j->all) continue;
-                if (j->any && !(m & j->any)) continue;
+                i64 tag = j->meta[row];
+                if ((tag & j->all) != j->all) continue;
+                if (j->any && !(tag & j->any)) continue;
             }
             v = ((u64)sc[k] << 32) | (u64)(u32)row;
             tq_heap_push_(&j->heap, v);
         }
     }
     return (void *)0;
+}
+
+typedef struct { f32 s; i32 c; } TqCs;
+
+static int tq_cs_desc_(const void *a, const void *b)
+{
+    f32 x = ((const TqCs *)a)->s, y = ((const TqCs *)b)->s;
+    return x < y ? 1 : (x > y ? -1 : 0);
+}
+
+/* moves the k largest entries (by s) to a[0..k), in no particular order (Hoare quickselect, O(n)) */
+static void tq_select_(TqCs *a, i32 n, i32 k)
+{
+    i32 lo = 0, hi = n - 1;
+    while (lo < hi) {
+        f32 piv = a[lo + (hi - lo) / 2].s;
+        i32 i = lo, j = hi;
+        while (i <= j) {
+            while (a[i].s > piv) ++i;
+            while (a[j].s < piv) --j;
+            if (i <= j) { TqCs x = a[i]; a[i] = a[j]; a[j] = x; ++i; --j; }
+        }
+        if (k - 1 <= j) hi = j;
+        else if (k - 1 >= i) lo = i;
+        else break;
+    }
+}
+
+static int tq_u64_desc_(const void *a, const void *b)
+{
+    u64 x = *(const u64 *)a, y = *(const u64 *)b;
+    return x < y ? 1 : (x > y ? -1 : 0);
 }
 
 /* The R best rows (by the quantised inner product) that are alive and pass the meta filter; returns how
@@ -319,20 +412,17 @@ i32 tq_search(const Tq *t, const f32 *q, i32 R, i32 *rows, const u8 *dead, const
     for (i = 0; i < t->dpad * 16; ++i) { i32 v = (i32)(lf[i] * scale + 0.5f); lut[i] = (u8)(v > lutmax ? lutmax : v); }
 
     if (t->nc > 1) {                                             /* IVF: the blocks of the nprobe clusters closest to the query */
-        i32 np = probe > 0 ? probe : t->nprobe, c, nb = 0, *top = (i32 *)malloc((size_t)np * sizeof(i32));
-        f32 *ts = (f32 *)malloc((size_t)np * sizeof(f32));
-        i32 got = 0;
+        i32 np = probe > 0 ? probe : t->nprobe, nb = 0;
+        TqCs *cs = (TqCs *)malloc((size_t)t->nc * sizeof(TqCs));
         if (np > t->nc) np = t->nc;
-        for (c = 0; c < t->nc; ++c) {                            /* the np best centroids by inner product with the query */
-            f32 s = vs_dot(q, t->cent + (size_t)c * t->dim, t->dim);
-            if (got == np && s <= ts[np - 1]) continue;
-            { i32 k = got < np ? got++ : np - 1; while (k > 0 && ts[k - 1] < s) { ts[k] = ts[k - 1]; top[k] = top[k - 1]; --k; } ts[k] = s; top[k] = c; }
-        }
-        for (i = 0; i < got; ++i) nb += t->cstart[top[i] + 1] - t->cstart[top[i]];
+        for (c = 0; c < t->nc; ++c) { cs[c].s = vs_dot(q, t->cent + (size_t)c * t->dim, t->dim); cs[c].c = c; }
+        tq_select_(cs, t->nc, np);                               /* the np best centroids, O(nc) */
+        qsort(cs, (size_t)np, sizeof(TqCs), tq_cs_desc_);        /* closest first: the heap threshold rises early */
+        for (i = 0; i < np; ++i) nb += t->cstart[cs[i].c + 1] - t->cstart[cs[i].c];
         blks = (i32 *)malloc((size_t)(nb ? nb : 1) * sizeof(i32));
-        for (nb = 0, i = 0; i < got; ++i) { i32 b; for (b = t->cstart[top[i]]; b < t->cstart[top[i] + 1]; ++b) blks[nb++] = b; }
+        for (nb = 0, i = 0; i < np; ++i) { i32 b; for (b = t->cstart[cs[i].c]; b < t->cstart[cs[i].c + 1]; ++b) blks[nb++] = b; }
         nblk_scan = nb;
-        free(top); free(ts);
+        free(cs);
     } else nblk_scan = t->nblk;
     if (nthreads < 1) nthreads = 1;
     if (nthreads > 16) nthreads = 16;
@@ -351,8 +441,8 @@ i32 tq_search(const Tq *t, const f32 *q, i32 R, i32 *rows, const u8 *dead, const
     { TqHeap m; m.h = (u64 *)malloc((size_t)R * sizeof(u64)); m.n = 0; m.cap = R;
       for (i = 0; i < nj; ++i) { i32 k; for (k = 0; k < jobs[i].heap.n; ++k) tq_heap_push_(&m, jobs[i].heap.h[k]); free(jobs[i].heap.h); }
       all_h = m.h; cnt = m.n; }
-    /* heap array -> descending order */
-    for (i = 0; i < cnt; ++i) { i32 k, best = i; for (k = i + 1; k < cnt; ++k) if (all_h[k] > all_h[best]) best = k; { u64 x = all_h[i]; all_h[i] = all_h[best]; all_h[best] = x; } rows[i] = (i32)(u32)(all_h[i] & 0xffffffffu); }
+    qsort(all_h, (size_t)cnt, sizeof(u64), tq_u64_desc_);      /* heap array -> best first */
+    for (i = 0; i < cnt; ++i) rows[i] = (i32)(u32)(all_h[i] & 0xffffffffu);
     free(all_h); free(rot); free(tmp); free(lf); free(lut); free(blks);
     return cnt;
 }
