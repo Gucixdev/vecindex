@@ -33,8 +33,9 @@
 #include <immintrin.h>
 #endif
 
-/* Rows of a column in chunks of 2^shift rows (one chunk with a large shift = a plain array). */
-typedef struct { u8 *const *chunk; i32 shift; size_t esz; } TqCol;
+/* Rows of a column in chunks of 2^shift rows (one chunk with a large shift = a plain array). A vector column holds
+ * f32 rows, or int8 rows (i8 = 1) whose f32 scale sits in a second column. */
+typedef struct TqCol { u8 *const *chunk; i32 shift; size_t esz; i32 i8, dim; const struct TqCol *scale; } TqCol;
 #define TQ_AT(c, r) ((c)->chunk[(size_t)(r) >> (c)->shift] + ((size_t)(r) & (((size_t)1 << (c)->shift) - 1u)) * (c)->esz)
 #define TQ_ROW(c, r) ((const f32 *)(const void *)TQ_AT(c, r))
 
@@ -43,8 +44,25 @@ TqCol tq_col_flat(const void *base, size_t esz, u8 **holder)
 {
     TqCol c;
     *holder = (u8 *)base;
-    c.chunk = holder; c.shift = 31; c.esz = esz;
+    c.chunk = holder; c.shift = 31; c.esz = esz; c.i8 = 0; c.dim = 0; c.scale = (const TqCol *)0;
     return c;
+}
+
+/* row r as f32: a pointer into the column, or (int8 rows) dequantised into buf[dim] */
+static const f32 *tq_row_(const TqCol *c, i64 r, f32 *buf)
+{
+    const i8 *x;
+    f32 s;
+    i32 d = 0;
+    if (!c->i8) return TQ_ROW(c, r);
+    x = (const i8 *)(const void *)TQ_AT(c, r);
+    s = *(const f32 *)(const void *)TQ_AT(c->scale, r);
+#if defined(__AVX512F__)
+    for (; d + 16 <= c->dim; d += 16)
+        _mm512_storeu_ps(buf + d, _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(x + d)))), _mm512_set1_ps(s)));
+#endif
+    for (; d < c->dim; ++d) buf[d] = s * (f32)x[d];
+    return buf;
 }
 
 typedef struct {
@@ -58,12 +76,16 @@ typedef struct {
     i32  *slot_row;         /* [nblk * 32] row held by each slot, -1 = padding */
     f32  *s1, *s2;          /* random +-1 signs, [dpad] */
     i32  *perm;             /* [dpad] */
-    u8   *codes;            /* nblk * dpad * 16 bytes */
+    u8   *codes;            /* nblk * vd * 16 bytes */
     i32   mapped;           /* 1: the arrays point into a file mapping the caller owns (store_load) */
+    i32   bits;             /* 4: one 4-bit code a coordinate; 2: one 4-bit code a pair of coordinates (2 bits each) */
+    i32   vd;               /* code columns a row: dpad (4-bit) or dpad/2 rounded up to even (2-bit) */
 } Tq;
 
+static i32 tq_vd_(i32 dpad, i32 bits) { return bits == 2 ? ((dpad / 2) + 1) & ~1 : dpad; }
+
 #define TQ_FLAT_MAX   1024              /* more clusters than this: two-level k-means */
-#define TQ_SAMPLE_MAX ((size_t)256 << 20)   /* bytes of training sample at most */
+#define TQ_SAMPLE_MAX ((size_t)512 << 20)   /* bytes of training sample at most (100M rows: ~25 a centroid) */
 
 /* Lloyd-Max centroids of the standard normal, 16 levels ascending */
 static const f32 TQ_CENT[16] = {
@@ -191,6 +213,23 @@ static void tq_codes_(const f32 *rot, i32 dpad, u8 *codes)
     }
 #endif
     for (; d < dpad; ++d) codes[d] = tq_code_(rot[d]);
+}
+
+/* 2-bit: Lloyd-Max levels of the standard normal (4 of them) and the decision boundaries between them */
+static const f32 TQ_CENT2[4] = { -1.5104f, -0.4528f, 0.4528f, 1.5104f };
+static const f32 TQ_B2[3] = { -0.9816f, 0.0f, 0.9816f };
+
+/* code columns of a rotated row: 4-bit, one per coordinate; 2-bit, coordinates 2v and 2v+1 share column v as
+ * (code of 2v) | (code of 2v+1) << 2, so the 16-entry tables and the scan kernel stay exactly the same */
+static void tq_encode_row_(const Tq *t, const f32 *rot, u8 *cd)
+{
+    i32 v;
+    if (t->bits != 2) { tq_codes_(rot, t->dpad, cd); return; }
+    for (v = 0; v < t->vd; ++v) {
+        f32 a = 2 * v < t->dpad ? rot[2 * v] : 0.0f, b = 2 * v + 1 < t->dpad ? rot[2 * v + 1] : 0.0f;
+        i32 ca = (a > TQ_B2[0]) + (a > TQ_B2[1]) + (a > TQ_B2[2]), cb = (b > TQ_B2[0]) + (b > TQ_B2[1]) + (b > TQ_B2[2]);
+        cd[v] = (u8)(ca | (cb << 2));
+    }
 }
 
 /* ---- centroid scoring: 16 centroids per step, centroids transposed in groups ([dim][16] per group) ---- */
@@ -448,7 +487,11 @@ static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc
     if (m > n) m = n;
     if (nc > m) nc = m;
     x = (f32 *)malloc((size_t)m * (size_t)dim * sizeof(f32));
-    for (i = 0; i < m; ++i) memcpy(x + (size_t)i * dim, TQ_ROW(rows, (i64)n * i / m), (size_t)dim * sizeof(f32));   /* an even spread of rows */
+    for (i = 0; i < m; ++i) {                                            /* an even spread of rows */
+        f32 *dst = x + (size_t)i * dim;
+        const f32 *src = tq_row_(rows, (i64)n * i / m, dst);
+        if (src != dst) memcpy(dst, src, (size_t)dim * sizeof(f32));
+    }
     if (nc <= TQ_FLAT_MAX) {
         cl->nc = nc;
         cl->cent = (f32 *)malloc((size_t)nc * (size_t)dim * sizeof(f32));
@@ -475,7 +518,8 @@ static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc
         cl->nc = tot;
         cl->cent = (f32 *)malloc((size_t)tot * (size_t)dim * sizeof(f32));
         cl->sub_ct = (f32 **)calloc((size_t)k1, sizeof(f32 *));
-        buf = (f32 *)malloc((size_t)m * (size_t)dim * sizeof(f32));
+        { i32 big = 1; for (j = 0; j < k1; ++j) if (cnt[j + 1] - cnt[j] > big) big = cnt[j + 1] - cnt[j];
+          buf = (f32 *)malloc((size_t)big * (size_t)dim * sizeof(f32)); }        /* the largest cell, not the whole sample */
         for (j = 0; j < k1; ++j) {
             i32 cn = cnt[j + 1] - cnt[j], z;
             f32 *dst = cl->cent + (size_t)cl->sub0[j] * dim;
@@ -503,7 +547,7 @@ static void tq_asg_rows_(void *p, i64 a, i64 b, i32 tid)
     const TqClus *cl = j->cl;
     i32 wide = cl->nc > cl->k1 ? cl->nc : cl->k1, *top = (i32 *)malloc(TQ_ABATCH * sizeof(i32));
     i32 *ord = (i32 *)malloc(TQ_ABATCH * sizeof(i32)), *cst = (i32 *)malloc(((size_t)cl->k1 + 2) * sizeof(i32));
-    f32 *sc = (f32 *)malloc(((size_t)wide + 16) * 4 * sizeof(f32));
+    f32 *sc = (f32 *)malloc(((size_t)wide + 16) * 4 * sizeof(f32)), *rb = (f32 *)malloc((size_t)cl->dim * 4 * sizeof(f32));
     i32 *cnt = j->cnt + (size_t)tid * j->nc;
     i64 x;
     for (x = a; x < b; x += TQ_ABATCH) {
@@ -512,7 +556,7 @@ static void tq_asg_rows_(void *p, i64 a, i64 b, i32 tid)
         /* stage 1: the flat centroids, or the top cells */
         for (i = 0; i < m; i += 4) {
             i32 g = m - i < 4 ? m - i : 4;
-            for (r = 0; r < g; ++r) v[r] = TQ_ROW(j->rows, x + i + r);
+            for (r = 0; r < g; ++r) v[r] = tq_row_(j->rows, x + i + r, rb + (size_t)r * cl->dim);
             if (cl->k1) tq_nearest4_(v, g, cl->top_ct, cl->k1, cl->dim, sc, top + i);
             else tq_nearest4_(v, g, cl->flat_ct, cl->nc, cl->dim, sc, j->asg + x + i);
         }
@@ -526,14 +570,14 @@ static void tq_asg_rows_(void *p, i64 a, i64 b, i32 tid)
             i32 s0 = cst[c], s1 = cst[c + 1], q;
             for (q = s0; q < s1; q += 4) {
                 i32 g = s1 - q < 4 ? s1 - q : 4, best[4];
-                for (r = 0; r < g; ++r) v[r] = TQ_ROW(j->rows, x + ord[q + r]);
+                for (r = 0; r < g; ++r) v[r] = tq_row_(j->rows, x + ord[q + r], rb + (size_t)r * cl->dim);
                 if (cl->subn[c] > 1) tq_nearest4_(v, g, cl->sub_ct[c], cl->subn[c], cl->dim, sc, best);
                 else for (r = 0; r < g; ++r) best[r] = 0;
                 for (r = 0; r < g; ++r) { i32 asg = cl->sub0[c] + best[r]; j->asg[x + ord[q + r]] = asg; ++cnt[asg]; }
             }
         }
     }
-    free(top); free(ord); free(cst); free(sc);
+    free(top); free(ord); free(cst); free(sc); free(rb);
 }
 
 typedef struct { const TqCol *rows; Tq *t; const i32 *slot; i32 n, nth; } TqEncJob;
@@ -546,22 +590,23 @@ static void tq_enc_rows_(void *p, i64 a, i64 b, i32 tid)
     Tq *t = j->t;
     i64 lo = (i64)t->nblk * tid / j->nth * 32, hi = (i64)t->nblk * (tid + 1) / j->nth * 32, i;
     f32 *rot = (f32 *)malloc((size_t)t->dpad * sizeof(f32)), *tmp = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
+    f32 *rb = (f32 *)malloc((size_t)t->dim * sizeof(f32));
     u8 *cd = (u8 *)malloc((size_t)t->dpad + 16);
-    i32 d;
+    i32 d, vd = t->vd;
     (void)a; (void)b;
     for (i = j->slot ? 0 : lo; i < (j->slot ? j->n : (hi < j->n ? hi : j->n)); ++i) {   /* flat: slot == row, walk only our range */
         i64 s = j->slot ? j->slot[i] : i;
         i32 r;
         u8 *blk;
         if (s < lo || s >= hi) continue;
-        blk = t->codes + (size_t)(s / 32) * (size_t)t->dpad * 16;
+        blk = t->codes + (size_t)(s / 32) * (size_t)vd * 16;
         r = (i32)(s % 32);
-        tq_rot_(t, TQ_ROW(j->rows, i), rot, tmp);
-        tq_codes_(rot, t->dpad, cd);
-        if (r < 16) for (d = 0; d < t->dpad; ++d) { u8 *q = blk + (size_t)d * 16 + r; *q = (u8)((*q & 0xf0) | cd[d]); }
-        else for (d = 0; d < t->dpad; ++d) { u8 *q = blk + (size_t)d * 16 + (r - 16); *q = (u8)((*q & 0x0f) | (cd[d] << 4)); }
+        tq_rot_(t, tq_row_(j->rows, i, rb), rot, tmp);
+        tq_encode_row_(t, rot, cd);
+        if (r < 16) for (d = 0; d < vd; ++d) { u8 *q = blk + (size_t)d * 16 + r; *q = (u8)((*q & 0xf0) | cd[d]); }
+        else for (d = 0; d < vd; ++d) { u8 *q = blk + (size_t)d * 16 + (r - 16); *q = (u8)((*q & 0x0f) | (cd[d] << 4)); }
     }
-    free(rot); free(tmp); free(cd);
+    free(rot); free(tmp); free(cd); free(rb);
 }
 
 static i32 tq_default_probe_(i32 nc)
@@ -574,7 +619,7 @@ static i32 tq_default_probe_(i32 nc)
 /* nc <= 1: flat scan of every row. nc > 1: IVF with about nc clusters (nprobe defaults to min(16%, 4 sqrt nc)). */
 static f64 tq_now_(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (f64)ts.tv_sec + 1e-9 * (f64)ts.tv_nsec; }
 
-Tq *tq_build(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth)
+Tq *tq_build(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, i32 bits)
 {
     Tq *t = (Tq *)calloc(1, sizeof(Tq));
     f64 t0 = tq_now_();
@@ -584,6 +629,7 @@ Tq *tq_build(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth)
     TqEncJob ej;
     if (nth < 1) nth = 1;
     t->dim = dim; t->dpad = dim + (dim & 1); t->n = n;
+    t->bits = bits == 2 ? 2 : 4; t->vd = tq_vd_(t->dpad, t->bits);
     t->s1 = (f32 *)malloc((size_t)t->dpad * sizeof(f32)); t->s2 = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
     t->perm = (i32 *)malloc((size_t)t->dpad * sizeof(i32));
     for (i = 0; i < t->dpad; ++i) { t->s1[i] = (tq_rng_(&r) & 1u) ? 1.0f : -1.0f; t->s2[i] = (tq_rng_(&r) & 1u) ? 1.0f : -1.0f; t->perm[i] = i; }
@@ -620,7 +666,7 @@ Tq *tq_build(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth)
     } else {
         t->nblk = (n + 31) / 32; nslots = t->nblk * 32;
     }
-    t->codes = (u8 *)calloc((size_t)(t->nblk ? t->nblk : 1) * (size_t)t->dpad * 16, 1);
+    t->codes = (u8 *)calloc((size_t)(t->nblk ? t->nblk : 1) * (size_t)t->vd * 16, 1);
     ej.rows = rows; ej.t = t; ej.slot = slot; ej.n = n; ej.nth = n >= 4096 ? nth : 1;
     if (ej.nth > 64) ej.nth = 64;
     tq_par_(tq_enc_rows_, &ej, (i64)ej.nth * 4096, ej.nth);     /* every thread walks all rows, keeps its own blocks */
@@ -651,7 +697,7 @@ static i64 tq_ram_(const Tq *t)
     if (!t) return 0;
     if (t->nc > 1) b += (i64)((t->nc + 15) / 16) * 16 * t->dim * 4;
     if (!t->mapped) {
-        b += (i64)t->nblk * t->dpad * 16 + (i64)t->dpad * 12;
+        b += (i64)t->nblk * t->vd * 16 + (i64)t->dpad * 12;
         if (t->slot_row) b += (i64)t->nblk * 32 * 4;
         if (t->nc > 1) b += (i64)t->nc * t->dim * 4 + (i64)(t->nc + 1) * 4;
     }
@@ -791,7 +837,7 @@ static void *tq_job_(void *arg)
     for (b = j->b0; b < j->b1; ++b) {
         i32 blk = j->blks ? j->blks[b] : b, base = blk * 32;
         i32 full = j->heap.n == j->heap.cap;
-        u32 m = tq_block_(t->codes + (size_t)blk * (size_t)t->dpad * 16, j->lut, t->dpad,
+        u32 m = tq_block_(t->codes + (size_t)blk * (size_t)t->vd * 16, j->lut, t->vd,
                           full ? (u16)(j->heap.h[0] >> 32) : (u16)0, sc);
         if (!full) m = 0xffffffffu;                              /* still filling the heap: every row counts */
         while (m) {
@@ -852,8 +898,8 @@ i32 tq_search(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, cons
 {
     i32 *blks = (i32 *)0, nblk_scan;
     f32 *rot = (f32 *)malloc((size_t)t->dpad * sizeof(f32)), *tmp = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
-    f32 *lf = (f32 *)malloc((size_t)t->dpad * 16 * sizeof(f32)), maxr = 0.0f, scale;
-    u8 *lut = (u8 *)malloc((size_t)t->dpad * 16 + 32);
+    f32 *lf = (f32 *)malloc((size_t)t->vd * 16 * sizeof(f32)), maxr = 0.0f, scale;
+    u8 *lut = (u8 *)malloc((size_t)t->vd * 16 + 32);
     TqJob jobs[16];
     pthread_t th[16];
     i32 d, c, i, nj, per, cnt = 0, lutmax;
@@ -861,15 +907,19 @@ i32 tq_search(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, cons
 
     if (t->n == 0 || R <= 0) { free(rot); free(tmp); free(lf); free(lut); return 0; }
     tq_rot_(t, q, rot, tmp);
-    for (d = 0; d < t->dpad; ++d) {
+    for (d = 0; d < t->vd; ++d) {                                /* one 16-entry table per code column */
         f32 mn = 1e30f, mx = -1e30f;
-        for (c = 0; c < 16; ++c) { f32 v = rot[d] * TQ_CENT[c]; lf[d * 16 + c] = v; if (v < mn) mn = v; if (v > mx) mx = v; }
+        if (t->bits == 2) {                                      /* column d = coordinates 2d, 2d+1, 2 bits each */
+            f32 a = 2 * d < t->dpad ? rot[2 * d] : 0.0f, b = 2 * d + 1 < t->dpad ? rot[2 * d + 1] : 0.0f;
+            for (c = 0; c < 16; ++c) { f32 v = a * TQ_CENT2[c & 3] + b * TQ_CENT2[c >> 2]; lf[d * 16 + c] = v; if (v < mn) mn = v; if (v > mx) mx = v; }
+        } else
+            for (c = 0; c < 16; ++c) { f32 v = rot[d] * TQ_CENT[c]; lf[d * 16 + c] = v; if (v < mn) mn = v; if (v > mx) mx = v; }
         for (c = 0; c < 16; ++c) lf[d * 16 + c] -= mn;
         if (mx - mn > maxr) maxr = mx - mn;
     }
-    lutmax = 65535 / t->dpad; if (lutmax > 255) lutmax = 255;
+    lutmax = 65535 / t->vd; if (lutmax > 255) lutmax = 255;
     scale = maxr > 0.0f ? (f32)lutmax / maxr : 1.0f;
-    for (i = 0; i < t->dpad * 16; ++i) { i32 v = (i32)(lf[i] * scale + 0.5f); lut[i] = (u8)(v > lutmax ? lutmax : v); }
+    for (i = 0; i < t->vd * 16; ++i) { i32 v = (i32)(lf[i] * scale + 0.5f); lut[i] = (u8)(v > lutmax ? lutmax : v); }
 
     if (t->nc > 1) {                                             /* IVF: the blocks of the nprobe clusters closest to the query */
         i32 np = probe > 0 ? probe : t->nprobe, nb = 0, ng = (t->nc + 15) / 16;

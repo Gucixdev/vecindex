@@ -31,7 +31,10 @@
  *     f32 rows are only read for the few hundred candidates re-scored per query; when those reads start missing
  *     the page cache, the kernel is asked for all of them at once (MADV_WILLNEED) instead of one fault at a time;
  *   - doc ids that arrive in increasing order (the usual case) need no id map at all: lookups binary-search the
- *     id column. Only rows added out of order go into a hash of row numbers (8 bytes a slot).
+ *     id column. Only rows added out of order go into a hash of row numbers (8 bytes a slot);
+ *   - for the largest stores two knobs trade a little recall for a lot of room (store_set_codes,
+ *     store_set_vec_bytes): 2-bit codes (d/4 bytes a row in RAM instead of d/2) and int8 rows on disk (d + 4
+ *     bytes instead of 4d). 100M rows of 96 dimensions then need 2.8 GB of RAM and 11.6 GB of disk.
  *
  * Concurrency: an rwlock - store_search(_filter) take the read lock and
  * touch no shared mutable state (own malloc scratch, engine_search_into
@@ -91,6 +94,7 @@ static void store_prefetch_row_(const f32 *row, i32 dim)
 
 #define STORE_MAGIC   0x34584956u   /* 'VIX4' - v4 = goal gains max_candidates */
 #define STORE_VERSION 5             /* v5: 64-byte aligned sections, the scan index saved too, loaded by mmap */
+#define STORE_VERSION_I8 6          /* v6: v5 + a 16-byte extension after the header (int8 rows) and their scales */
 
 /* ---- column chunks ---- */
 #define STORE_CSHIFT 16                           /* 65536 rows a chunk */
@@ -125,6 +129,10 @@ typedef struct {
     i32      dim;
 
     SCol     vec, idc, metac;   /* the rows: unit vectors, caller doc ids, caller i64 tags (0 = none) */
+    SCol     vsc;           /* int8 rows only: the f32 scale of each row */
+    i32      vbytes;        /* 4: f32 rows; 1: int8 rows (each row times its scale) */
+    i32      codebits;      /* 4 or 2: the scan index's code width (store_set_codes) */
+    f32     *addbuf;        /* [dim] the row being added, normalised (under the write lock) */
     u64     *dead;          /* tombstones, one bit a row */
     i64      dead_words;
     i32      live;          /* rows that are not tombstoned */
@@ -151,7 +159,9 @@ typedef struct {
 } RagStore;
 
 /* row accessors (also for tests and tools) */
-#define STORE_VEC(s, r)  ((f32 *)(void *)SCOL_AT(&(s)->vec, r))
+#define STORE_VEC(s, r)  ((f32 *)(void *)SCOL_AT(&(s)->vec, r))      /* f32 stores only (vbytes == 4) */
+#define STORE_I8(s, r)   ((i8 *)(void *)SCOL_AT(&(s)->vec, r))
+#define STORE_SC(s, r)   (*(f32 *)(void *)SCOL_AT(&(s)->vsc, r))
 #define STORE_ID(s, r)   (*(i64 *)(void *)SCOL_AT(&(s)->idc, r))
 #define STORE_META(s, r) (*(i64 *)(void *)SCOL_AT(&(s)->metac, r))
 #define STORE_DEAD(s, r) ((i32)(((s)->dead[(size_t)(r) >> 6] >> ((u32)(r) & 63u)) & 1u))
@@ -160,7 +170,15 @@ typedef struct {
 static TqCol store_tqcol_(const SCol *c)
 {
     TqCol t;
-    t.chunk = c->chunk; t.shift = STORE_CSHIFT; t.esz = c->esz;
+    t.chunk = c->chunk; t.shift = STORE_CSHIFT; t.esz = c->esz; t.i8 = 0; t.dim = 0; t.scale = (const TqCol *)0;
+    return t;
+}
+
+/* the vector rows as the index builder reads them (int8 rows carry their scale column along) */
+static TqCol store_vcol_(const RagStore *s, TqCol *sc)
+{
+    TqCol t = store_tqcol_(&s->vec);
+    if (s->vbytes == 1) { *sc = store_tqcol_(&s->vsc); t.i8 = 1; t.dim = s->dim; t.scale = sc; }
     return t;
 }
 
@@ -248,10 +266,12 @@ static i32 store_reserve_(RagStore *s, i64 need)
     while (s->vec.nchunk < nch) if (scol_push_(s, &s->vec)) return -1;
     while (s->idc.nchunk < nch) if (scol_push_(s, &s->idc)) return -1;
     while (s->metac.nchunk < nch) if (scol_push_(s, &s->metac)) return -1;
+    while (s->vbytes == 1 && s->vsc.nchunk < nch) if (scol_push_(s, &s->vsc)) return -1;
     ci = (i32)((i64)s->count >> STORE_CSHIFT);                   /* the chunk the next row lands in */
     if (scol_unshare_(s, &s->vec, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT))
         || scol_unshare_(s, &s->idc, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT))
-        || scol_unshare_(s, &s->metac, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT))) return -1;
+        || scol_unshare_(s, &s->metac, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT))
+        || (s->vbytes == 1 && scol_unshare_(s, &s->vsc, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))) return -1;
     if (words > s->dead_words) {
         i64 nw = s->dead_words ? s->dead_words * 2 : 1024;
         u64 *d;
@@ -276,6 +296,8 @@ static void store_chunk_done_(RagStore *s, i32 ci)
             sync_file_range(s->spill_fd, (off_t)s->idc.foff[ci], (off_t)(STORE_CROWS * 8), SYNC_FILE_RANGE_WRITE);
         if (ci < s->metac.nchunk && s->metac.how[ci] == STORE_SPILL)
             sync_file_range(s->spill_fd, (off_t)s->metac.foff[ci], (off_t)(STORE_CROWS * 8), SYNC_FILE_RANGE_WRITE);
+        if (ci < s->vsc.nchunk && s->vsc.how[ci] == STORE_SPILL)
+            sync_file_range(s->spill_fd, (off_t)s->vsc.foff[ci], (off_t)(STORE_CROWS * 4), SYNC_FILE_RANGE_WRITE);
     }
 #else
     (void)s; (void)ci;
@@ -460,6 +482,9 @@ RagStore *store_new(Arena *a, i32 dim)
     s->goal.n_iters = 12;
     s->goal.seed = 0x5eedu;
     s->vec.esz = (size_t)dim * sizeof(f32); s->vec.elem = sizeof(f32);
+    s->vsc.esz = sizeof(f32); s->vsc.elem = sizeof(f32);
+    s->vbytes = 4; s->codebits = 4;
+    s->addbuf = (f32 *)malloc((size_t)dim * sizeof(f32));
     s->idc.esz = sizeof(i64); s->idc.elem = sizeof(i64);
     s->metac.esz = sizeof(i64); s->metac.elem = sizeof(i64);
     h64_init(&s->dup, 8);
@@ -504,7 +529,8 @@ void store_destroy(RagStore *s)
     if (s->jf) fclose(s->jf);
     free(s->jpath); s->jpath = (char *)0;
     arena_free(&s->idx_arena);
-    scol_free_(&s->vec); scol_free_(&s->idc); scol_free_(&s->metac);
+    scol_free_(&s->vec); scol_free_(&s->idc); scol_free_(&s->metac); scol_free_(&s->vsc);
+    free(s->addbuf); s->addbuf = (f32 *)0;
     free(s->dead); s->dead = (u64 *)0; s->dead_words = 0;
     if (s->map) { munmap(s->map, s->map_len); s->map = (void *)0; }
     if (s->spill_fd >= 0) { close(s->spill_fd); s->spill_fd = -1; }
@@ -517,10 +543,10 @@ void store_mem(RagStore *s, i64 *ram, i64 *file)
 {
     i64 r = 0, f = 0;
     i32 c;
-    SCol *cols[3];
+    SCol *cols[4];
     pthread_rwlock_rdlock(&s->lock);
-    cols[0] = &s->vec; cols[1] = &s->idc; cols[2] = &s->metac;
-    for (c = 0; c < 3; ++c) {
+    cols[0] = &s->vec; cols[1] = &s->idc; cols[2] = &s->metac; cols[3] = &s->vsc;
+    for (c = 0; c < 4; ++c) {
         i32 i;
         for (i = 0; i < cols[c]->nchunk; ++i) {
             i64 rows = (i64)s->count - ((i64)i << STORE_CSHIFT), b;
@@ -533,7 +559,7 @@ void store_mem(RagStore *s, i64 *ram, i64 *file)
     r += s->dead_words * 8 + (i64)s->ids_h.cap * 8 + (i64)s->dup.cap * 13;
     if (s->tq) {
         r += tq_ram_(s->tq);
-        if (s->tq->mapped) f += (i64)s->tq->nblk * s->tq->dpad * 16 + (s->tq->slot_row ? (i64)s->tq->nblk * 128 : 0);
+        if (s->tq->mapped) f += (i64)s->tq->nblk * s->tq->vd * 16 + (s->tq->slot_row ? (i64)s->tq->nblk * 128 : 0);
     }
     pthread_rwlock_unlock(&s->lock);
     if (ram) *ram = r;
@@ -560,12 +586,83 @@ static i32 store_ncpu_(void)
 
 static Tq *store_tq_build_(RagStore *s, i32 n)
 {
-    TqCol col = store_tqcol_(&s->vec);
+    TqCol sc, col = store_vcol_(s, &sc);
     Tq *t;
     store_advise_(s, MADV_SEQUENTIAL);                           /* the build reads every row in order, twice */
-    t = tq_build(&col, n, s->dim, s->goal.seed, n >= STORE_IVF_MIN ? n / STORE_IVF_ROWS : 0, store_ncpu_());
+    t = tq_build(&col, n, s->dim, s->goal.seed, n >= STORE_IVF_MIN ? n / STORE_IVF_ROWS : 0, store_ncpu_(), s->codebits);
     store_advise_(s, MADV_RANDOM);                               /* searching re-scores rows at random */
     return t;
+}
+
+/* Code width of the scan index from the next build on: 4 (default) or 2. 2-bit codes take d/4 bytes a row in RAM
+ * instead of d/2 and scan twice as fast, but rank candidates more coarsely: re-score more of them
+ * (store_set_rerank) to keep the recall. */
+void store_set_codes(RagStore *s, i32 bits)
+{
+    pthread_rwlock_wrlock(&s->lock);
+    s->codebits = bits == 2 ? 2 : 4;
+    pthread_rwlock_unlock(&s->lock);
+}
+
+/* Bytes a coordinate in the stored rows: 4 (f32, default) or 1 (int8, with an f32 scale a row: d + 4 bytes instead
+ * of 4d, re-scoring error around 0.3% of a score). Only on an empty store; returns 0, or -1 if it has rows.
+ * int8 rows have no f32 copy to lend out, so store_vec_ptr returns NULL; store_get_vec dequantises. */
+i32 store_set_vec_bytes(RagStore *s, i32 bytes)
+{
+    i32 r = 0;
+    pthread_rwlock_wrlock(&s->lock);
+    if (s->count > 0 || s->vec.nchunk > 0) r = -1;
+    else if (bytes == 1) { s->vbytes = 1; s->vec.esz = (size_t)s->dim; s->vec.elem = 1; }
+    else { s->vbytes = 4; s->vec.esz = (size_t)s->dim * sizeof(f32); s->vec.elem = sizeof(f32); }
+    pthread_rwlock_unlock(&s->lock);
+    return r;
+}
+
+/* row r as f32: a pointer into the column, or dequantised into buf[dim] */
+static const f32 *store_row_(const RagStore *s, i32 r, f32 *buf)
+{
+    const i8 *x;
+    f32 sc;
+    i32 d = 0;
+    if (s->vbytes != 1) return STORE_VEC(s, r);
+    x = STORE_I8(s, r); sc = STORE_SC(s, r);
+#if defined(__AVX512F__)
+    for (; d + 16 <= s->dim; d += 16)
+        _mm512_storeu_ps(buf + d, _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(x + d)))), _mm512_set1_ps(sc)));
+#endif
+    for (; d < s->dim; ++d) buf[d] = sc * (f32)x[d];
+    return buf;
+}
+
+/* q . row r (q unit length): what every exact re-score uses */
+static f32 store_dot_(const RagStore *s, const f32 *q, i32 r)
+{
+    const i8 *x;
+    f32 acc = 0.0f;
+    i32 d = 0;
+    if (s->vbytes != 1) return vs_dot(q, STORE_VEC(s, r), s->dim);
+    x = STORE_I8(s, r);
+#if defined(__AVX512F__)
+    {   __m512 a = _mm512_setzero_ps();
+        for (; d + 16 <= s->dim; d += 16)
+            a = _mm512_fmadd_ps(_mm512_loadu_ps(q + d), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(x + d)))), a);
+        acc = _mm512_reduce_add_ps(a); }
+#endif
+    for (; d < s->dim; ++d) acc += q[d] * (f32)x[d];
+    return acc * STORE_SC(s, r);
+}
+
+/* store a normalised f32 row into row r (int8: symmetric, scale = max |v| / 127) */
+static void store_put_row_(RagStore *s, i32 r, const f32 *v)
+{
+    i32 d;
+    if (s->vbytes != 1) { memcpy(STORE_VEC(s, r), v, (size_t)s->dim * sizeof(f32)); return; }
+    {   f32 mx = 0.0f, inv;
+        i8 *x = STORE_I8(s, r);
+        for (d = 0; d < s->dim; ++d) { f32 a = v[d] < 0.0f ? -v[d] : v[d]; if (a > mx) mx = a; }
+        inv = mx > 0.0f ? 127.0f / mx : 0.0f;
+        for (d = 0; d < s->dim; ++d) { f32 y = v[d] * inv; x[d] = (i8)(y < 0.0f ? y - 0.5f : y + 0.5f); }
+        STORE_SC(s, r) = mx / 127.0f; }
 }
 
 /* fast build: one k-means + q4 instead of the auto-tuner's candidate bake-off */
@@ -597,9 +694,10 @@ i32 store_add_meta(RagStore *s, const f32 *vec, i64 doc_id, i64 meta)
     store_idmap_locked_(s);
     if (store_reserve_(s, (i64)s->count + 1) != 0) { pthread_rwlock_unlock(&s->lock); return -1; }
     r = s->count;
-    v = STORE_VEC(s, r);
+    v = s->addbuf;
     memcpy(v, vec, (size_t)s->dim * sizeof(f32));
     store_normalise_(v, s->dim);
+    store_put_row_(s, r, v);
     STORE_ID(s, r) = doc_id;
     STORE_META(s, r) = meta;
     s->dead[r >> 6] &= ~((u64)1 << (r & 63));
@@ -660,6 +758,7 @@ const f32 *store_vec_ptr(const RagStore *s, i64 doc_id)
 {
     i32 r;
     store_need_idmap_((RagStore *)s);
+    if (s->vbytes == 1) return (const f32 *)0;                   /* int8 rows: no f32 copy to lend (store_get_vec) */
     r = store_live_row_(s, doc_id);
     return r >= 0 ? STORE_VEC(s, r) : (const f32 *)0;
 }
@@ -678,7 +777,7 @@ i32 store_get_vec(RagStore *s, i64 doc_id, f32 *out)
     store_need_idmap_(s);
     pthread_rwlock_rdlock(&s->lock);
     r = store_live_row_(s, doc_id);
-    if (r >= 0) memcpy(out, STORE_VEC(s, r), (size_t)s->dim * sizeof(f32));
+    if (r >= 0) { const f32 *v = store_row_(s, r, out); if (v != out) memcpy(out, v, (size_t)s->dim * sizeof(f32)); }
     pthread_rwlock_unlock(&s->lock);
     return r >= 0 ? 0 : -1;
 }
@@ -712,7 +811,8 @@ static i32 store_compact_(RagStore *s)
     for (i = 0; i < s->count; ++i) {
         if (STORE_DEAD(s, i)) continue;
         if (w != i) {
-            memcpy(STORE_VEC(s, w), STORE_VEC(s, i), s->vec.esz);
+            memcpy(SCOL_AT(&s->vec, w), SCOL_AT(&s->vec, i), s->vec.esz);
+            if (s->vbytes == 1) STORE_SC(s, w) = STORE_SC(s, i);
             STORE_ID(s, w) = STORE_ID(s, i);
             STORE_META(s, w) = STORE_META(s, i);
         }
@@ -745,9 +845,9 @@ void store_build(RagStore *s)
         if (w > 0) s->tq = store_tq_build_(s, w);
     } else if (w > 0) {
         /* the tuner wants one contiguous array (it copies what it keeps) */
-        f32 *flat = (f32 *)malloc((size_t)w * s->vec.esz);
+        f32 *flat = (f32 *)malloc((size_t)w * (size_t)s->dim * sizeof(f32));
         i32 i;
-        for (i = 0; i < w; ++i) memcpy(flat + (size_t)i * s->dim, STORE_VEC(s, i), s->vec.esz);
+        for (i = 0; i < w; ++i) { f32 *dst = flat + (size_t)i * s->dim; const f32 *v = store_row_(s, i, dst); if (v != dst) memcpy(dst, v, (size_t)s->dim * sizeof(f32)); }
         s->idx = engine_build(&s->idx_arena, flat, w, s->dim, s->goal);
         free(flat);
     } else s->idx = (EngIndex *)0;
@@ -785,6 +885,7 @@ static void store_willneed_(const RagStore *s, const i32 *rows, i32 m)
         i32 r = rows[i];
         if (r < 0 || r >= s->count || s->vec.how[(size_t)r >> STORE_CSHIFT] == STORE_ANON) continue;
         store_madv_(s, SCOL_AT(&s->vec, r), s->vec.esz, MADV_WILLNEED);
+        if (s->vbytes == 1) store_madv_(s, SCOL_AT(&s->vsc, r), 4, MADV_WILLNEED);
     }
 }
 
@@ -805,9 +906,9 @@ static void store_rescore_(RagStore *s, const f32 *qn, const i32 *rows, i32 m, i
     for (i = 0; i < m; ++i) {
         i32 row = rows[i];
         if (i + STORE_PF_AHEAD < m && rows[i + STORE_PF_AHEAD] >= 0 && rows[i + STORE_PF_AHEAD] < s->built_upto)
-            store_prefetch_row_(STORE_VEC(s, rows[i + STORE_PF_AHEAD]), s->dim);
+            store_prefetch_row_((const f32 *)(const void *)SCOL_AT(&s->vec, rows[i + STORE_PF_AHEAD]), (i32)(s->vec.esz / 4));
         if (row < 0 || row >= s->built_upto) continue;
-        eng_topk_(out_rows, out_scores, k, have, (i64)row, 2.0f * vs_dot(qn, STORE_VEC(s, row), s->dim) - 2.0f);
+        eng_topk_(out_rows, out_scores, k, have, (i64)row, 2.0f * store_dot_(s, qn, row) - 2.0f);
     }
     if (!pf && store_vec_filed_(s)) {
         i64 df = store_majflt_() - f0;
@@ -881,7 +982,7 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
                 if (STORE_DEAD(s, i) || !store_meta_ok_(STORE_META(s, i), all_bits, any_bits)) continue;
                 for (j = 0; j < have; ++j) if (out_doc_ids[j] == i) { dup = 1; break; }
                 if (dup) continue;
-                eng_topk_(out_doc_ids, out_scores, k, &have, (i64)i, 2.0f * vs_dot(qn, STORE_VEC(s, i), dim) - 2.0f);
+                eng_topk_(out_doc_ids, out_scores, k, &have, (i64)i, 2.0f * store_dot_(s, qn, i) - 2.0f);
             }
         }
     }
@@ -890,7 +991,7 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
     for (i = s->built_upto; i < tail; ++i) {                    /* the pending tail: exact */
         if (STORE_DEAD(s, i)) continue;
         if (filtered && !store_meta_ok_(STORE_META(s, i), all_bits, any_bits)) continue;
-        eng_topk_(out_doc_ids, out_scores, k, &have, (i64)i, 2.0f * vs_dot(qn, STORE_VEC(s, i), dim) - 2.0f);
+        eng_topk_(out_doc_ids, out_scores, k, &have, (i64)i, 2.0f * store_dot_(s, qn, i) - 2.0f);
     }
     for (i = 0; i < have; ++i) out_doc_ids[i] = STORE_ID(s, out_doc_ids[i]);   /* rows -> doc ids, only for the k kept */
 
@@ -1069,9 +1170,9 @@ static int store_col_w_(FILE *f, const SCol *c, i64 n)
 static int store_tq_w_(FILE *f, const Tq *t)
 {
     i32 h[8];
-    size_t ncode = (size_t)t->nblk * (size_t)t->dpad * 16;
+    size_t ncode = (size_t)t->nblk * (size_t)t->vd * 16;
     h[0] = t->dim; h[1] = t->dpad; h[2] = t->n; h[3] = t->nblk; h[4] = t->nc; h[5] = t->nprobe;
-    h[6] = t->slot_row != (i32 *)0; h[7] = 0;
+    h[6] = t->slot_row != (i32 *)0; h[7] = t->bits == 2 ? 2 : 0;                     /* 0 = 4-bit (older files) */
     if (store_pad_(f) || STORE_W32(f, h, 8)
         || store_pad_(f) || STORE_W32(f, t->s1, (size_t)t->dpad)
         || store_pad_(f) || STORE_W32(f, t->s2, (size_t)t->dpad)
@@ -1087,7 +1188,7 @@ i32 store_save(RagStore *s, const char *path)
 {
     FILE *f;
     char *tmp;
-    i32 hdr[4];
+    i32 hdr[4], ext[4];
     i32 live, stale;
     u8 kind;
 
@@ -1098,16 +1199,19 @@ i32 store_save(RagStore *s, const char *path)
     f = fopen(tmp, "wb");                                        /* the old file stays intact until the new one is complete and on disk */
     if (!f) { free(tmp); pthread_rwlock_unlock(&s->lock); return -1; }
 
-    hdr[0] = (i32)STORE_MAGIC; hdr[1] = STORE_VERSION;
+    hdr[0] = (i32)STORE_MAGIC; hdr[1] = s->vbytes == 1 ? STORE_VERSION_I8 : STORE_VERSION;   /* f32 stores stay v5 */
     hdr[2] = s->dim; hdr[3] = live;
+    ext[0] = 1; ext[1] = ext[2] = ext[3] = 0;                    /* v6: rows are int8 */
     /* 0: no index (load rebuilds), 1: engine index, 2: the scan index */
     kind = (u8)(s->idx != (EngIndex *)0 && s->built_upto == live ? 1
               : (s->tq && !stale && s->built_upto == live && s->tq->n == live ? 2 : 0));
 
     store_advise_(s, MADV_SEQUENTIAL);                           /* the save streams every row: read ahead */
     if (STORE_W32(f, hdr, 4)
+        || (s->vbytes == 1 && STORE_W32(f, ext, 4))
         || store_goal_w_(f, &s->goal)
         || store_pad_(f) || store_col_w_(f, &s->vec, live)
+        || (s->vbytes == 1 && (store_pad_(f) || store_col_w_(f, &s->vsc, live)))
         || store_pad_(f) || store_col_w_(f, &s->idc, live)
         || store_pad_(f) || store_col_w_(f, &s->metac, live)
         || fwrite(&kind, 1, 1, f) != 1
@@ -1192,6 +1296,7 @@ static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows)
     if (h[0] <= 0 || h[1] < h[0] || h[2] != rows || h[3] < 0 || h[4] < 0) return (Tq *)0;
     t = (Tq *)calloc(1, sizeof(Tq));
     t->dim = h[0]; t->dpad = h[1]; t->n = h[2]; t->nblk = h[3]; t->nc = h[4]; t->nprobe = h[5];
+    t->bits = h[7] == 2 ? 2 : 4; t->vd = tq_vd_(t->dpad, t->bits);
     t->mapped = map != (u8 *)0;
     o = STORE_AL(o + 32);
     t->s1 = (f32 *)store_take_(map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
@@ -1204,7 +1309,7 @@ static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows)
         o = STORE_AL(o + ((size_t)t->nc + 1) * 4);
     }
     if (h[6]) { t->slot_row = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nblk * 32); o = STORE_AL(o + (size_t)t->nblk * 128); }
-    t->codes = (u8 *)store_take_(map, len, f, o, 1, (size_t)t->nblk * (size_t)t->dpad * 16);
+    t->codes = (u8 *)store_take_(map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd * 16);
     if (!t->s1 || !t->s2 || !t->perm || (t->nc > 1 && (!t->cent || !t->cstart)) || (h[6] && !t->slot_row) || !t->codes) {
         tq_free(t);
         return (Tq *)0;
@@ -1212,7 +1317,7 @@ static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows)
     tq_prepare_(t);
     if (map) {                                                   /* the codes are scanned on every query: start reading them now */
         size_t pg = (size_t)sysconf(_SC_PAGESIZE), a = (size_t)t->codes & ~(pg - 1);
-        madvise((void *)a, (size_t)t->codes + (size_t)t->nblk * (size_t)t->dpad * 16 - a, MADV_WILLNEED);
+        madvise((void *)a, (size_t)t->codes + (size_t)t->nblk * (size_t)t->vd * 16 - a, MADV_WILLNEED);
     }
     return t;
 }
@@ -1223,17 +1328,20 @@ static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows)
 static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *hdr)
 {
     RagStore *s;
-    i32 live = hdr[3], dim = hdr[2];
+    i32 live = hdr[3], dim = hdr[2], ext[4], i8rows = hdr[1] == STORE_VERSION_I8;
     struct stat st;
-    size_t len, o_vecs, o_ids, o_meta, o_kind;
+    size_t len, o_vecs, o_vsc = 0, o_ids, o_meta, o_kind;
     u8 *map = (u8 *)0, kind = 0;
 
     if (live < 0 || dim <= 0 || fstat(fileno(f), &st) != 0) { fclose(f); return (RagStore *)0; }
     len = (size_t)st.st_size;
+    if (i8rows && (STORE_R32(f, ext, 4) || ext[0] != 1)) { fclose(f); return (RagStore *)0; }
     s = store_new(a, dim);
+    if (i8rows) store_set_vec_bytes(s, 1);
     if (store_goal_r_(f, &s->goal)) { fclose(f); store_destroy(s); return (RagStore *)0; }
-    o_vecs = STORE_AL(16 + 32);
-    o_ids  = STORE_AL(o_vecs + (size_t)live * (size_t)dim * 4);
+    o_vecs = STORE_AL((i8rows ? 32 : 16) + 32);
+    if (i8rows) { o_vsc = STORE_AL(o_vecs + (size_t)live * (size_t)dim); o_ids = STORE_AL(o_vsc + (size_t)live * 4); }
+    else o_ids = STORE_AL(o_vecs + (size_t)live * (size_t)dim * 4);
     o_meta = STORE_AL(o_ids + (size_t)live * 8);
     o_kind = o_meta + (size_t)live * 8;
     if (o_kind >= len) { fclose(f); store_destroy(s); return (RagStore *)0; }
@@ -1243,7 +1351,8 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     }
     if (live > 0) {
         if (store_col_r_(s, &s->vec, map, len, f, o_vecs, live) || store_col_r_(s, &s->idc, map, len, f, o_ids, live)
-            || store_col_r_(s, &s->metac, map, len, f, o_meta, live)) { fclose(f); store_destroy(s); return (RagStore *)0; }
+            || store_col_r_(s, &s->metac, map, len, f, o_meta, live)
+            || (i8rows && store_col_r_(s, &s->vsc, map, len, f, o_vsc, live))) { fclose(f); store_destroy(s); return (RagStore *)0; }
         s->dead_words = ((i64)live + 63) >> 6;
         s->dead = (u64 *)calloc((size_t)s->dead_words, sizeof(u64));
         if (map) {                                               /* re-scoring reads rows at random: no read-ahead */
@@ -1283,8 +1392,8 @@ RagStore *store_load(Arena *a, const char *path)
     u8 has_idx;
     if (!f) return (RagStore *)0;
     if (STORE_R32(f, hdr, 4) || (u32)hdr[0] != STORE_MAGIC
-        || (hdr[1] != 4 && hdr[1] != STORE_VERSION)) { fclose(f); return (RagStore *)0; }
-    if (hdr[1] == STORE_VERSION) return store_load_v5_(a, path, f, hdr);
+        || (hdr[1] != 4 && hdr[1] != STORE_VERSION && hdr[1] != STORE_VERSION_I8)) { fclose(f); return (RagStore *)0; }
+    if (hdr[1] == STORE_VERSION || hdr[1] == STORE_VERSION_I8) return store_load_v5_(a, path, f, hdr);
 
     /* v4: packed sections, no saved scan index - read everything, rebuild the scan */
     s = store_new(a, hdr[2]);
@@ -1480,7 +1589,7 @@ int main(void)
         {   f32 *un = (f32 *)malloc((size_t)n * dim * sizeof(f32));                /* unit rows, as the store keeps them */
             for (i = 0; i < n; ++i) { f32 nr = 0; for (j = 0; j < dim; ++j) nr += vv[(size_t)i * dim + j] * vv[(size_t)i * dim + j]; nr = 1.0f / (f32)sqrt((f64)nr); for (j = 0; j < dim; ++j) un[(size_t)i * dim + j] = vv[(size_t)i * dim + j] * nr; }
             vcol = tq_col_flat(un, (size_t)dim * sizeof(f32), &hv);
-            flat = tq_build(&vcol, n, dim, 7u, 0, 2); ivf = tq_build(&vcol, n, dim, 7u, 60, 2);
+            flat = tq_build(&vcol, n, dim, 7u, 0, 2, 4); ivf = tq_build(&vcol, n, dim, 7u, 60, 2, 4);
             for (q = 0; q < nq; ++q) {
                 i32 rf[256], ri[256], rn[256], nf, ni, nn2;
                 const f32 *qv = un + (size_t)((q * 97) % n) * dim;
@@ -1527,6 +1636,82 @@ int main(void)
         print_cstr(", file-backed bytes "); print_i64(file); print_cstr("\n");
         if (same != tried || found != tried || file < (i64)n * dim * 4) ok = 0;
         store_destroy(m); store_destroy(d);
+    }
+
+    /* the compact modes: int8 rows + 2-bit codes. Same neighbours as the f32 / 4-bit store, a v6 file that loads back
+     * to identical answers, and the 2-bit IVF scan of every cluster equal to the 2-bit flat scan */
+    {
+        RagStore *ref = store_new(a, dim), *c8 = store_new(a, dim), *cl;
+        i32 tried = 0, agree = 0, same = 0, self = 0, x;
+        f32 back[128], cosm = 1.0f;
+        store_set_fast(ref, 0.9f); store_set_fast(c8, 0.9f);
+        if (store_set_vec_bytes(c8, 1) != 0) ok = 0;
+        store_set_codes(c8, 2);
+        store_set_rerank(c8, 1000);                                  /* 2-bit ranks coarsely: re-score more */
+        for (i = 0; i < n; ++i) { store_add(ref, vv + (size_t)i * dim, 7000 + i); store_add(c8, vv + (size_t)i * dim, 7000 + i); }
+        if (store_set_vec_bytes(c8, 4) != -1) ok = 0;               /* not once it has rows */
+        store_build(ref); store_build(c8);
+        for (i = 0; i < n; i += 7) {   /* a hit counts when its exact score is within the int8 error of the exact 10th best: rows of a topic are near
+                                       * ties (cosine ~0.998), so the exact ids are a coin toss; real-data recall is in bench/ */
+            i64 r1[10], r2[10]; f32 c1[10], c2[10];
+            i32 h1 = store_search(ref, vv + (size_t)i * dim, 10, r1, c1), h2 = store_search(c8, vv + (size_t)i * dim, 10, r2, c2);
+            for (x = 0; x < h2 && h1 == 10; ++x) {
+                f32 ex[128];
+                if (store_get_vec(ref, r2[x], ex) == 0) {
+                    f32 d2 = 0.0f, qq = 0.0f; i32 z;
+                    for (z = 0; z < dim; ++z) { d2 += ex[z] * vv[(size_t)i * dim + z]; qq += vv[(size_t)i * dim + z] * vv[(size_t)i * dim + z]; }
+                    if (2.0f * d2 / (f32)sqrt((f64)qq) - 2.0f >= c1[9] - 0.01f) ++agree;   /* within the int8 error */
+                }
+            }
+            tried += h1;
+            if (h2 > 0 && r2[0] == 7000 + i) ++self;
+        }
+        for (i = 0; i < n; i += 97) {
+            f32 dot = 0.0f, nn = 0.0f;
+            if (store_get_vec(c8, 7000 + i, back) != 0) { ok = 0; continue; }
+            for (x = 0; x < dim; ++x) { dot += back[x] * vv[(size_t)i * dim + x]; nn += vv[(size_t)i * dim + x] * vv[(size_t)i * dim + x]; }
+            dot /= (f32)sqrt((f64)nn);
+            if (dot < cosm) cosm = dot;
+        }
+        if (store_vec_ptr(c8, 7000) != (const f32 *)0) ok = 0;      /* no f32 copy to lend */
+        if (store_save(c8, "/tmp/store_demo_i8.vxi") != 0) ok = 0;
+        cl = store_load(a, "/tmp/store_demo_i8.vxi");
+        if (!cl || cl->vbytes != 1 || !cl->tq || cl->tq->bits != 2) ok = 0;
+        else for (i = 0; i < n; i += 11) {
+            i64 r1[5], r2[5]; f32 c1[5], c2[5];
+            i32 h1 = store_search(c8, vv + (size_t)i * dim, 5, r1, c1), h2 = store_search(cl, vv + (size_t)i * dim, 5, r2, c2), eq = h1 == h2;
+            for (x = 0; x < h1 && eq; ++x) if (r1[x] != r2[x]) eq = 0;
+            same += eq;
+        }
+        print_cstr("  int8 rows + 2-bit codes: top-10 as close as the exact top-10 on "); print_i64((i64)(100L * agree / (tried ? tried : 1)));
+        print_cstr("%, self@1 "); print_i64((i64)(100L * self / ((n + 6) / 7))); print_cstr("%, min cosine of a dequantised row ");
+        print_i64((i64)(cosm * 10000.0f)); print_cstr("e-4, v6 save/load identical on "); print_i64((i64)(100L * same / ((n + 10) / 11)));
+        print_cstr("%\n");
+        if (agree * 100 < tried * 95 || self * 100 < ((n + 6) / 7) * 95 || cosm < 0.998f || same != (n + 10) / 11) ok = 0;
+        if (cl) store_destroy(cl);
+        store_destroy(ref); store_destroy(c8);
+        remove("/tmp/store_demo_i8.vxi"); remove("/tmp/store_demo_i8.vxi.j");
+    }
+    {   /* 2-bit IVF over every cluster == 2-bit flat */
+        f32 *un = (f32 *)malloc((size_t)n * dim * sizeof(f32));
+        u8 *hv;
+        TqCol vcol;
+        Tq *flat, *ivf;
+        i32 q, all_ok = 1, j;
+        for (i = 0; i < n; ++i) { f32 nr = 0; for (j = 0; j < dim; ++j) nr += vv[(size_t)i * dim + j] * vv[(size_t)i * dim + j]; nr = 1.0f / (f32)sqrt((f64)nr); for (j = 0; j < dim; ++j) un[(size_t)i * dim + j] = vv[(size_t)i * dim + j] * nr; }
+        vcol = tq_col_flat(un, (size_t)dim * sizeof(f32), &hv);
+        flat = tq_build(&vcol, n, dim, 7u, 0, 2, 2); ivf = tq_build(&vcol, n, dim, 7u, 60, 2, 2);
+        for (q = 0; q < 40; ++q) {
+            i32 rf[200], rn[200], nf, nn2, k;
+            const f32 *qv = un + (size_t)((q * 131) % n) * dim;
+            nf = tq_search(flat, qv, 200, rf, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 0);
+            nn2 = tq_search(ivf, qv, 200, rn, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 60);
+            if (nf != nn2) all_ok = 0;
+            for (k = 0; k < nf && k < 150 && all_ok; ++k) { i32 z, f = 0; for (z = 0; z < nn2; ++z) if (rn[z] == rf[k]) { f = 1; break; } if (!f) all_ok = 0; }
+        }
+        print_cstr("  2-bit IVF, every cluster == 2-bit flat: "); print_cstr(all_ok ? "yes" : "NO"); print_cstr("\n");
+        if (!all_ok || flat->vd != dim / 2 || ivf->bits != 2) ok = 0;
+        tq_free(flat); tq_free(ivf); free(un);
     }
 
     /* journal: base save, then only the changes are synced; a reload replays them (torn tail tolerated) */

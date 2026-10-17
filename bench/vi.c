@@ -11,6 +11,16 @@ static Arena vi_arena;
 
 void *vi_new(int dim) { return store_new(&vi_arena, dim); }
 
+/* codebits 4 or 2 (scan codes), vecbytes 4 (f32 rows) or 1 (int8 rows) */
+void *vi_new2(int dim, int codebits, int vecbytes)
+{
+    RagStore *s = store_new(&vi_arena, dim);
+    store_set_codes(s, codebits);
+    store_set_vec_bytes(s, vecbytes);
+    return s;
+}
+void vi_set_rerank(void *s, int r) { store_set_rerank((RagStore *)s, r); }
+
 /* adds n rows (ids = first_id + i); returns how many were accepted */
 int vi_add(void *s, const float *v, long n, long first_id)
 {

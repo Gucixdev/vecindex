@@ -2,7 +2,8 @@
 """One method of the vecindex benchmark on a prepared dataset (prepare_glove.py); prints JSON lines.
 
 usage: bench.py DATA_DIR METHOD [--threads T] [--lat N]
-methods: vecindex, turbovec4, turbovec2, faiss-hnsw, faiss-ivfflat, faiss-ivfpqfs, qdrant
+methods: vecindex, vecindex-i8, vecindex-2bit, vecindex-2bit-i8, turbovec4, turbovec2, faiss-hnsw, faiss-ivfflat,
+         faiss-ivfpqfs, qdrant
 
 Per method: build (timed, T threads), index size, save and load (timed, warm page cache), then for every
 search setting, on the LOADED index: recall@10 over all queries, single-thread QPS (one query per call,
@@ -42,13 +43,17 @@ def cpu_model():
 
 
 class VecIndex:
-    """vecindex: the store's default index (rotated 4-bit fast-scan, IVF from 600k rows, exact re-score)."""
+    """vecindex: the store's index (rotated 4-bit fast-scan, IVF from 600k rows, exact re-score of the candidates).
+    bits=2: 2-bit codes; vbytes=1: int8 rows (the compact modes for very large stores)."""
     pins_threads = True
 
-    def __init__(self, dim, threads):
+    def __init__(self, dim, threads, bits=4, vbytes=4):
         lib = ctypes.CDLL(os.path.join(HERE, "libvi.so"))
         P, I, L, LL, F = ctypes.c_void_p, ctypes.c_int, ctypes.c_long, ctypes.c_longlong, ctypes.c_char_p
         lib.vi_new.restype = P; lib.vi_new.argtypes = [I]
+        lib.vi_new2.restype = P; lib.vi_new2.argtypes = [I, I, I]
+        lib.vi_set_rerank.argtypes = [P, I]
+        lib.vi_file_bytes.restype = LL; lib.vi_file_bytes.argtypes = [P]
         lib.vi_add.restype = I; lib.vi_add.argtypes = [P, P, L, L]
         lib.vi_build.argtypes = [P]
         lib.vi_set_probe.argtypes = [P, I]
@@ -59,16 +64,21 @@ class VecIndex:
         lib.vi_search.restype = I; lib.vi_search.argtypes = [P, P, I, P]
         lib.vi_search_batch.argtypes = [P, P, I, I, P, I]
         self.lib, self.dim, self.threads, self.s = lib, dim, threads, None
+        self.bits, self.vbytes = bits, vbytes
         self.version = os.popen(f"git -C {HERE} rev-parse --short HEAD 2>/dev/null").read().strip()
 
     def build(self, X):
         X = np.ascontiguousarray(X, dtype=np.float32)
-        self.s = self.lib.vi_new(self.dim)
+        self.s = self.lib.vi_new2(self.dim, self.bits, self.vbytes)
         self.lib.vi_add(self.s, X.ctypes.data, len(X), 0)
         self.lib.vi_build(self.s)
 
     def size(self):
-        return int(self.lib.vi_mem_bytes(self.s))
+        return int(self.lib.vi_mem_bytes(self.s)) + int(self.lib.vi_file_bytes(self.s))
+
+    def size_split(self):
+        """(RAM-only bytes, file-backed bytes): the codes stay hot; rows are paged in for re-scoring"""
+        return int(self.lib.vi_mem_bytes(self.s)), int(self.lib.vi_file_bytes(self.s))
 
     def save(self, path):
         if self.lib.vi_save(self.s, path.encode()) != 0:
@@ -80,10 +90,13 @@ class VecIndex:
             raise RuntimeError("vi_load failed")
 
     def sweep(self):
+        if self.bits == 2:                               # coarser codes: re-score more candidates
+            return [{"nprobe": p, "rerank": r} for p in (16, 32, 64, 96, 128, 192) for r in (256, 1000)]
         return [{"nprobe": p} for p in (8, 16, 24, 32, 48, 64, 96, 128, 192)]
 
     def set(self, prm):
         self.lib.vi_set_probe(self.s, prm["nprobe"])
+        self.lib.vi_set_rerank(self.s, prm.get("rerank", 0))
         self.lib.vi_set_threads(self.s, 1)
 
     def single_thread(self, on):
@@ -149,17 +162,26 @@ class Faiss:
 
 
 class TurboVec:
-    """turbovec (TurboQuant): no knobs; its thread pool is fixed at start, so run once per thread count."""
+    """turbovec (TurboQuant): no knobs; its thread pool is fixed at start, so run once per thread count.
+    It needs dim % 8 == 0: vectors (and queries) are zero-padded to the next multiple of 8, which leaves every
+    inner product unchanged (GloVe 100 -> 104)."""
     pins_threads = False
 
     def __init__(self, dim, threads, bits):
         os.environ["RAYON_NUM_THREADS"] = str(threads)
         import turbovec
         self.mod, self.dim, self.bits, self.version = turbovec, dim, bits, getattr(turbovec, "__version__", "?")
+        self.pdim = (dim + 7) // 8 * 8
+
+    def _pad(self, X):
+        X = np.ascontiguousarray(X, dtype=np.float32)
+        if self.pdim == self.dim:
+            return X
+        return np.ascontiguousarray(np.pad(X, [(0, 0)] * (X.ndim - 1) + [(0, self.pdim - self.dim)]))
 
     def build(self, X):
-        self.index = self.mod.TurboQuantIndex(dim=self.dim, bit_width=self.bits)
-        self.index.add(np.ascontiguousarray(X, dtype=np.float32))
+        self.index = self.mod.TurboQuantIndex(dim=self.pdim, bit_width=self.bits)
+        self.index.add(self._pad(X))
 
     def size(self):
         return len(self.index.to_bytes())
@@ -180,10 +202,10 @@ class TurboVec:
         pass
 
     def search_one(self, q, k):
-        return self.index.search(q[None, :], k)[1][0]
+        return self.index.search(self._pad(q[None, :]), k)[1][0]
 
     def search_batch(self, Q, k, threads):
-        return self.index.search(Q, k)[1]
+        return self.index.search(self._pad(Q), k)[1]
 
 
 class Qdrant:
@@ -258,6 +280,12 @@ class Qdrant:
 def make(method, dim, threads):
     if method == "vecindex":
         return VecIndex(dim, threads)
+    if method == "vecindex-i8":
+        return VecIndex(dim, threads, 4, 1)
+    if method == "vecindex-2bit":
+        return VecIndex(dim, threads, 2, 4)
+    if method == "vecindex-2bit-i8":
+        return VecIndex(dim, threads, 2, 1)
     if method == "turbovec4":
         return TurboVec(dim, threads, 4)
     if method == "turbovec2":
@@ -303,11 +331,14 @@ def main():
                 "threads": a.threads, "cpu": cpu_model(), "build_s": round(t_build, 3),
                 "save_s": round(t_save, 3), "load_s": round(t_load, 3), "index_bytes": size,
                 "bytes_per_vec": round(size / n, 1)}
+        if hasattr(m, "size_split"):
+            ram, fil = m.size_split()
+            base.update(ram_bytes_per_vec=round(ram / n, 1), file_bytes_per_vec=round(fil / n, 1))
         print(json.dumps(dict(base, kind="build")), flush=True)
         sweep = m.sweep()
         if a.sweep:
             key, vals = a.sweep.split("=", 1)
-            sweep = [{key: int(v)} for v in vals.split(",")]
+            sweep = [dict(p, **{key: int(v)}) for v in vals.split(",") for p in ([{}] if key in sweep[0] or len(sweep[0]) == 1 else [dict((k2, v2) for k2, v2 in sweep[0].items() if k2 != key)])]
         for prm in sweep:
             m.set(prm)
             m.single_thread(False)

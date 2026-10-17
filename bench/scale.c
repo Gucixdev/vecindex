@@ -2,7 +2,8 @@
  * reloads, printing time and memory (RSS split into anonymous memory and file-backed pages) at every stage.
  *
  *   gcc -std=gnu99 -O2 -march=native -I.. scale.c -lm -lpthread -o scale
- *   ./scale N [dim=128] [--nq 200] [--max-rss-mb 6000] [--save DIR] [--probe a,b,c] [--spill DIR]
+ *   ./scale N [dim=128] [--nq 200] [--max-rss-mb 6000] [--save DIR] [--probe a,b,c] [--rerank r1,r2] [--spill DIR]
+ *           [--bits 2] [--int8]       (2-bit codes, int8 rows: the compact modes for 100M-row stores)
  *
  * The data: a deterministic mixture (1000 topics x 50 subtopics, Gaussian-ish noise), generated row by row from
  * the row number, so the benchmark itself holds no copy of the corpus and the exact ground truth is computed by
@@ -67,11 +68,17 @@ static long status_kb_(const char *key)
     return kb;
 }
 
+static RagStore *cur_store;   /* the store being measured: its own count of RAM and file-backed bytes */
+
 static void mem_(const char *stage, i64 n, double secs, const char *extra)
 {
-    printf("{\"stage\":\"%s\",\"n\":%lld,\"secs\":%.2f,\"rss_mb\":%.0f,\"anon_mb\":%.0f,\"file_mb\":%.0f,\"hwm_mb\":%.0f%s%s}\n",
+    i64 ram = 0, file = 0;
+    if (cur_store) store_mem(cur_store, &ram, &file);
+    printf("{\"stage\":\"%s\",\"n\":%lld,\"secs\":%.2f,\"rss_mb\":%.0f,\"anon_mb\":%.0f,\"file_mb\":%.0f,\"hwm_mb\":%.0f,"
+           "\"store_ram_mb\":%.0f,\"store_file_mb\":%.0f%s%s}\n",
            stage, (long long)n, secs, status_kb_("VmRSS:") / 1024.0, status_kb_("RssAnon:") / 1024.0,
-           status_kb_("RssFile:") / 1024.0, status_kb_("VmHWM:") / 1024.0, extra ? "," : "", extra ? extra : "");
+           status_kb_("RssFile:") / 1024.0, status_kb_("VmHWM:") / 1024.0, (double)ram / 1048576.0, (double)file / 1048576.0,
+           extra ? "," : "", extra ? extra : "");
     fflush(stdout);
 }
 
@@ -158,20 +165,21 @@ static double run_queries_(RagStore *s, const f32 *q, i32 nq, i64 *res, i32 nth,
 
 static int dcmp_(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 
-static void search_report_(const char *stage, RagStore *s, i64 n, const f32 *q, i32 nq, const i64 *gt, i32 probe, i32 ncpu)
+static void search_report_(const char *stage, RagStore *s, i64 n, const f32 *q, i32 nq, const i64 *gt, i32 probe, i32 rerank, i32 ncpu)
 {
     i64 *res = (i64 *)malloc((size_t)nq * GTK * sizeof(i64));
     double *lat = (double *)malloc((size_t)nq * sizeof(double)), t1, tn;
     i32 i, x, y, hit = 0;
     char extra[256];
     store_set_probe(s, probe);
+    store_set_rerank(s, rerank);
     store_set_threads(s, 1);
     t1 = run_queries_(s, q, nq, res, 1, lat);
     for (i = 0; i < nq; ++i) for (x = 0; x < GTK; ++x) for (y = 0; y < GTK; ++y) if (res[(size_t)i * GTK + x] == gt[(size_t)i * GTK + y]) { ++hit; break; }
     tn = run_queries_(s, q, nq, res, ncpu, (double *)0);
     qsort(lat, (size_t)nq, sizeof(double), dcmp_);
-    sprintf(extra, "\"probe\":%d,\"recall10\":%.4f,\"qps1\":%.1f,\"qps%d\":%.1f,\"p50_ms\":%.3f,\"p99_ms\":%.3f", probe,
-            (double)hit / (nq * GTK), nq / t1, ncpu, nq / tn, lat[nq / 2] * 1e3, lat[nq * 99 / 100] * 1e3);
+    sprintf(extra, "\"probe\":%d,\"rerank\":%d,\"recall10\":%.4f,\"qps1\":%.1f,\"qps%d\":%.1f,\"p50_ms\":%.3f,\"p99_ms\":%.3f", probe,
+            rerank, (double)hit / (nq * GTK), nq / t1, ncpu, nq / tn, lat[nq / 2] * 1e3, lat[nq * 99 / 100] * 1e3);
     mem_(stage, n, t1, extra);
     free(res); free(lat);
 }
@@ -180,9 +188,10 @@ int main(int argc, char **argv)
 {
     static Arena arena;
     i64 N = 1000000, i, added = 0;
-    i32 nq = 200, ncpu = (i32)sysconf(_SC_NPROCESSORS_ONLN), np = 0, a, probes[16];
+    i32 nq = 200, ncpu = (i32)sysconf(_SC_NPROCESSORS_ONLN), np = 0, a, b, probes[16], nr = 0, reranks[8], bits = 4, int8 = 0;
     long max_rss_mb = 0;
     i32 ingest_only = 0;
+    i64 every;
     const char *save = (const char *)0, *spill = (const char *)0;
     RagStore *s;
     f32 *v, *q;
@@ -196,6 +205,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[a], "--spill") && a + 1 < argc) spill = argv[++a];
         else if (!strcmp(argv[a], "--noise") && a + 1 < argc) NOISE = (f32)atof(argv[++a]);
         else if (!strcmp(argv[a], "--ingest-only")) ingest_only = 1;
+        else if (!strcmp(argv[a], "--bits") && a + 1 < argc) bits = atoi(argv[++a]);
+        else if (!strcmp(argv[a], "--int8")) int8 = 1;
+        else if (!strcmp(argv[a], "--rerank") && a + 1 < argc) {
+            char *p = argv[++a];
+            while (*p && nr < 8) { reranks[nr++] = atoi(p); while (*p && *p != ',') ++p; if (*p) ++p; }
+        }
         else if (!strcmp(argv[a], "--probe") && a + 1 < argc) {
             char *p = argv[++a];
             while (*p && np < 16) { probes[np++] = atoi(p); while (*p && *p != ',') ++p; if (*p) ++p; }
@@ -205,9 +220,15 @@ int main(int argc, char **argv)
     }
     if (ncpu > 16) ncpu = 16;
     gen_centres_();
-    printf("{\"stage\":\"config\",\"n\":%lld,\"dim\":%d,\"nq\":%d,\"cpus\":%d,\"noise\":%.2f}\n", (long long)N, DIM, nq, ncpu, NOISE);
+    printf("{\"stage\":\"config\",\"n\":%lld,\"dim\":%d,\"nq\":%d,\"cpus\":%d,\"noise\":%.2f,\"bits\":%d,\"int8\":%d}\n",
+           (long long)N, DIM, nq, ncpu, NOISE, bits, int8);
     s = store_new(&arena, DIM);
+    cur_store = s;
     store_set_fast(s, 0.97f);
+#ifdef STORE_HAS_SPILL
+    store_set_codes(s, bits);
+    if (int8) store_set_vec_bytes(s, 1);
+#endif
 #ifdef STORE_HAS_SPILL
     if (spill) store_set_spill(s, !strcmp(spill, "off") ? (const char *)0 : spill, 0);
 #else
@@ -215,11 +236,12 @@ int main(int argc, char **argv)
 #endif
     v = (f32 *)malloc((size_t)DIM * sizeof(f32));
     t0 = now_();
+    every = N / 20 > 1000000 ? N / 20 / 1000000 * 1000000 : 1000000;
     for (i = 0; i < N; ++i) {
         gen_row_(1, i, v);
         store_add(s, v, i);
         ++added;
-        if ((i + 1) % 1000000 == 0) {
+        if ((i + 1) % every == 0) {
             long rss = status_kb_("VmRSS:") / 1024;
             mem_("ingest", added, now_() - t0, (const char *)0);
             if (max_rss_mb && rss > max_rss_mb) { printf("{\"stage\":\"ceiling\",\"n\":%lld,\"rss_mb\":%ld}\n", (long long)added, rss); break; }
@@ -240,7 +262,8 @@ int main(int argc, char **argv)
     ground_truth_(N, nq, q, gt, ncpu);
     printf("{\"stage\":\"ground_truth\",\"secs\":%.1f}\n", now_() - t0);
     if (!np) probes[np++] = 0;
-    for (a = 0; a < np; ++a) search_report_("search", s, N, q, nq, gt, probes[a], ncpu);
+    if (!nr) reranks[nr++] = 0;
+    for (a = 0; a < np; ++a) for (b = 0; b < nr; ++b) search_report_("search", s, N, q, nq, gt, probes[a], reranks[b], ncpu);
 
     if (save) {
         char path[1024];
@@ -252,12 +275,14 @@ int main(int argc, char **argv)
         stat(path, &st);
         { char e[64]; sprintf(e, "\"file_mb\":%.0f", (double)st.st_size / 1048576.0); mem_("saved", N, now_() - t0, e); }
         store_destroy(s);
+        cur_store = (RagStore *)0;
         mem_("destroyed", N, 0, (const char *)0);
         t0 = now_();
         l = store_load(&arena, path);
         if (!l) { printf("{\"stage\":\"load\",\"error\":1}\n"); return 1; }
+        cur_store = l;
         mem_("loaded", N, now_() - t0, (const char *)0);
-        for (a = 0; a < np; ++a) search_report_("search_loaded", l, N, q, nq, gt, probes[a], ncpu);
+        for (a = 0; a < np; ++a) for (b = 0; b < nr; ++b) search_report_("search_loaded", l, N, q, nq, gt, probes[a], reranks[b], ncpu);
         store_destroy(l);
         remove(path); { char j[1040]; sprintf(j, "%s.j", path); remove(j); }
     }
