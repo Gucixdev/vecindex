@@ -89,10 +89,10 @@ class VecIndex:
         if not self.s:
             raise RuntimeError("vi_load failed")
 
-    def sweep(self):
+    def sweep(self):                                     # clusters: 4 sqrt(n) (GloVe: 4351 of ~270 rows)
         if self.bits == 2:                               # coarser codes: re-score more candidates
-            return [{"nprobe": p, "rerank": r} for p in (16, 32, 64, 96, 128, 192) for r in (256, 1000)]
-        return [{"nprobe": p} for p in (8, 16, 24, 32, 48, 64, 96, 128, 192)]
+            return [{"nprobe": p, "rerank": r} for p in (64, 128, 192, 256, 384, 512, 768) for r in (256, 1000)]
+        return [{"nprobe": p} for p in (32, 64, 96, 128, 192, 256, 384, 512, 768)]
 
     def set(self, prm):
         self.lib.vi_set_probe(self.s, prm["nprobe"])
@@ -338,7 +338,10 @@ def main():
         sweep = m.sweep()
         if a.sweep:
             key, vals = a.sweep.split("=", 1)
-            sweep = [dict(p, **{key: int(v)}) for v in vals.split(",") for p in ([{}] if key in sweep[0] or len(sweep[0]) == 1 else [dict((k2, v2) for k2, v2 in sweep[0].items() if k2 != key)])]
+            if "rerank" in a.sweep or "nprobe=" not in a.sweep or len(sweep[0]) == 1:
+                sweep = [{key: int(v)} for v in vals.split(",")]
+            else:                                     # nprobe override on a 2-bit sweep: keep its rerank values
+                sweep = [{key: int(v), "rerank": r} for v in vals.split(",") for r in sorted({p["rerank"] for p in sweep})]
         for prm in sweep:
             m.set(prm)
             m.single_thread(False)

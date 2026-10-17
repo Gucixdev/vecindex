@@ -64,29 +64,10 @@ int vi_search(void *s, const float *q, int k, long long *ids)
     return got;
 }
 
-typedef struct { void *s; const float *q; int nq, dim, k, a, b; long long *ids; } ViJob;
-
-static void *vi_job_(void *p)
-{
-    ViJob *j = (ViJob *)p;
-    int i;
-    for (i = j->a; i < j->b; ++i) vi_search(j->s, j->q + (size_t)i * j->dim, j->k, j->ids + (size_t)i * j->k);
-    return (void *)0;
-}
-
-/* nq queries spread over nthreads threads, one query per thread at a time */
+/* nq queries on nthreads threads: the store's batch search (cluster-major scan, then the re-scoring in parallel) */
 void vi_search_batch(void *s, const float *q, int nq, int k, long long *ids, int nthreads)
 {
-    ViJob jobs[64];
-    pthread_t th[64];
-    int i, dim = ((RagStore *)s)->dim;
-    if (nthreads < 1) nthreads = 1;
-    if (nthreads > 64) nthreads = 64;
-    for (i = 0; i < nthreads; ++i) {
-        jobs[i].s = s; jobs[i].q = q; jobs[i].nq = nq; jobs[i].dim = dim; jobs[i].k = k; jobs[i].ids = ids;
-        jobs[i].a = (int)((long)nq * i / nthreads); jobs[i].b = (int)((long)nq * (i + 1) / nthreads);
-    }
-    for (i = 1; i < nthreads; ++i) pthread_create(&th[i], (const pthread_attr_t *)0, vi_job_, &jobs[i]);
-    vi_job_(&jobs[0]);
-    for (i = 1; i < nthreads; ++i) pthread_join(th[i], (void **)0);
+    f32 *sc = (f32 *)malloc((size_t)nq * (size_t)k * sizeof(f32));
+    store_search_batch((RagStore *)s, q, nq, k, (i64 *)ids, sc, nthreads);
+    free(sc);
 }

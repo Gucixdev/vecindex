@@ -68,14 +68,22 @@
 
 #define STORE_HAS_SPILL 1
 
-/* From this many rows the TurboQuant scan is grouped into clusters (IVF) of about STORE_IVF_ROWS rows and a query
- * scans only the closest few. Below it a flat scan is fast enough (200k rows: ~1.3 ms) and always exact-ish. */
+/* From this many rows the TurboQuant scan is grouped into clusters (IVF) and a query scans only the closest few.
+ * Below it a flat scan is fast enough (200k rows: ~1.3 ms) and always exact-ish. The cluster count follows the usual
+ * rule, 4 sqrt(rows) (1.2M rows: 4351 clusters of ~270; 100M: 40000 of 2500), but no cluster is planned smaller
+ * than STORE_IVF_ROWS rows. Finer clusters than the old fixed 2000 rows: 30-40% more queries a second at the same
+ * recall on GloVe-100, and a faster build. */
 #ifndef STORE_IVF_MIN
 #define STORE_IVF_MIN 600000
 #endif
 #ifndef STORE_IVF_ROWS
-#define STORE_IVF_ROWS 2000
+#define STORE_IVF_ROWS 256
 #endif
+static i32 store_nclusters_(i32 n)
+{
+    i32 a = (i32)(4.0 * eng_sqrt_((f64)n)), b = n / STORE_IVF_ROWS;
+    return n < STORE_IVF_MIN ? 0 : (a < b ? a : b);
+}
 #ifndef STORE_SPILL_MIN
 #define STORE_SPILL_MIN ((i64)256 << 20)   /* column bytes kept in anonymous memory before chunks go to the spill file */
 #endif
@@ -589,7 +597,7 @@ static Tq *store_tq_build_(RagStore *s, i32 n)
     TqCol sc, col = store_vcol_(s, &sc);
     Tq *t;
     store_advise_(s, MADV_SEQUENTIAL);                           /* the build reads every row in order, twice */
-    t = tq_build(&col, n, s->dim, s->goal.seed, n >= STORE_IVF_MIN ? n / STORE_IVF_ROWS : 0, store_ncpu_(), s->codebits);
+    t = tq_build(&col, n, s->dim, s->goal.seed, store_nclusters_(n), store_ncpu_(), s->codebits);
     store_advise_(s, MADV_RANDOM);                               /* searching re-scores rows at random */
     return t;
 }
@@ -1010,6 +1018,75 @@ i32 store_search_filter(RagStore *s, const f32 *query, i32 k,
                         i64 all_bits, i64 any_bits)
 { return store_search_impl_(s, query, k, out_doc_ids, out_scores,
                             all_bits, any_bits, 1); }
+
+/* ---- many queries at once ---- */
+typedef struct { RagStore *s; const f32 *qn; i32 k, R; const i32 *rows, *cnt; i64 *ids; f32 *sc; } StoreBatch;
+
+static void store_batch_fin_(void *p, i64 a, i64 b, i32 tid)
+{
+    StoreBatch *j = (StoreBatch *)p;
+    RagStore *s = j->s;
+    i64 q;
+    (void)tid;
+    for (q = a; q < b; ++q) {
+        const f32 *qn = j->qn + (size_t)q * s->dim;
+        i64 *ids = j->ids + (size_t)q * j->k;
+        f32 *sc = j->sc + (size_t)q * j->k;
+        i32 have = 0, i;
+        store_rescore_(s, qn, j->rows + (size_t)q * j->R, j->cnt[q], j->k, ids, sc, &have);
+        for (i = s->built_upto; i < s->count; ++i)               /* the pending tail: exact */
+            if (!STORE_DEAD(s, i)) eng_topk_(ids, sc, j->k, &have, (i64)i, 2.0f * store_dot_(s, qn, i) - 2.0f);
+        for (i = 0; i < have; ++i) ids[i] = STORE_ID(s, ids[i]);
+        for (; i < j->k; ++i) { ids[i] = -1; sc[i] = -4.0f; }
+    }
+}
+
+typedef struct { RagStore *s; const f32 *Q; i32 k; i64 *ids; f32 *sc; } StoreEach;
+static void store_each_(void *p, i64 a, i64 b, i32 tid)
+{
+    StoreEach *j = (StoreEach *)p;
+    i64 q;
+    (void)tid;
+    for (q = a; q < b; ++q) {
+        i32 got = store_search(j->s, j->Q + (size_t)q * j->s->dim, j->k, j->ids + (size_t)q * j->k, j->sc + (size_t)q * j->k);
+        for (; got < j->k; ++got) { j->ids[(size_t)q * j->k + got] = -1; j->sc[(size_t)q * j->k + got] = -4.0f; }
+    }
+}
+
+/* nq queries at once, no filter: out_ids / out_scores are nq x k (a slot a query could not fill: id -1). The scan
+ * runs cluster by cluster for the whole batch, so codes come in from memory once per batch instead of once per
+ * query; the exact re-score then runs query by query on nthreads threads. Same answers as store_search per query.
+ * For throughput (bulk jobs, benchmarks); a server answering one query at a time uses store_search. */
+void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, f32 *out_scores, i32 nthreads)
+{
+    i32 dim = s->dim, R, off, i;
+    f32 *qn;
+    if (nq <= 0 || k <= 0) return;
+    if (nthreads < 1) nthreads = 1;
+    if (!s->tq) {                                                /* no scan index: one query at a time, in parallel */
+        StoreEach e;
+        e.s = s; e.Q = Q; e.k = k; e.ids = out_ids; e.sc = out_scores;
+        tq_par2_(store_each_, &e, nq, nthreads);
+        return;
+    }
+    qn = (f32 *)malloc((size_t)nq * (size_t)dim * sizeof(f32));
+    memcpy(qn, Q, (size_t)nq * (size_t)dim * sizeof(f32));
+    for (i = 0; i < nq; ++i) store_normalise_(qn + (size_t)i * dim, dim);
+    pthread_rwlock_rdlock(&s->lock);
+    R = s->tq_rerank > 0 ? s->tq_rerank : (k * 20 > 256 ? k * 20 : 256);
+    for (off = 0; off < nq; off += 1024) {                       /* batches of 1024 bound the per-query heaps */
+        i32 m = nq - off < 1024 ? nq - off : 1024;
+        i32 *rows = (i32 *)malloc((size_t)m * (size_t)R * sizeof(i32)), *cnt = (i32 *)malloc((size_t)m * sizeof(i32));
+        StoreBatch j;
+        tq_search_many(s->tq, qn + (size_t)off * dim, m, R, rows, cnt, s->dead, nthreads, s->tq_probe);
+        j.s = s; j.qn = qn + (size_t)off * dim; j.k = k; j.R = R; j.rows = rows; j.cnt = cnt;
+        j.ids = out_ids + (size_t)off * k; j.sc = out_scores + (size_t)off * k;
+        tq_par2_(store_batch_fin_, &j, m, nthreads);
+        free(rows); free(cnt);
+    }
+    pthread_rwlock_unlock(&s->lock);
+    free(qn);
+}
 
 /* ------------------------------------------------------------------ *
  * persistence - .vxi: metadata + compacted rows + the built index    *
@@ -1709,9 +1786,47 @@ int main(void)
             if (nf != nn2) all_ok = 0;
             for (k = 0; k < nf && k < 150 && all_ok; ++k) { i32 z, f = 0; for (z = 0; z < nn2; ++z) if (rn[z] == rf[k]) { f = 1; break; } if (!f) all_ok = 0; }
         }
+        {   /* tq_search_many (cluster-major batch) == tq_search, IVF and flat */
+            i32 nq2 = 64, R2 = 100, *mr = (i32 *)malloc((size_t)nq2 * R2 * sizeof(i32)), mc[64], z, same2 = 0, pass;
+            for (pass = 0; pass < 2; ++pass) {
+                Tq *tt = pass ? flat : ivf;
+                tq_search_many(tt, un, nq2, R2, mr, mc, (const u64 *)0, 2, 12);
+                for (q = 0; q < nq2; ++q) {
+                    i32 one[100], no = tq_search(tt, un + (size_t)q * dim, R2, one, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 12), eq = no == mc[q];
+                    for (z = 0; z < no && eq; ++z) if (one[z] != mr[(size_t)q * R2 + z]) eq = 0;
+                    same2 += eq;
+                }
+            }
+            print_cstr("  tq_search_many == tq_search on "); print_i64(same2); print_cstr("/128 (IVF and flat, 2-bit)\n");
+            if (same2 != 2 * nq2) all_ok = 0;
+            free(mr);
+        }
         print_cstr("  2-bit IVF, every cluster == 2-bit flat: "); print_cstr(all_ok ? "yes" : "NO"); print_cstr("\n");
         if (!all_ok || flat->vd != dim / 2 || ivf->bits != 2) ok = 0;
         tq_free(flat); tq_free(ivf); free(un);
+    }
+
+    /* batch search: the same answers as one query at a time (flat scan here; IVF + batch in the 2-bit test above) */
+    {
+        RagStore *b = store_new(a, dim);
+        i32 nq = 300, same = 0, x;
+        i64 *bi = (i64 *)malloc((size_t)nq * 10 * sizeof(i64)), r1[10];
+        f32 *bs = (f32 *)malloc((size_t)nq * 10 * sizeof(f32)), c1[10];
+        store_set_fast(b, 0.9f);
+        for (i = 0; i < n; ++i) store_add(b, vv + (size_t)i * dim, 300000 + i);
+        store_build(b);
+        for (i = 0; i < 40; ++i) store_add(b, vv + (size_t)(i * 13) * dim, 900000 + i);   /* a pending tail too */
+        store_delete(b, 300000 + 5);
+        store_search_batch(b, vv, nq, 10, bi, bs, 2);
+        for (i = 0; i < nq; ++i) {
+            i32 h = store_search(b, vv + (size_t)i * dim, 10, r1, c1), eq = 1;
+            for (x = 0; x < 10; ++x) if ((x < h ? r1[x] : -1) != bi[(size_t)i * 10 + x]) eq = 0;
+            same += eq;
+        }
+        print_cstr("  batch search == one at a time on "); print_i64(same); print_cstr("/"); print_i64(nq); print_cstr(" queries\n");
+        if (same != nq) ok = 0;
+        free(bi); free(bs);
+        store_destroy(b);
     }
 
     /* journal: base save, then only the changes are synced; a reload replays them (torn tail tolerated) */
