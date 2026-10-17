@@ -576,9 +576,13 @@ static void store_journal_replay_(RagStore *s, const char *path)
             good = ftell(f);
         }
         fclose(f); f = (FILE *)0;
-        truncate(jn, (off_t)good);                                /* drop a torn tail, then append after the good part */
-        s->jf = fopen(jn, "ab");
-        if (s->jf) { s->jpath = (char *)malloc(strlen(path) + 1); strcpy(s->jpath, path); }
+        /* drop a torn tail, then append after the good part. If the tail cannot be dropped, run
+         * without a journal (as when fopen fails): records appended behind a torn one would never
+         * be replayed. */
+        if (truncate(jn, (off_t)good) == 0) {
+            s->jf = fopen(jn, "ab");
+            if (s->jf) { s->jpath = (char *)malloc(strlen(path) + 1); strcpy(s->jpath, path); }
+        }
     } else {
         if (f) fclose(f);
         store_journal_reset_(s, path);
