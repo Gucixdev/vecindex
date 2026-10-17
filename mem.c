@@ -468,18 +468,22 @@ i32 mem_cold_open(Mem *m, const char *path)
 }
 
 /* core, no lock - the caller must already hold m->lk (mem_archive does; the public wrapper below
- * takes it for a standalone call) */
+ * takes it for a standalone call). Walks the exact layout mem_archive writes - 24-byte header,
+ * title, text, nprov * 4 bytes of provenance - and stops at a corrupt or torn record. */
 static i32 mem_cold_count_(Mem *m)
 {
     i32 n = 0;
+    long size, pos = 0;
     if (!m->cf) return 0;
-    fseek(m->cf, 0, SEEK_SET);
+    if (fseek(m->cf, 0, SEEK_END) != 0 || (size = ftell(m->cf)) < 0) return 0;
     for (;;) {
-        i32 hdr[6]; char *buf;
-        if (fread(hdr, 4, 6, m->cf) != 6) break;                 /* kind,nl,tl,nprov,corrob,contra */
-        buf = (char *)malloc((size_t)(hdr[1] + hdr[2]) + (size_t)hdr[3] * 4 + 16);
-        if (fread(buf, 1, (size_t)(hdr[1] + hdr[2]) + (size_t)hdr[3] * 4 + 16, m->cf) == 0 && hdr[1] + hdr[2] > 0) { free(buf); break; }
-        free(buf);
+        i32 hdr[6];
+        long body;
+        if (fseek(m->cf, pos, SEEK_SET) != 0 || fread(hdr, 4, 6, m->cf) != 6) break;   /* kind,nl,tl,nprov,corrob,contra */
+        if (hdr[1] < 0 || hdr[2] < 0 || hdr[3] < 0) break;
+        body = (long)hdr[1] + (long)hdr[2] + (long)hdr[3] * 4;
+        if (body > size - pos - 24) break;                                              /* header without its full body */
+        pos += 24 + body;
         ++n;
     }
     return n;
@@ -1251,6 +1255,7 @@ int main(void)
       md_ok_ &= md_check_("the unrelated cat event still was not swept into it", mem_kind(m3, e4) == MK_EVENT);
       mem_free(m3); vecdb_free(d3); }
 
+    remove("/tmp/mem_selftest.vdb.mem.cold");                         /* the cold file is append-only: start from empty, not a previous run's */
     mem_cold_open(m, "/tmp/mem_selftest.vdb");                        /* opened early: mem_forget needs it below to archive rather than hard-delete */
 
     printf("merge, prune, forget, fix\n");
@@ -1309,6 +1314,19 @@ int main(void)
       recalled = mem_recall(m, cold_id);
       md_ok_ &= md_check_("recall re-adds it as a fresh, live event", recalled >= 0 && mem_kind(m, recalled) == MK_EVENT && db->nodes[recalled].kind == VN_NOTE);
       { char *t = vecdb_text(db, recalled); md_ok_ &= md_check_("the recalled text matches what was archived", t && strstr(t, "kettle") != (char *)0); free(t); }
+      { i32 base_n = mem_cold_count(m), c1, c2, r1, r2;                /* several records: the count used to lose sync from the second one */
+        char *t1, *t2;
+        i32 n1 = mem_note_event(m, "Cold one", "first archived record about a lighthouse");
+        i32 n2 = mem_note_event(m, "Cold two", "second archived record about a glacier");
+        c1 = mem_archive(m, n1);
+        c2 = mem_archive(m, n2);
+        md_ok_ &= md_check_("cold ids stay sequential across several records", base_n >= 1 && c1 == base_n && c2 == base_n + 1 && mem_cold_count(m) == base_n + 2);
+        r1 = mem_recall(m, c1);
+        r2 = mem_recall(m, c2);
+        t1 = r1 >= 0 ? vecdb_text(db, r1) : (char *)0;
+        t2 = r2 >= 0 ? vecdb_text(db, r2) : (char *)0;
+        md_ok_ &= md_check_("recall by id brings back each record's own text", t1 && t2 && strstr(t1, "lighthouse") != (char *)0 && strstr(t2, "glacier") != (char *)0);
+        free(t1); free(t2); }
       remove("/tmp/mem_selftest.vdb.mem.cold");
     }
 
