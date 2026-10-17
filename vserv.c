@@ -1,14 +1,15 @@
 /* vserv.c - vecindex over a socket: libc + pthreads + Linux epoll, and TLS through the vendored BearSSL
  * (third_party/bearssl, MIT, no malloc inside). Nothing else.
  *
- *   vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-d DIM] [-x] [-c CERT.pem -k KEY.pem [-a CA.pem] [-P]] STORE.vxi
+ *   vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-d DIM] [-x] [-c CERT.pem -k KEY.pem [-a CA.pem] [-P] [-T]] STORE.vxi
  *     -s PATH   Unix socket, created mode 0600 (default ./vecindex.sock when -p is not given)
  *     -p PORT   TCP port, bound to 127.0.0.1 unless -b gives another address
  *     -t N      worker threads (default: online CPUs)
  *     -d DIM    dimension of a new, empty store when STORE.vxi does not exist yet
  *     -x        save the store to STORE.vxi on SIGINT / SIGTERM
- *     -c, -k    TLS on the TCP port: certificate chain and private key (PEM, EC or RSA). The port then takes only
- *               TLS: HTTPS, or the binary protocol inside TLS (-P lets plaintext in too)
+ *     -c, -k    TLS: certificate chain and private key (PEM, EC or RSA). The TCP port then takes only TLS: HTTPS,
+ *               or the binary protocol inside TLS (-P lets plaintext in too). The Unix socket takes TLS as well and
+ *               still accepts plaintext from local clients, unless -T
  *     -a FILE   mutual TLS: a client must present a certificate that chains to one of the CA certificates in FILE
  *               (or is one of them), else the handshake fails
  *
@@ -30,8 +31,9 @@
  *
  * TLS (when -c/-k are given): a connection is TLS when its first byte is a handshake record (0x16). TLS 1.2 only,
  * ECDHE key exchange (forward secrecy), AEAD suites only (AES-GCM - AES-NI when the CPU has it - and
- * ChaCha20-Poly1305), sessions resumable from a per-thread cache. Client certificates with -a. The Unix socket
- * stays plaintext: it never leaves the machine and its 0600 mode decides who may connect.
+ * ChaCha20-Poly1305), sessions resumable from one cache shared by every worker. Client certificates with -a. On
+ * the Unix socket TLS is optional unless -T (the socket never leaves the machine, and its 0600 mode decides who
+ * may connect at all).
  *
  * Memory: an idle connection is one small struct. Its request buffer (one request of this store's
  * dimension) is allocated on first read and reused for every later request on it; responses are built in a
@@ -97,10 +99,6 @@ typedef struct {
     f32 *vec;                                   /* dim floats: an aligned copy of the query */
     i64 *ids;
     f32 *sc;
-#ifdef VSERV_TLS
-    br_ssl_session_cache_lru lru;               /* resumable sessions of this thread's connections */
-    unsigned char *lru_mem;
-#endif
 } VsWorker;
 
 #ifdef VSERV_TLS
@@ -115,10 +113,40 @@ static br_skey_decoder_context vs_skey;         /* the decoded private key, for 
 static i32 vs_keytype, vs_issuer;
 static br_x509_trust_anchor *vs_tas;
 static size_t vs_ntas;
+
+/* One session cache for every worker: a client that comes back is handed to whichever worker the kernel wakes,
+ * so a per-thread cache would miss about half the resumptions. BearSSL's LRU is not thread-safe; a mutex around
+ * its two calls is all it needs (a lookup is a short tree walk). */
+typedef struct {
+    const br_ssl_session_cache_class *vtable;
+    br_ssl_session_cache_lru lru;
+    pthread_mutex_t mu;
+} VsCache;
+#define VS_CACHE_BYTES (256 * 1024)             /* ~2500 sessions */
+static VsCache vs_cache;
+static unsigned char *vs_cache_mem;
+
+static void vs_cache_save_(const br_ssl_session_cache_class **ctx, br_ssl_server_context *sc, const br_ssl_session_parameters *p)
+{
+    VsCache *c = (VsCache *)(void *)ctx;
+    pthread_mutex_lock(&c->mu);
+    c->lru.vtable->save(&c->lru.vtable, sc, p);
+    pthread_mutex_unlock(&c->mu);
+}
+static int vs_cache_load_(const br_ssl_session_cache_class **ctx, br_ssl_server_context *sc, br_ssl_session_parameters *p)
+{
+    VsCache *c = (VsCache *)(void *)ctx;
+    int r;
+    pthread_mutex_lock(&c->mu);
+    r = c->lru.vtable->load(&c->lru.vtable, sc, p);
+    pthread_mutex_unlock(&c->mu);
+    return r;
+}
+static const br_ssl_session_cache_class vs_cache_class = { sizeof(VsCache), vs_cache_save_, vs_cache_load_ };
 #else
 struct VsTls { i32 unused; };
 #endif
-static i32 vs_tls_on, vs_plain_ok;
+static i32 vs_tls_on, vs_plain_ok, vs_unix_tls_only;
 
 static RagStore *vs_store;
 static const char *vs_path;
@@ -624,7 +652,8 @@ static VsTls *vs_tls_new_(VsWorker *w)
         br_ssl_server_set_trust_anchor_names_alt(&t->sc, vs_tas, vs_ntas);
         br_ssl_engine_set_x509(&t->sc.eng, &t->xc.vtable);
     }
-    br_ssl_server_set_cache(&t->sc, &w->lru.vtable);
+    br_ssl_server_set_cache(&t->sc, &vs_cache.vtable);
+    (void)w;
     br_ssl_engine_set_buffer(&t->sc.eng, t->io, sizeof(t->io), 1);
     if (!br_ssl_server_reset(&t->sc)) { free(t); return (VsTls *)0; }
     return t;
@@ -678,7 +707,7 @@ static void vs_readable_(VsWorker *w, VsConn *c)
         if (!c->buf) { c->closing = 1; return; }
         c->cap = vs_reqcap;
     }
-    if (vs_tls_on && c->tcp && !c->checked) {      /* a TLS ClientHello starts with a handshake record, 0x16 */
+    if (vs_tls_on && !c->checked) {                /* a TLS ClientHello starts with a handshake record, 0x16 */
         u8 b0;
         ssize_t k = recv(c->fd, &b0, 1, MSG_PEEK);
         if (k == 0) { c->closing = 1; return; }
@@ -690,7 +719,7 @@ static void vs_readable_(VsWorker *w, VsConn *c)
             if (!c->tls) { c->closing = 1; return; }
         } else
 #endif
-        if (!vs_plain_ok) {
+        if (c->tcp ? !vs_plain_ok : vs_unix_tls_only) {
             static const char msg[] = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 32\r\n"
                                       "Connection: close\r\n\r\n{\"error\":\"this port speaks TLS\"}";
             vs_send_(w, c, msg, (i32)sizeof(msg) - 1);
@@ -944,13 +973,21 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) key = argv[++i];
         else if (!strcmp(argv[i], "-a") && i + 1 < argc) ca = argv[++i];
         else if (!strcmp(argv[i], "-P")) vs_plain_ok = 1;
+        else if (!strcmp(argv[i], "-T")) vs_unix_tls_only = 1;
         else if (argv[i][0] != '-' && !vs_path) vs_path = argv[i];
-        else { fprintf(stderr, "usage: vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-d DIM] [-x] [-c CERT -k KEY [-a CA] [-P]] STORE.vxi\n"); return 2; }
+        else { fprintf(stderr, "usage: vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-d DIM] [-x] [-c CERT -k KEY [-a CA] [-P] [-T]] STORE.vxi\n"); return 2; }
     }
     if (!vs_path) { fprintf(stderr, "vserv: no store file given\n"); return 2; }
-    if ((cert || key || ca) && !(cert && key)) { fprintf(stderr, "vserv: TLS needs both -c CERT and -k KEY\n"); return 2; }
+    if ((cert || key || ca || vs_unix_tls_only) && !(cert && key)) { fprintf(stderr, "vserv: TLS needs both -c CERT and -k KEY\n"); return 2; }
 #ifdef VSERV_TLS
-    if (cert) { if (vs_tls_load_(cert, key, ca)) return 1; vs_tls_on = 1; }
+    if (cert) {
+        if (vs_tls_load_(cert, key, ca)) return 1;
+        vs_tls_on = 1;
+        vs_cache_mem = (unsigned char *)malloc(VS_CACHE_BYTES);
+        br_ssl_session_cache_lru_init(&vs_cache.lru, vs_cache_mem, VS_CACHE_BYTES);
+        pthread_mutex_init(&vs_cache.mu, (const pthread_mutexattr_t *)0);
+        vs_cache.vtable = &vs_cache_class;
+    }
 #else
     if (cert) { fprintf(stderr, "vserv: built without TLS (VSERV_NO_TLS)\n"); return 2; }
 #endif
@@ -985,10 +1022,6 @@ int main(int argc, char **argv)
         w->vec = (f32 *)malloc((size_t)vs_dim * sizeof(f32));
         w->ids = (i64 *)malloc(VS_MAXK * sizeof(i64));
         w->sc = (f32 *)malloc(VS_MAXK * sizeof(f32));
-#ifdef VSERV_TLS
-        w->lru_mem = (unsigned char *)malloc(32768);   /* ~300 resumable sessions a thread */
-        br_ssl_session_cache_lru_init(&w->lru, w->lru_mem, 32768);
-#endif
         for (j = 0; j < vs_nls; ++j) {               /* every worker waits on every listener; the kernel wakes one */
             struct epoll_event e;
             e.events = EPOLLIN | EPOLLEXCLUSIVE; e.data.ptr = &vs_ls[j];
@@ -997,7 +1030,8 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "vserv: %s: %d rows x %d, loaded in %.1f ms; %d threads;%s%s%s%s%s%s\n", vs_path, store_count(vs_store), vs_dim,
             (vs_now_() - t0) * 1e3, nth, sock ? " unix " : "", sock ? sock : "", port ? " tcp " : "", port ? bind_addr : "",
-            vs_tls_on ? (vs_ntas_() ? " (TLS, client certificates required)" : " (TLS)") : "", vs_tls_on && vs_plain_ok ? " + plaintext" : "");
+            vs_tls_on ? (vs_ntas_() ? " (TLS, client certificates required)" : " (TLS)") : "",
+            vs_tls_on ? (vs_plain_ok ? " + plaintext on tcp" : (vs_unix_tls_only ? "" : "; plaintext on unix only")) : "");
     for (i = 0; i < nth; ++i) pthread_create(&ws[i].th, (const pthread_attr_t *)0, vs_worker_, &ws[i]);
     for (i = 0; i < nth; ++i) pthread_join(ws[i].th, (void **)0);
 
@@ -1009,12 +1043,10 @@ int main(int argc, char **argv)
     }
     for (i = 0; i < nth; ++i) {
         close(ws[i].ep); free(ws[i].out); free(ws[i].vec); free(ws[i].ids); free(ws[i].sc);
-#ifdef VSERV_TLS
-        explicit_bzero(ws[i].lru_mem, 32768); free(ws[i].lru_mem);
-#endif
     }
 #ifdef VSERV_TLS
     explicit_bzero(&vs_skey, sizeof(vs_skey));
+    if (vs_cache_mem) { explicit_bzero(vs_cache_mem, VS_CACHE_BYTES); free(vs_cache_mem); }   /* master secrets */
 #endif
     free(ws);
     return 0;

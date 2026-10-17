@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """TLS end-to-end test of vserv: HTTPS and the binary protocol inside TLS, plaintext refused on the TLS port,
-session resumption, large replies across many records, concurrency, mutual TLS (client certificates), an RSA
-server key, and curl.
+session resumption (from any worker thread), large replies across many records, TLS on the Unix socket (optional,
+or required with -T), concurrency, mutual TLS (client certificates), an RSA server key, and curl.
 
     python3 bench/vserv_tls_test.py [path/to/vserv]
 
@@ -149,20 +149,33 @@ try:
     check(code == 200 and r["ids"][0] == 9 and len(r["ids"]) == 400, "HTTPS: k=400 reply (%d ids) across records" % len(r.get("ids", [])))
     sess = s.session
     s.close()
-    s2 = tls_conn(C, session=sess)
-    check(s2.session_reused, "session resumed from the server's cache")
-    check(http(s2, "GET", "/stats")[1]["count"] == N, "HTTPS on the resumed session")
-    s2.close()
-    # plaintext on the TLS port is refused; the Unix socket stays plaintext
+    resumed = 0
+    for _ in range(8):                                 # 2 workers: each reconnect lands on either one
+        s2 = tls_conn(C, session=sess)
+        resumed += s2.session_reused
+        ok = http(s2, "GET", "/stats")[1]["count"] == N
+        s2.close()
+    check(resumed == 8, "session resumed on 8 of 8 reconnects (one cache for every worker): %d" % resumed)
+    check(ok, "HTTPS on the resumed session")
+    # plaintext on the TLS port is refused
     raw = socket.create_connection(("127.0.0.1", PORT))
     raw.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
     code, r = read_http(raw)
     check(code == 400 and "TLS" in r["error"], "plaintext HTTP on the TLS port -> 400 %s" % r)
     raw.close()
+    # the Unix socket: plaintext still works for local tools, and TLS works there too
     u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     u.connect(P("v.sock"))
-    check(http(u, "GET", "/health")[0] == 200, "Unix socket: plaintext as before")
+    check(http(u, "GET", "/health")[0] == 200, "Unix socket: plaintext still accepted (no -T)")
     u.close()
+    u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    u.connect(P("v.sock"))
+    ut = C.wrap_socket(u, server_hostname="localhost")
+    st, cnt, body = bin_call(ut, 1, 1, struct.pack("<%df" % DIM, *vecs[11]))
+    check(ut.version() == "TLSv1.2" and st == 0 and struct.unpack_from("<q", body, 0)[0] == 11,
+          "Unix socket: binary protocol inside TLS finds row 11")
+    check(http(ut, "GET", "/health") == (200, {"ok": True}), "Unix socket: HTTPS on the same connection")
+    ut.close()
     # a client that does not trust our CA fails the handshake
     try:
         ssl.create_default_context().wrap_socket(socket.create_connection(("127.0.0.1", PORT)), server_hostname="localhost")
@@ -193,6 +206,23 @@ try:
     if shutil.which("curl"):
         out = subprocess.run(["curl", "-s", "--cacert", P("ca.pem"), "https://localhost:%d/health" % PORT], capture_output=True, text=True)
         check(out.stdout.strip() == '{"ok":true}', "curl --cacert https://localhost/health -> %s" % out.stdout.strip())
+finally:
+    stop(p)
+
+# -T: TLS required on the Unix socket as well
+p = start("-c", P("server.pem"), "-k", P("server.key"), "-T")
+try:
+    u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    u.connect(P("v.sock"))
+    u.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+    code, r = read_http(u)
+    check(code == 400 and "TLS" in r["error"], "-T: plaintext on the Unix socket -> 400")
+    u.close()
+    u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    u.connect(P("v.sock"))
+    ut = ctx().wrap_socket(u, server_hostname="localhost")
+    check(http(ut, "GET", "/health") == (200, {"ok": True}), "-T: TLS on the Unix socket gets in")
+    ut.close()
 finally:
     stop(p)
 
