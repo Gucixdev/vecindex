@@ -3,3 +3,6 @@ __pycache__/
 *.o
 emb/real_data.bin
 emb/real_texts.json
+bench/libvi.so
+bench/.venv/
+bench/data/
