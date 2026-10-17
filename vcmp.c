@@ -112,7 +112,8 @@ int main(int argc, char **argv)
         FILE *o; i32 n, i, j, k; f32 *data, *q; i32 *truth; u32 r = 7;
         if (!st) { fprintf(stderr, "cannot load %s\n", argv[2]); return 2; }
         n = st->count; DIM = st->dim;
-        data = st->vecs; q = (f32 *)malloc((size_t)NQ * DIM * 4); truth = (i32 *)malloc((size_t)NQ * 10 * 4);
+        data = (f32 *)malloc((size_t)n * DIM * 4); q = (f32 *)malloc((size_t)NQ * DIM * 4); truth = (i32 *)malloc((size_t)NQ * 10 * 4);
+        for (i = 0; i < n; ++i) memcpy(data + (size_t)i * DIM, STORE_VEC(st, i), (size_t)DIM * 4);   /* the rows live in chunks */
         for (i = 0; i < NQ; ++i) {
             const f32 *src = data + (size_t)((r = r * 1664525u + 1013904223u) % (u32)n) * DIM; f32 nrm = 0;
             for (j = 0; j < DIM; ++j) { r = r * 1664525u + 1013904223u; q[(size_t)i * DIM + j] = src[j] + ((f32)(r >> 8) / 16777216.0f - 0.5f) * 0.06f; nrm += q[(size_t)i * DIM + j] * q[(size_t)i * DIM + j]; }

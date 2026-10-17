@@ -366,8 +366,8 @@ int main(void)
             for (x = 0; x < h; ++x) {
                 i32 row;
                 for (row = 0; row < fs->count; ++row)
-                    if (fs->ids[row] == fr[x] && !fs->dead[row]) {
-                        if ((fs->meta[row] & 3) != 3) ++wrong;
+                    if (STORE_ID(fs, row) == fr[x] && !STORE_DEAD(fs, row)) {
+                        if ((STORE_META(fs, row) & 3) != 3) ++wrong;
                         break;
                     }
             }

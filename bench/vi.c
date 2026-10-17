@@ -27,20 +27,19 @@ void vi_set_threads(void *s, int nthreads) { store_set_threads((RagStore *)s, nt
 int vi_save(void *s, const char *path) { return store_save((RagStore *)s, path); }
 void *vi_load(const char *path) { return store_load(&vi_arena, path); }
 
-/* bytes the store holds in RAM for searching: rows, ids, tags, tombstones, the id map and the scan index */
+/* bytes the store holds: anonymous memory (ram) and file-backed pages (file: the loaded .vxi or the spill file,
+ * resident only while there is room) */
 long long vi_mem_bytes(void *sv)
 {
-    RagStore *s = (RagStore *)sv;
-    long long b = (long long)s->count * ((long long)s->dim * 4 + 8 + 8 + 1 + 4);
-    b += (long long)s->idmap.cap * (8 + 4 + 1);
-    if (s->tq) {
-        const Tq *t = s->tq;
-        b += (long long)t->nblk * t->dpad * 16;
-        if (t->slot_row) b += (long long)t->nblk * 32 * 4;
-        if (t->cent) b += (long long)t->nc * t->dim * 4 + (long long)(t->nc + 1) * 4;
-        b += (long long)t->dpad * 12;
-    }
-    return b;
+    i64 ram = 0, file = 0;
+    store_mem((RagStore *)sv, &ram, &file);
+    return (long long)ram;
+}
+long long vi_file_bytes(void *sv)
+{
+    i64 ram = 0, file = 0;
+    store_mem((RagStore *)sv, &ram, &file);
+    return (long long)file;
 }
 
 int vi_search(void *s, const float *q, int k, long long *ids)

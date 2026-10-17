@@ -6,3 +6,4 @@ emb/real_texts.json
 bench/libvi.so
 bench/.venv/
 bench/data/
+bench/scale

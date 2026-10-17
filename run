@@ -137,6 +137,15 @@ else
     echo "  (sanitizers unavailable - skipped)"
 fi
 
+# ---- the socket server: both protocols, Unix + TCP sockets, bad input, pipelining, concurrency, restart ----
+echo "vserv"
+"$CC" "${CFLAGS[@]}" vserv.c -lm -lpthread -o "$OUT/vserv" || fail=1
+if command -v python3 >/dev/null; then
+    python3 bench/vserv_test.py "$OUT/vserv" || { echo "  ^ vserv FAILED"; fail=1; }
+else
+    echo "  (python3 unavailable - built, end-to-end test skipped)"
+fi
+
 # ---- mem.c timings (mirrors bench.c one layer up): ingest/search/touch/archive/recall/save/load,
 # ---- and the mem_consolidate cost-vs-N sweep that is the one gap README calls out ----
 if [[ "${1:-}" == bench ]]; then
