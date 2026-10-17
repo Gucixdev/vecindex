@@ -31,7 +31,7 @@ void *vi_load(const char *path) { return store_load(&vi_arena, path); }
 long long vi_mem_bytes(void *sv)
 {
     RagStore *s = (RagStore *)sv;
-    long long b = (long long)s->cap * ((long long)s->dim * 4 + 8 + 8 + 1 + 4);
+    long long b = (long long)s->count * ((long long)s->dim * 4 + 8 + 8 + 1 + 4);
     b += (long long)s->idmap.cap * (8 + 4 + 1);
     if (s->tq) {
         const Tq *t = s->tq;

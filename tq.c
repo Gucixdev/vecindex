@@ -37,6 +37,7 @@ typedef struct {
     f32  *s1, *s2;          /* random +-1 signs, [dpad] */
     i32  *perm;             /* [dpad] */
     u8   *codes;            /* nblk * dpad * 16 bytes */
+    i32   mapped;           /* 1: the arrays point into a file mapping the caller owns (store_load) */
 } Tq;
 
 /* Lloyd-Max centroids of the standard normal, 16 levels ascending */
@@ -196,7 +197,8 @@ Tq *tq_build(const f32 *vecs, i32 n, i32 dim, u32 seed, i32 nc)
 void tq_free(Tq *t)
 {
     if (!t) return;
-    free(t->s1); free(t->s2); free(t->perm); free(t->codes); free(t->cent); free(t->cstart); free(t->slot_row); free(t);
+    if (!t->mapped) { free(t->s1); free(t->s2); free(t->perm); free(t->codes); free(t->cent); free(t->cstart); free(t->slot_row); }
+    free(t);
 }
 
 /* ---- scanning ---- */

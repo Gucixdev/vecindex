@@ -45,6 +45,8 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include "hdict.c"
 #include "tq.c"
 
@@ -70,7 +72,7 @@ static void store_prefetch_row_(const f32 *row, i32 dim)
 }
 
 #define STORE_MAGIC   0x34584956u   /* 'VIX4' - v4 = goal gains max_candidates */
-#define STORE_VERSION 4
+#define STORE_VERSION 5             /* v5: 64-byte aligned sections, the scan index saved too, loaded by mmap */
 #define STORE_GROW    4096
 
 typedef struct {
@@ -102,7 +104,39 @@ typedef struct {
     EngIndex *idx;
     EngGoal  goal;
     pthread_rwlock_t lock;
+    void    *map;           /* store_load's private copy-on-write mapping of the file (vecs/ids/meta/tq point in) */
+    size_t   map_len;
+    i32      idmap_ok;      /* 0 after a mapped load: idmap/prev are built on first use, not at load */
 } RagStore;
+
+/* The id map is only needed to add, delete or look up by id - never to search - so a loaded store builds it
+ * on first use. Writers call this under the write lock; readers through store_need_idmap_. */
+static void store_reindex_(RagStore *s);
+static i32 store_idmap_ready_(RagStore *s)
+{
+#if defined(__GNUC__)
+    return __atomic_load_n(&s->idmap_ok, __ATOMIC_ACQUIRE);
+#else
+    return s->idmap_ok;
+#endif
+}
+static void store_idmap_locked_(RagStore *s)
+{
+    if (s->idmap_ok) return;
+    store_reindex_(s);
+#if defined(__GNUC__)
+    __atomic_store_n(&s->idmap_ok, 1, __ATOMIC_RELEASE);
+#else
+    s->idmap_ok = 1;
+#endif
+}
+static void store_need_idmap_(RagStore *s)
+{
+    if (store_idmap_ready_(s)) return;
+    pthread_rwlock_wrlock(&s->lock);
+    store_idmap_locked_(s);
+    pthread_rwlock_unlock(&s->lock);
+}
 
 /* ------------------------------------------------------------------ */
 
@@ -160,6 +194,7 @@ RagStore *store_new(Arena *a, i32 dim)
     memset(s, 0, sizeof(*s));
     s->arena = a;
     s->dim = dim;
+    s->idmap_ok = 1;
     s->goal.mode = ENG_MAX_ACC;
     s->goal.k = 10;
     s->goal.max_code_bytes = 1 << 20;   /* unbounded -> most accurate config */
@@ -189,6 +224,7 @@ void store_destroy(RagStore *s)
     if (s->jf) fclose(s->jf);
     free(s->jpath);
     arena_free(&s->idx_arena); arena_free(&s->data_arena[0]); arena_free(&s->data_arena[1]);
+    if (s->map) { munmap(s->map, s->map_len); s->map = (void *)0; }
 }
 
 /* IVF (large stores): how many clusters a query scans; 0 = the default (~16% of them). More = better recall, slower. */
@@ -226,6 +262,7 @@ i32 store_add_meta(RagStore *s, const f32 *vec, i64 doc_id, i64 meta)
 {
     if (!store_finite_(vec, s->dim)) return -1;
     pthread_rwlock_wrlock(&s->lock);
+    store_idmap_locked_(s);
     store_reserve_(s, s->count + 1);
     memcpy(s->vecs + (size_t)s->count * s->dim, vec, (size_t)s->dim * sizeof(f32));
     store_normalise_(s->vecs + (size_t)s->count * s->dim, s->dim);
@@ -262,6 +299,7 @@ i32 store_delete(RagStore *s, i64 doc_id)
 {
     i32 r, hit = 0;
     pthread_rwlock_wrlock(&s->lock);
+    store_idmap_locked_(s);
     for (r = h64_get(&s->idmap, doc_id); r >= 0; r = s->prev[r])
         if (!s->dead[r]) { s->dead[r] = 1; ++hit; --s->live; }
     h64_del(&s->idmap, doc_id);
@@ -288,12 +326,15 @@ static i32 store_live_row_(const RagStore *s, i64 doc_id)
  * for single-threaded callers such as vecdb), NULL if the id is not live */
 const f32 *store_vec_ptr(const RagStore *s, i64 doc_id)
 {
-    i32 r = store_live_row_(s, doc_id);
+    i32 r;
+    store_need_idmap_((RagStore *)s);
+    r = store_live_row_(s, doc_id);
     return r >= 0 ? s->vecs + (size_t)r * s->dim : (const f32 *)0;
 }
 i32 store_has(RagStore *s, i64 doc_id)
 {
     i32 r;
+    store_need_idmap_(s);
     pthread_rwlock_rdlock(&s->lock);
     r = store_live_row_(s, doc_id);
     pthread_rwlock_unlock(&s->lock);
@@ -302,6 +343,7 @@ i32 store_has(RagStore *s, i64 doc_id)
 i32 store_get_vec(RagStore *s, i64 doc_id, f32 *out)
 {
     i32 r;
+    store_need_idmap_(s);
     pthread_rwlock_rdlock(&s->lock);
     r = store_live_row_(s, doc_id);
     if (r >= 0) memcpy(out, s->vecs + (size_t)r * s->dim, (size_t)s->dim * sizeof(f32));
@@ -312,6 +354,7 @@ i32 store_set_meta(RagStore *s, i64 doc_id, i64 meta)
 {
     i32 r;
     pthread_rwlock_wrlock(&s->lock);
+    store_idmap_locked_(s);
     r = store_live_row_(s, doc_id);
     if (r >= 0) s->meta[r] = meta;
     if (r >= 0 && s->jf) { u8 op = 'M'; fwrite(&op, 1, 1, s->jf); fwrite(&doc_id, 8, 1, s->jf); fwrite(&meta, 8, 1, s->jf); }
@@ -321,6 +364,7 @@ i32 store_set_meta(RagStore *s, i64 doc_id, i64 meta)
 i32 store_get_meta(RagStore *s, i64 doc_id, i64 *meta)
 {
     i32 r;
+    store_need_idmap_(s);
     pthread_rwlock_rdlock(&s->lock);
     r = store_live_row_(s, doc_id);
     if (r >= 0) *meta = s->meta[r];
@@ -357,7 +401,12 @@ static i32 store_compact_(RagStore *s)
     }
     s->count = w;
     if (s->built_upto > w) s->built_upto = w;
-    store_reindex_(s);
+#if defined(__GNUC__)
+    __atomic_store_n(&s->idmap_ok, 0, __ATOMIC_RELEASE);        /* rows moved: rebuild the map now */
+#else
+    s->idmap_ok = 0;
+#endif
+    store_idmap_locked_(s);
     return w;
 }
 
@@ -615,15 +664,47 @@ static void store_journal_replay_(RagStore *s, const char *path)
     free(vec); free(jn);
 }
 
+/* v5 layout: every array starts on a 64-byte boundary, so store_load can map the file and point straight into
+ * it (no copy, pages come in when first touched). The scan index (tq) is saved as well: a load is O(header),
+ * not a rebuild. */
+#define STORE_AL(x) (((size_t)(x) + 63u) & ~(size_t)63u)
+static int store_pad_(FILE *f)
+{
+    static const u8 z[64];
+    long pos = ftell(f);
+    size_t pad;
+    if (pos < 0) return -1;
+    pad = STORE_AL(pos) - (size_t)pos;
+    return pad && fwrite(z, 1, pad, f) != pad ? -1 : 0;
+}
+
+static int store_tq_w_(FILE *f, const Tq *t)
+{
+    i32 h[8];
+    size_t ncode = (size_t)t->nblk * (size_t)t->dpad * 16;
+    h[0] = t->dim; h[1] = t->dpad; h[2] = t->n; h[3] = t->nblk; h[4] = t->nc; h[5] = t->nprobe;
+    h[6] = t->slot_row != (i32 *)0; h[7] = 0;
+    if (store_pad_(f) || STORE_W32(f, h, 8)
+        || store_pad_(f) || STORE_W32(f, t->s1, (size_t)t->dpad)
+        || store_pad_(f) || STORE_W32(f, t->s2, (size_t)t->dpad)
+        || store_pad_(f) || STORE_W32(f, t->perm, (size_t)t->dpad)) return -1;
+    if (t->nc > 1 && (store_pad_(f) || STORE_W32(f, t->cent, (size_t)t->nc * (size_t)t->dim)
+                      || store_pad_(f) || STORE_W32(f, t->cstart, (size_t)t->nc + 1))) return -1;
+    if (t->slot_row && (store_pad_(f) || STORE_W32(f, t->slot_row, (size_t)t->nblk * 32))) return -1;
+    if (store_pad_(f) || (ncode && fwrite(t->codes, 1, ncode, f) != ncode)) return -1;
+    return 0;
+}
+
 i32 store_save(RagStore *s, const char *path)
 {
     FILE *f;
     char *tmp;
     i32 hdr[4];
-    i32 live;
-    u8 has_idx;
+    i32 live, stale;
+    u8 kind;
 
     pthread_rwlock_wrlock(&s->lock);
+    stale = s->count != s->live;                                 /* compaction is about to move rows under the index */
     live = store_compact_(s);
     tmp = (char *)malloc(strlen(path) + 5); strcpy(tmp, path); strcat(tmp, ".tmp");
     f = fopen(tmp, "wb");                                        /* the old file stays intact until the new one is complete and on disk */
@@ -631,15 +712,18 @@ i32 store_save(RagStore *s, const char *path)
 
     hdr[0] = (i32)STORE_MAGIC; hdr[1] = STORE_VERSION;
     hdr[2] = s->dim; hdr[3] = live;
-    has_idx = (u8)(s->idx != (EngIndex *)0 && s->built_upto == live);
+    /* 0: no index (load rebuilds), 1: engine index, 2: the scan index */
+    kind = (u8)(s->idx != (EngIndex *)0 && s->built_upto == live ? 1
+              : (s->tq && !stale && s->built_upto == live && s->tq->n == live ? 2 : 0));
 
     if (STORE_W32(f, hdr, 4)
         || store_goal_w_(f, &s->goal)
-        || STORE_W32(f, s->vecs, (size_t)live * s->dim)
-        || STORE_W64(f, s->ids,  (size_t)live)
-        || STORE_W64(f, s->meta, (size_t)live)
-        || fwrite(&has_idx, 1, 1, f) != 1
-        || (has_idx && engine_save(s->idx, f))) {
+        || store_pad_(f) || STORE_W32(f, s->vecs, (size_t)live * s->dim)
+        || store_pad_(f) || STORE_W64(f, s->ids,  (size_t)live)
+        || store_pad_(f) || STORE_W64(f, s->meta, (size_t)live)
+        || fwrite(&kind, 1, 1, f) != 1
+        || (kind == 1 && engine_save(s->idx, f))
+        || (kind == 2 && store_tq_w_(f, s->tq))) {
         fclose(f); remove(tmp); free(tmp); pthread_rwlock_unlock(&s->lock); return -1;
     }
     if (store_fsync_(f) != 0 || fclose(f) != 0 || rename(tmp, path) != 0) { remove(tmp); free(tmp); pthread_rwlock_unlock(&s->lock); return -1; }
@@ -665,6 +749,115 @@ i32 store_sync(RagStore *s, const char *path)
     return store_save(s, path);
 }
 
+/* n elements of esz bytes at byte offset off: a pointer into the mapping when there is one (no copy), else
+ * read (and byte-swapped on a big-endian host) into arena memory, or malloc'd memory when a is NULL.
+ * NULL when the range is not inside the file. */
+static void *store_take_(u8 *map, size_t len, FILE *f, Arena *a, size_t off, size_t esz, size_t n)
+{
+    void *p;
+    if (off > len || esz * n > len - off) return (void *)0;
+    if (map) return (void *)(map + off);
+    p = a ? arena_alloc(a, esz * (n ? n : 1)) : malloc(esz * (n ? n : 1));
+    if (!p) return (void *)0;
+    if (fseek(f, (long)off, SEEK_SET) != 0 || (n && engs_rle_(f, p, esz, n))) { if (!a) free(p); return (void *)0; }
+    return p;
+}
+
+static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows)
+{
+    i32 h[8];
+    Tq *t;
+    size_t o = STORE_AL(off);
+    i32 *hp = (i32 *)store_take_(map, len, f, (Arena *)0, o, 4, 8);
+    if (!hp) return (Tq *)0;
+    memcpy(h, hp, sizeof(h));
+    if (!map) free(hp);
+    if (h[0] <= 0 || h[1] < h[0] || h[2] != rows || h[3] < 0 || h[4] < 0) return (Tq *)0;
+    t = (Tq *)calloc(1, sizeof(Tq));
+    t->dim = h[0]; t->dpad = h[1]; t->n = h[2]; t->nblk = h[3]; t->nc = h[4]; t->nprobe = h[5];
+    t->mapped = map != (u8 *)0;
+    o = STORE_AL(o + 32);
+    t->s1 = (f32 *)store_take_(map, len, f, (Arena *)0, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
+    t->s2 = (f32 *)store_take_(map, len, f, (Arena *)0, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
+    t->perm = (i32 *)store_take_(map, len, f, (Arena *)0, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
+    if (t->nc > 1) {
+        t->cent = (f32 *)store_take_(map, len, f, (Arena *)0, o, 4, (size_t)t->nc * (size_t)t->dim);
+        o = STORE_AL(o + (size_t)t->nc * (size_t)t->dim * 4);
+        t->cstart = (i32 *)store_take_(map, len, f, (Arena *)0, o, 4, (size_t)t->nc + 1);
+        o = STORE_AL(o + ((size_t)t->nc + 1) * 4);
+    }
+    if (h[6]) { t->slot_row = (i32 *)store_take_(map, len, f, (Arena *)0, o, 4, (size_t)t->nblk * 32); o = STORE_AL(o + (size_t)t->nblk * 128); }
+    t->codes = (u8 *)store_take_(map, len, f, (Arena *)0, o, 1, (size_t)t->nblk * (size_t)t->dpad * 16);
+    if (!t->s1 || !t->s2 || !t->perm || (t->nc > 1 && (!t->cent || !t->cstart)) || (h[6] && !t->slot_row) || !t->codes) {
+        tq_free(t);
+        return (Tq *)0;
+    }
+    return t;
+}
+
+/* v5: map the file privately (copy-on-write: the store may still edit rows in place, the file is never
+ * written through the mapping) and point the arrays and the scan index into it. Nothing is read up front;
+ * pages arrive on first touch, the id map is built on first use. */
+static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *hdr)
+{
+    RagStore *s;
+    i32 live = hdr[3], dim = hdr[2];
+    struct stat st;
+    size_t len, o_vecs, o_ids, o_meta, o_kind;
+    u8 *map = (u8 *)0, kind = 0;
+    Arena *da;
+
+    if (live < 0 || dim <= 0 || fstat(fileno(f), &st) != 0) { fclose(f); return (RagStore *)0; }
+    len = (size_t)st.st_size;
+    s = store_new(a, dim);
+    if (store_goal_r_(f, &s->goal)) { fclose(f); return (RagStore *)0; }
+    o_vecs = STORE_AL(16 + 32);
+    o_ids  = STORE_AL(o_vecs + (size_t)live * (size_t)dim * 4);
+    o_meta = STORE_AL(o_ids + (size_t)live * 8);
+    o_kind = o_meta + (size_t)live * 8;
+    if (o_kind >= len) { fclose(f); return (RagStore *)0; }
+    if (!eng_host_be_() && live > 0) {
+        void *m = mmap((void *)0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fileno(f), 0);
+        if (m != MAP_FAILED) { map = (u8 *)m; s->map = m; s->map_len = len; }
+    }
+    da = &s->data_arena[s->data_which];
+    if (live > 0) {
+        s->vecs = (f32 *)store_take_(map, len, f, da, o_vecs, 4, (size_t)live * (size_t)dim);
+        s->ids  = (i64 *)store_take_(map, len, f, da, o_ids, 8, (size_t)live);
+        s->meta = (i64 *)store_take_(map, len, f, da, o_meta, 8, (size_t)live);
+        if (!s->vecs || !s->ids || !s->meta) { fclose(f); store_destroy(s); return (RagStore *)0; }
+        s->dead = (u8 *)arena_alloc(da, (size_t)live);
+        memset(s->dead, 0, (size_t)live);
+        s->prev = (i32 *)arena_alloc(da, (size_t)live * sizeof(i32));
+        s->cap = live;
+        if (map) {                                               /* re-scoring reads rows at random: no read-ahead */
+            size_t pg = (size_t)sysconf(_SC_PAGESIZE), b = o_vecs - o_vecs % pg;
+            madvise(map + b, o_ids - b, MADV_RANDOM);
+        }
+    }
+    s->count = live;
+    s->live = live;
+    s->idmap_ok = live == 0;
+    if (map) kind = map[o_kind];
+    else if (fseek(f, (long)o_kind, SEEK_SET) != 0 || fread(&kind, 1, 1, f) != 1) { fclose(f); store_destroy(s); return (RagStore *)0; }
+
+    if (kind == 1) {
+        if (fseek(f, (long)(o_kind + 1), SEEK_SET) != 0) { fclose(f); store_destroy(s); return (RagStore *)0; }
+        s->idx = engine_load(&s->idx_arena, f);
+        fclose(f);
+        if (!s->idx) { store_destroy(s); return (RagStore *)0; }
+        s->built_upto = live;
+    } else {
+        if (kind == 2) s->tq = store_tq_r_(map, len, f, o_kind + 1, live);
+        fclose(f);
+        s->fast = 1; s->fast_target = 0.97f;                     /* fast stores are saved without an engine index */
+        if (s->tq) s->built_upto = live;
+        else store_build(s);                                      /* no saved scan index (or an unreadable one): build it */
+    }
+    store_journal_replay_(s, path);
+    return s;
+}
+
 RagStore *store_load(Arena *a, const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -674,8 +867,10 @@ RagStore *store_load(Arena *a, const char *path)
     u8 has_idx;
     if (!f) return (RagStore *)0;
     if (STORE_R32(f, hdr, 4) || (u32)hdr[0] != STORE_MAGIC
-        || hdr[1] != STORE_VERSION) { fclose(f); return (RagStore *)0; }
+        || (hdr[1] != 4 && hdr[1] != STORE_VERSION)) { fclose(f); return (RagStore *)0; }
+    if (hdr[1] == STORE_VERSION) return store_load_v5_(a, path, f, hdr);
 
+    /* v4: packed sections, no saved scan index - read everything, rebuild the scan */
     s = store_new(a, hdr[2]);
     live = hdr[3];
     if (store_goal_r_(f, &s->goal)) { fclose(f); return (RagStore *)0; }

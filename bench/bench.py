@@ -296,9 +296,9 @@ def main():
     path = os.path.join(tmp, "index")
     try:
         t0 = time.perf_counter(); m.build(train); t_build = time.perf_counter() - t0
-        size = m.size()
         t0 = time.perf_counter(); m.save(path); t_save = time.perf_counter() - t0
         t0 = time.perf_counter(); m.load(path); t_load = time.perf_counter() - t0
+        size = m.size()                                   # what the loaded, ready-to-search index holds
         base = {"dataset": meta["name"], "method": a.method, "version": m.version, "n": n, "dim": dim,
                 "threads": a.threads, "cpu": cpu_model(), "build_s": round(t_build, 3),
                 "save_s": round(t_save, 3), "load_s": round(t_load, 3), "index_bytes": size,
