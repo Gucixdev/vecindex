@@ -1,5 +1,18 @@
+# vecindex
 
-# ragdb
+An embedded vector index and note database in C89: bit-packed 1-5 bit quantizers, a TurboQuant-style
+rotated 4-bit fast-scan with exact re-scoring, IVF and HNSW routers, BM25 hybrid search and an optional
+agent-memory layer. Library only: no server, nothing beyond libc, libm and pthreads.
+
+```sh
+git clone https://github.com/Gucixdev/vecindex && cd vecindex
+./run            # self-tests, fuzzers, thread and crash-safety tests (needs bash and gcc)
+./run stress     # plus the churn / oracle stress tests
+```
+
+It used to live in [holyc](https://github.com/Gucixdev/holyc) as `ragdb/`; its history came along.
+
+## Overview
 
 A note/vector database (`vecdb.c`, on `vecindex` + `hdict.c` + `lex.c` + `store.c`) plus an
 optional agent-memory layer on top of it (`mem.c`) - embedded, C89, no server required. This
