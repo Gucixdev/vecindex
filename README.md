@@ -1,16 +1,136 @@
 # vecindex
 
-An embedded vector index and note database in C89: bit-packed 1-5 bit quantizers, a TurboQuant-style
-rotated 4-bit fast-scan with exact re-scoring, IVF and HNSW routers, BM25 hybrid search and an optional
-agent-memory layer. Library only: no server, nothing beyond libc, libm and pthreads.
+An embedded vector index and note database in C89: a TurboQuant-style rotated 4-bit (or 2-bit) fast-scan with
+exact re-scoring, IVF clustering, bit-packed 1-5 bit quantizers, BM25 hybrid search and an optional
+agent-memory layer - plus `vserv.c`, a small epoll server for it (Unix and TCP sockets, a binary protocol and
+HTTP/1.1, TLS 1.2 through the vendored BearSSL). Nothing beyond libc, libm and pthreads (and BearSSL for TLS).
 
 ```sh
 git clone https://github.com/Gucixdev/vecindex && cd vecindex
-./run            # self-tests, fuzzers, thread and crash-safety tests (needs bash and gcc)
+./run            # self-tests, fuzzers, thread and crash-safety tests, the server end to end (needs bash and gcc)
 ./run stress     # plus the churn / oracle stress tests
 ```
 
 It used to live in [holyc](https://github.com/Gucixdev/holyc) as `ragdb/`; its history came along.
+
+## Results
+
+Everything in this section was measured on one machine, in one session: 2 vCPUs of an Intel Xeon @ 2.80GHz (Cascade
+Lake: AVX-512 with VNNI, 1 MB of L2 per core, 33 MB of L3 shared), the shell's cgroup capped at 5.84 GiB, Linux 6.18.
+FAISS 1.15.1 (pip), turbovec 1.1.2, qdrant-edge-py 0.8.0 and vecindex (through a ctypes shim, `bench/vi.c`) all run
+through the same harness, `bench/bench.py`, so every library pays the same Python call per query.
+
+The cloud VM this ran on changed hardware during the work (it restarted onto this host from one with a 260 MB L3), so
+the before/after numbers of individual changes in the priority table were measured as pairs on whichever host was up
+at the time - never one number from each host.
+
+### GloVe-100: queries per second at the same recall
+
+glove-100-angular prepared the ann-benchmarks way: 1,183,514 vectors of 100 dimensions, 10,000 held-out queries,
+recall@10 against the exact top 10. Each QPS cell is **one batch of 10k queries on 2 threads / one query per call on
+1 thread**, at the fastest setting each method has that reaches the recall (the settings swept are in `bench.py`:
+probes and re-rank depth for vecindex, nprobe and k_factor for FAISS IVF, efSearch / hnsw_ef for the graphs).
+
+| method | build | load | bytes/vec | best recall@10 | >= 0.85 | >= 0.90 | >= 0.95 | >= 0.97 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| vecindex 4-bit + f32 rows | 8.0 s | 7 ms | 475 | 0.9884 | 13,405 / 4,911 | 7,996 / 2,277 | 4,897 / 1,433 | 2,606 / 862 |
+| vecindex 4-bit + int8 rows | 10.5 s | 7 ms | 179 | 0.9752 | 10,975 / 4,280 | 6,833 / 2,639 | 3,849 / 876 | 2,099 / 624 |
+| vecindex 2-bit + f32 rows | 7.5 s | 7 ms | 449 | 0.9836 | 10,160 / 3,922 | 6,758 / 2,376 | 2,882 / 1,241 | 2,112 / 929 |
+| vecindex 2-bit + int8 rows | 8.3 s | 8 ms | 153 | 0.9712 | 11,424 / 3,935 | 7,235 / 2,654 | 2,420 / 949 | 1,896 / 715 |
+| FAISS IVF4096,PQ50x4fs,RFlat | 124.5 s | 510 ms | 436 | 0.9785 | 8,632 / 2,535 | 4,456 / 1,081 | 2,822 / 871 | 1,846 / 526 |
+| turbovec 4-bit | 2.2 s | 105 ms | 56 | 0.8465 | - | - | - | - |
+| turbovec 2-bit | 1.7 s | 69 ms | 30 | 0.5448 | - | - | - | - |
+
+FAISS HNSW32, FAISS IVF4096,Flat and Qdrant are being measured again on this host (a container restart cut that run
+short); their rows go in when it finishes.
+
+turbovec scans every code of every row (no clustering) and stops at recall@10 0.8465: 256 on 2 threads, 37 one query at a time QPS there.
+Bytes/vec is what the loaded index holds, RAM and file together (vecindex keeps its rows file-backed; the codes it
+scans are 50 (4-bit) or 25 (2-bit) B/vec).
+
+Against the fastest other method at each recall:
+
+| recall@10 | vecindex, batch 2 threads | best other | x | vecindex, 1 thread per call | best other | x |
+|---|---:|---|---:|---:|---|---:|
+| >= 0.85 | 13,405 | 8,632 (FAISS IVF4096,PQ50x4fs,RFlat) | 1.55x | 4,911 | 2,535 (FAISS IVF4096,PQ50x4fs,RFlat) | 1.94x |
+| >= 0.90 | 7,996 | 4,456 (FAISS IVF4096,PQ50x4fs,RFlat) | 1.79x | 2,654 | 1,081 (FAISS IVF4096,PQ50x4fs,RFlat) | 2.46x |
+| >= 0.95 | 4,897 | 2,822 (FAISS IVF4096,PQ50x4fs,RFlat) | 1.74x | 1,433 | 871 (FAISS IVF4096,PQ50x4fs,RFlat) | 1.65x |
+| >= 0.97 | 2,606 | 1,846 (FAISS IVF4096,PQ50x4fs,RFlat) | 1.41x | 929 | 526 (FAISS IVF4096,PQ50x4fs,RFlat) | 1.77x |
+
+### Where vecindex wins and where it loses
+
+| axis | vecindex | the others | verdict |
+|---|---|---|---|
+| QPS at recall@10 0.85-0.97, batch on 2 threads | see above | FAISS IVF-PQ fast-scan is the closest | **1.41-1.79x faster** |
+| QPS at recall@10 0.85-0.97, one query at a time | see above | FAISS IVF-PQ fast-scan | **1.65-2.46x faster** |
+| build | 7.5-10.5 s | FAISS IVF-PQ 124.5 s; turbovec 1.7-2.2 s (no clustering) | **12-17x faster than FAISS**; 3.6x slower than turbovec |
+| load a saved index | 7-8 ms (mmap) | FAISS IVF-PQ 510 ms; turbovec 69-105 ms | **9-70x faster** |
+| memory | 153 B/vec (2-bit + int8 rows) to 475 (4-bit + f32 rows) | FAISS IVF-PQ 436; turbovec 30-56 (codes only) | 2.8x smaller than FAISS at recall 0.97; **turbovec is 2.7x smaller** but stops at recall 0.85 |
+| best recall@10 reached | 0.9884 | FAISS IVF-PQ 0.9785; turbovec 0.8465 | higher |
+
+### Scale: one 2-core box, a 5.84 GiB memory limit
+
+Still on the previous commits while the runs on 5621db4 finish (they will replace this list):
+
+- Old store (`b0e285e`): f32 rows in anonymous memory, OOM-killed between 7M and 8M rows of 128 dimensions during
+  ingest.
+- 10M x 128 (`7c4307d`, first host): 258 MB anonymous memory after ingest, 917 MB after the build, build 11.6 s.
+- 100M x 96, 2-bit codes + int8 rows (`5125fd9`, first host): ingest 195 s at 289 MB anonymous memory (10.8 GB of
+  rows in the spill file), build 225 s (train 32, assign 131, encode 62), 3.0 GB RAM after; recall@10 0.849 / 0.888
+  / 0.919 / 0.949 at 1000 / 2000 / 4000 / 8000 probes, 30.6 / 39.6 / 22.7 / 10.9 QPS on one thread.
+- vecdb, 8M notes (`10bb6d8`, first host): ingest 146 s, build 19 s, 3.6 GB anonymous memory, hybrid search 7.7
+  ms/query, MCTS explore 53 ms/query. The old code died at ~4M.
+
+### Priority table: what gave the most, what gave the least
+
+Every row is a before/after pair measured on the same host (the commit message of each change has the details).
+Ordered by what the change bought, biggest first.
+
+| # | change | before -> after | where measured |
+|---|---|---|---|
+| 1 | store rows in 65536-row column chunks, spilled to a file past 256 MB | ingest OOM-killed between 7M and 8M rows (d=128) -> 100M rows (d=96, compact mode) in the same 5.84 GiB | `bench/scale.c` |
+| 2 | load the saved index by mmap instead of rebuilding it | GloVe: 11.9 s -> 1-7 ms | `bench.py` load time |
+| 3 | `tq.c`: rotation + 4-bit fast-scan + exact re-score, replacing the IVF/q4 auto-tuner | 201k Wikipedia vectors: recall@10 76% -> 100%, build 70 s -> 1.1 s | `vcmp.c` (12-core box) |
+| 4 | this round (`5621db4`) as a whole: rows 5, 6 and 12 | old and new code side by side on the Results host: being measured | `bench.py` |
+| 5 | probes on int8 + VNNI, a reservoir instead of a heap, radix sort, prefetch two blocks ahead | one query, same probes: 390 -> 194 us (4-bit, probe 96), 378 -> 169 us (2-bit, probe 128); batch of 10k on 2 threads: 6.9k -> 11.3k and 6.7k -> 13.6k QPS | profiler, first host |
+| 6 | rows placed by their 4 closest top cells, 256 sample rows a centroid, one polish round | rows in the wrong cluster 24.4% -> 4.5%; true top 10 inside the 96 closest clusters 87.3% -> 90.0% of queries, 10% fewer rows scanned; build 2.0 -> 4.0 s | profiler, first host |
+| 7 | batch search, cluster by cluster | QPS at recall ~0.97 on 2 threads: 2183 -> 3194 | `bench.py`, first host |
+| 8 | 2-bit codes + int8 rows | 471 -> 150 B/vec for 1.5 recall points at the same probe | `bench.py`, first host |
+| 9 | vecdb: varint postings, 12-byte hash slots, a slab | 669 -> 392 B a note; 4M -> 8M notes in the cgroup | `vbench1m.c` |
+| 10 | threaded build: two-level k-means, AVX-512 scoring, encoding per block range | 1M rows: 7.6 -> 2.25 s | `bench/scale.c` |
+| 11 | AVX-512 scan kernel with the threshold test in registers, quickselect for the probes, rows prefetched for re-scoring | 1 thread: 344 -> 408 QPS at nprobe 96, 176 -> 245 at nprobe 192 (same recall) | `bench.py`, first host |
+| 12 | 8 queries per pass over the int8 centroids (batch) | probes cost a batched query 9 us (27-31 us for a query alone) | profiler, first host |
+
+What gave the least (measured, then dropped): a second polish round (+0.1 recall points for +0.85 s of build), 8 top
+cells instead of 4 (+0.15 points, +32% build), checking each centroid's nearest neighbours after the assignment (no
+gain, removed), the scan loop unrolled or written with GCC vector extensions (no gain), queries-outer order in the
+batch loop (no gain, reverted).
+
+### Bottlenecks now
+
+Measured on this host unless noted; ordered by how much of a query (or a build) each one is.
+
+| # | bottleneck | how big | what would move it |
+|---|---|---|---|
+| 1 | the scan kernel is port-bound: 11 vector ops per 64 bytes of codes, 2 of them shuffles that only one port runs | 2.5 ns a row in L1 at d=100, 4-bit (1.9 ns on the first host); two thirds of a query at probe 64 | codes laid out for VBMI (64-entry `vpermb` lookups) or byte sums kept in 8 bits for 4 columns at a time - a format change |
+| 2 | memory bandwidth: GloVe's 4-bit codes are 59 MB, this L3 is 33 MB | the scan streams from DRAM; the same queries ran 1.3-1.6x faster on the 260 MB-L3 host, where the kernel alone was 1.3x faster | 2-bit codes (30 MB, fit) with residual encoding, so they need fewer re-scores |
+| 3 | the build is mostly clustering: f32 k-means and assignment | ~6 of the 8 s on GloVe; 100M: 225 s on the previous commit (train 32, assign 131, encode 62) | int8 VNNI scoring for the assignment too (3x the multiply-adds per instruction measured here) |
+| 4 | exact re-scoring reads R random rows of 400 bytes | 11-25 us a query at R = 128-256 (first host) | int8 rows: 104 bytes, about 1 recall point |
+| 5 | probe selection at 40000 clusters (100M rows) | 40000 x 96 int8 bytes a query | a two-level probe (top cells first) |
+| 6 | the Python call per query in the harness | the same few microseconds for every library | - |
+
+### Reproduce
+
+```sh
+python3 bench/prepare_glove.py GLOVE_TWITTER_100_GZ DATA_DIR    # -> train.f32, test.f32, gt.i32, meta.json
+(cd bench && gcc -std=gnu99 -O3 -march=native -fPIC -shared -I.. vi.c -o libvi.so -lm -lpthread)
+python3 bench/bench.py DATA_DIR vecindex --threads 2 --lat 1000          # also vecindex-i8, -2bit, -2bit-i8,
+                                                                         # faiss-ivfpqfs, faiss-hnsw, faiss-ivfflat,
+                                                                         # qdrant, turbovec4, turbovec2
+(cd bench && gcc -std=gnu99 -O2 -march=native -I.. scale.c -lm -lpthread -o scale)
+bench/scale 100000000 96 --bits 2 --int8 --probe 1000,2000,4000,8000 --rerank 1000 --nq 100
+gcc -std=gnu99 -O2 -march=native -I. vbench1m.c -lm -lpthread -o .build/vbench1m && .build/vbench1m 8000000
+```
 
 ## Overview
 
@@ -23,9 +143,9 @@ section further down.
 
 **Verdict: production-ready as an embedded, single-node library.** Not equivalent to a hosted,
 multi-tenant vector-DB service (Pinecone/Qdrant/Milvus) - that would be a different project, not a
-gap this repo is missing by oversight. Every number below is measured on this machine (GTX 1050
-Ti, 7.8 GB RAM, 12 cores), not estimated; run `./run` / `./run stress` / `./run bench` /
-`./run real_val` yourself to reproduce any of it.
+gap this repo is missing by oversight. Every number below is measured, not estimated: the older rows on a
+GTX 1050 Ti box (7.8 GB RAM, 12 cores), the scale, server and benchmark rows on the 2-core box of the Results
+section; run `./run` / `./run stress` / `./run bench` / `./run real_val` yourself to reproduce any of it.
 
 | area | status | evidence |
 |---|---|---|
@@ -34,7 +154,8 @@ Ti, 7.8 GB RAM, 12 cores), not estimated; run `./run` / `./run stress` / `./run 
 | Fuzzing | 3 fuzzers (parser, rule engine, malformed input) | `vfuzz.c`/`mrfuzz.c` - the rule-parser one found and fixed a real stack-overflow crash on its first run |
 | Adversarial stress | real invariant checks, not just "doesn't crash" | `stress.c`/`mstress.c` - found and fixed 5 real bugs this way |
 | Static analysis | clang analyzer + clang-tidy across the core, findings triaged not just counted | 2 real (currently-unreachable) issues fixed, the rest confirmed false-positive/non-actionable by hand-tracing, not dismissed on sight |
-| Scale | measured to the actual breaking point, not extrapolated | 1M: 1.48 GB RSS, 1.1 ms/query. 2M: 1.9 GB, 6.4 ms/query (super-linear). ~3.4-3.5M: real swap-thrashing ceiling on this loaded machine (not a crash) |
+| Scale | measured to the actual breaking point, not extrapolated | store: 100M vectors (d=96, 2-bit + int8) ingested, built and searched in a 5.84 GiB cgroup on 2 cores; the old store was OOM-killed between 7M and 8M. vecdb: 8M notes end to end where the old code died at ~4M (see Results) |
+| Server | `vserv.c`: epoll, Unix + TCP, HTTP/1.1 + binary, TLS 1.2 (BearSSL), mutual TLS | `bench/vserv_test.py` (26 checks) and `bench/vserv_tls_test.py` (22 checks) in `./run` |
 | Retrieval quality | a real SQuAD-based benchmark, not hand-labeled questions | `real_val.c`: gold@10 up to 85.6%, vs an 87.1% ceiling for this embedder (measured directly) - the ANN index is near-lossless relative to what the embedder allows |
 | Reranking | a real cross-encoder second pass, with a measured effect | `rerank.c`: MRR 0.751->0.887, gold@1 62.1%->81.5% on the subset where it has room to help |
 | Independent review | **not done** | every test here was written and run by the same person who wrote the code - real bugs were still found this way, but this is not the same claim as external review |
@@ -42,6 +163,40 @@ Ti, 7.8 GB RAM, 12 cores), not estimated; run `./run` / `./run stress` / `./run 
 
 Full comparison to mainstream RAG/vector-DB stacks (what's genuinely ahead, what's genuinely
 behind, no hedging either way): see "How this compares" near the end of this file.
+
+## vserv: the store over a socket
+
+`vserv.c` serves one store file: Linux epoll, one worker thread per core, a fixed request buffer per connection
+(allocated on its first byte, reused after), replies built in a per-thread buffer - a request allocates nothing.
+The store is opened with `store_load` (mmap), so a 100M-row file is ready in milliseconds.
+
+```sh
+./run                                    # builds .build/vserv (BearSSL into .build/libbearssl.a first)
+.build/vserv -s /run/vx.sock -p 8077 -t 2 -x docs.vxi            # Unix socket (0600) + TCP on 127.0.0.1
+.build/vserv -p 8443 -c cert.pem -k key.pem [-a clients-ca.pem] [-T] docs.vxi   # TLS, optional mutual TLS
+curl -s localhost:8077/stats
+curl -s -X POST 'localhost:8077/search?k=5' -d '[0.1, 0.2, ...]'
+```
+
+Every socket speaks two protocols, told apart by the first byte: HTTP/1.1 (`GET /health`, `GET /stats`,
+`POST /search?k=`, `/add?id=`, `/delete?id=`, `/build`, `/save`; vectors as a JSON array or raw little-endian
+f32, keep-alive, pipelining) and a binary protocol (`0xB5`, op, k, length; search/add/delete/build/save/stats)
+with nothing to parse. The HTTP header scan looks for the blank line 16 bytes at a time with SSE2 (the
+picohttpparser idea, cut down to what this server needs).
+
+TLS (`-c`/`-k`): TLS 1.2 through the vendored [BearSSL](https://bearssl.org) 0.6 (MIT, unmodified, no crypto
+code of our own): ECDHE only (forward secrecy), AEAD suites only (AES-GCM with AES-NI, ChaCha20-Poly1305), EC or
+RSA keys, sessions resumed from one cache shared by every worker, keys wiped when a connection closes. `-a CA`
+requires client certificates (mutual TLS). TLS is sniffed per connection (`0x16`): the TCP port takes only TLS
+(`-P` lets plaintext in too); the Unix socket takes TLS or, for local tools, plaintext (`-T`: TLS only).
+
+Measured: 2.4 MB idle RSS; 4.2 KB per open plaintext connection, 20.7 KB per TLS connection (300 open). From
+Python clients on 2 cores: ~15-19k searches/s plaintext, ~10.7k over TLS on the first 2-core host; 8.9-10.6k and
+5.7-7.5k on the Cascade Lake host of the Results section (2k rows; the Python clients are the bottleneck).
+`bench/vserv_test.py` (26 checks: both protocols, both sockets, pipelining, a request trickled byte by byte,
+oversized and malformed input, 8 concurrent clients, SIGTERM saves, restart) and `bench/vserv_tls_test.py` (22
+checks: resumption on every reconnect, multi-record replies, plaintext refused, untrusted CA, mTLS accept/reject,
+RSA key, curl, TLS on the Unix socket) run in `./run`.
 
 ## vecdb: notes on top of vecindex
 
@@ -91,7 +246,7 @@ term dictionary + postings) and `vecdb.c` sit on `store.c`.
 
 `tq.c` copies what makes TurboQuant work: a fixed random rotation (signs + Walsh-Hadamard) turns every
 coordinate into ~N(0,1/d) for any data, so one fixed Lloyd-Max 4-bit codebook is near-optimal with no
-training; codes sit in a fast-scan layout scored with PSHUFB (AVX2, threaded above 150k rows). The scan only
+training; codes sit in a fast-scan layout scored with PSHUFB (AVX2 or AVX-512, threaded above 150k rows). The scan only
 proposes 256+ candidates; the f32 rows the store keeps re-score them exactly, which is what lifts 86% to
 100%. `store_set_fast` selects it (vecdb does); the IVF auto-tuner remains for the plain store API.
 
@@ -100,7 +255,8 @@ proposes 256+ candidates; the f32 rows the store keeps re-score them exactly, wh
 `vecdb_save` writes PATH.vdb (node table), PATH.vdt (bodies, stay on disk), PATH.vxi (vector rows) and
 PATH.img.vxi. `vecdb_sync` afterwards only appends to journals (`store_sync`, PATH.vxi.j, a torn tail is
 ignored on load), so a save costs the change, not the store. Loading rebuilds links, tags and BM25 from the
-bodies (~10 us per note) and the TurboQuant codes (~1 s per 200k).
+bodies (~10 us per note); the vector rows and the TurboQuant index are mapped from PATH.vxi as they are (no
+rebuild, pages come in when first touched).
 
 ### Real embeddings, documents, pictures
 
@@ -143,8 +299,9 @@ the gold passage was in the top-10 but not already first - exactly the case a re
 ### Threads
 
 Searches on a store take a read lock and run concurrently (stress test: 8 readers + a writer);
-the TurboQuant scan itself is multi-threaded on big stores. Lexical (BM25) searches on one index take
-turns behind a mutex. Building, embedding and ingest are single-threaded.
+the TurboQuant scan itself is multi-threaded on big stores, and `store_search_batch` spreads a batch of queries
+over threads. The index build is threaded (k-means, assignment, encoding). Lexical (BM25) searches on one index
+take turns behind a mutex. Embedding and ingest are single-threaded.
 
 ### Query language
 
@@ -289,54 +446,67 @@ Less memory traffic (2-bit codes with a longer shortlist, IVF pruning) is what w
 
 ### IVF for the TurboQuant scan (large stores)
 
-`tq_build(..., nc)` can group the rows by cluster (spherical k-means on a 40k sample, threaded assignment, clusters
-padded to whole 32-row blocks); a query ranks the centroids and scans only the blocks of the closest ~16%. The store
-turns it on from `STORE_IVF_MIN` = 600 000 rows (clusters of ~2000 rows); below that the flat scan is used because it
-is fast enough and exact-ish. `store_set_probe` trades recall for speed. Measured (recall@10 against exact search,
-after the exact re-score):
+From `STORE_IVF_MIN` = 600 000 rows the store groups the rows by cluster (IVF) and a query scans only the blocks of
+the clusters closest to it. The cluster count follows the usual rule, 4 sqrt(rows), with no cluster planned below
+`STORE_IVF_ROWS` = 256 rows: 1.2M rows get 4350 clusters of ~270, 100M rows 40000 of 2500. Training is spherical
+k-means on 256 rows per centroid (the sample is capped at 512 MB); above 1024 clusters it is two-level: ~sqrt(nc) top
+cells, trained on a subsample, each split into sub-clusters in proportion to its share of the sample. A row goes to the
+closest sub-cluster among those of its 4 closest top cells (2 past 128 cells), and one Lloyd round over the whole
+sample then lets neighbouring cells settle their shared borders. With only the closest cell, a quarter of GloVe's rows
+sat in the wrong cluster - rows a query then looks for in vain; now 4.5% do, and the true top 10 lies inside the 96
+closest clusters for 90.0% of queries instead of 87.3%, with 10% fewer rows to scan. Centroids are scored 16 at a time
+(transposed, AVX-512 FMA, 4 rows x 4 groups in registers); encoding runs on every core, each thread owning a range of
+blocks so no byte is shared.
 
-| vectors | flat | IVF, 16% of clusters | IVF, 32% |
-|---|---|---|---|
-| real e5, 201k x 384 (200 clusters forced) | 99.9%, 2.0 ms | 98.5%, 0.68 ms | 99.6%, 0.81 ms |
-| hashed BoW, 201k x 256 (diffuse) | 100%, 1.3 ms | ~94%, 0.4 ms | 98.3%, 0.63 ms |
-| synthetic clustered, 1M x 256 | 100%, 7.3 ms | 100%, 1.5 ms | - |
+A query picks its clusters from an int8 copy of the centroids: VNNI scores 16 centroids on 4 dimensions per
+instruction, a quarter of the bytes of f32, so the copy stays in L2 (0.44 MB for GloVe). A binary search on a vector
+count keeps about probe + probe/4 + 16 of them, and only those get exact f32 scores, so the clusters probed are the
+ones f32 would pick. In a batch, 8 queries share each pass over the centroids. The scan keeps its candidates in a
+reservoir (append while above the threshold, cut to the best R with a quickselect when full) and prefetches two
+blocks ahead. The default probe is min(16%, 4 sqrt(clusters)) of the clusters (GloVe-100: 264 of 4350, recall@10
+0.95); `store_set_probe` trades recall for speed, `store_set_rerank` sets how many candidates are re-scored exactly.
+Below 600k rows the flat scan is used.
 
-Build goes from 5.9 s to 10.3 s at 1M rows. Diffuse data (hashed word vectors) loses more recall per probed cluster
-than real embeddings; raise the probe there. `./run` exercises the IVF scan directly (recall, tombstones, meta
-filter, all-clusters == flat), and the store demo and stress test also pass when forced onto IVF at 1500 rows
-(`-DSTORE_IVF_MIN=1500 -DSTORE_IVF_ROWS=100`).
+`./run` exercises the IVF scan directly (recall, tombstones, meta filter, all-clusters == flat, 2-bit too, the
+two-level clustering on 1500 clusters, batch == one query at a time), and the store demo and stress test also pass
+when forced onto IVF at 1500 rows (`-DSTORE_IVF_MIN=1500 -DSTORE_IVF_ROWS=100`).
 
-### Scale ceiling on this machine (8 GB RAM, hashed embedder - no model server)
+### Scale: rows in chunks, past RAM
+
+What capped the store before (measured, see Results): every f32 row sat in anonymous memory, and the arrays grew by
+doubling into a second arena whose old copy was never released (RSS 1.5-3x the data), so the bash cgroup's 5.84 GiB
+OOM-killed it between 7M and 8M rows of 128 dimensions - during ingest, before any index existed.
+
+Now the rows live in column chunks of 65536 rows (vectors, doc ids, tags). A chunk never moves, so growth copies
+nothing. Past 256 MB new chunks are pages of an unlinked spill file (`store_set_spill`, `$VECINDEX_SPILL`,
+`/var/tmp` by default - use a disk, not a tmpfs), started on their way to disk as each fills (`sync_file_range`), so
+the kernel drops them under pressure instead of swapping or OOM-killing. A loaded store points its chunks into the
+.vxi mapping. What a search scans stays in RAM: the codes (d/2 bytes a row, d/4 in 2-bit mode), slot map and a
+dead-row bitset. Re-scoring reads only the few hundred candidate rows a query needs; when those reads start missing
+the page cache (major faults), the store asks for all of a query's rows at once (`MADV_WILLNEED`) instead of one
+blocking fault after another - ~190k IOPS batched against ~21k one by one on this disk. Ids that arrive in increasing
+order (the usual case) need no id map at all (binary search over the id column); only rows added out of order go
+into an 8-byte-a-slot hash.
+
+For stores past what RAM and disk allow at f32, two knobs: `store_set_codes(s, 2)` (2-bit codes: half the RAM,
+twice the scan speed, re-score more candidates) and `store_set_vec_bytes(s, 1)` (int8 rows with an f32 scale: d + 4
+bytes on disk instead of 4d, about one recall point on GloVe - the cost of 8 bits, a rotation first does not change
+it). Measured trade-offs are in the Results tables.
+
+### vecdb at scale (hashed embedder - no model server)
 
 `vbench1m.c` (`./.build/vbench1m N [SAVEDIR]`) adds N notes with links, tags and a body through the public API,
-builds, queries, saves, and reloads. On this machine (GTX 1050 Ti box, 7.8 GB RAM, 12 cores):
+builds, queries, saves, and reloads. Per note vecdb used ~670 bytes of C structures on top of its vector; now 392
+(500k notes, measured per structure): BM25 postings are varint-packed and kept inline while they fit in 8 bytes
+(271 -> 54 B), string hashes have 12-byte slots at load 0.7 (terms 105 -> 84 B, titles 61 -> 42 B), node names
+and link lists come from a slab with free lists (74 -> 57 B), and a node is 56 bytes instead of 64.
 
-| | N=1,000,000 | N=2,000,000 |
-|---|---|---|
-| ingest (add: embed + parse + graph + BM25 + store) | 11.1 s (11.1 us/note) | 54.2 s (27.1 us/note) |
-| vector index build (IVF kicks in above 600k rows) | 4.8 s | 25.3 s |
-| peak RSS | 1.48 GB | 1.9 GB |
-| hybrid search, 300 exact-id queries | 100% hit@1, 1.1 ms/query | 100% hit@1, 6.4 ms/query |
-| MCTS explore | 2.7 ms/query | 26.4 ms/query |
-| save (.vdb + .vdt + .vxi) | 1.0 s, 655 MB total | not measured at 2M (disk too tight - see below) |
-| load (no reindex - counts match, vectors come from the .vxi) | 11.3 s | not measured at 2M |
+In the 5.84 GiB cgroup on 2 cores the old code died at about 4M notes; now 8M notes run end to end: ingest 146 s
+(18 us/note, linear), index build 19 s, 3.6 GB anonymous memory after the build (the vectors stay file-backed),
+hybrid search 7.7 ms/query with 300/300 exact-id hits, MCTS explore 53 ms/query.
 
-Both ingest cost/note (11.1us -> 27.1us) and hybrid search latency (1.1ms -> 6.4ms, worse than the 2x the
-corpus grew) get noticeably worse per-unit between 1M and 2M, not just proportionally bigger - the same
-super-linear shape `mem_consolidate` showed (see mem.c's own timing section), likely the same underlying
-cause (routing/index overhead that itself grows with corpus size, not just the corpus).
-
-**Where it actually breaks**: pushed further to N=4,000,000 (ingest-only, no save - disk was down to 2.4 GB
-free) to find the real ceiling rather than just extrapolate it. It ingested smoothly to ~3.4M notes (RSS
-2.0-3.5 GB, fluctuating with the allocator, never alarming), then between 3.4M and 3.5M notes the process's
-`VmRSS` collapsed from 2.15 GB to 353 MB while `VmSwap` climbed to 5.2 GB and its state went to `D`
-(uninterruptible disk sleep) - **not an OOM kill, a swap-thrashing cliff**: one 100k-note batch that had been
-taking ~3s started taking ~200s (a ~65x slowdown) as the working set stopped fitting in RAM and the kernel
-started paging it in and out under load. This machine had ~3 GB already committed to another process (an
-unrelated training job) at the time, so a genuinely idle 7.8 GB machine would likely go somewhat higher than
-3.4-3.5M - but this is the actual, observed number under realistic (not idle) conditions, not a guess. The
-earlier claim here ("could hold several million before RAM becomes the limit") was speculation from the 1M
-point alone; this is what it looks like when actually pushed there.
+On the old 12-core box (history, before the changes above): 1M notes in 1.48 GB RSS, and a swap-thrashing cliff
+between 3.4M and 3.5M notes with ~3 GB of the machine taken by another process.
 
 Real notes with real (larger) embeddings and a model server will cost more per note than this hashed-embedder
 test - see the Wikipedia numbers above for that side of it.
@@ -588,15 +758,23 @@ Asked directly, honestly, not as a sales pitch:
   invariants that found real bugs (not just "does it crash" fuzzing), a rule-parser fuzzer that
   found a real stack-overflow crash on its first run. This is closer to how a production index
   engine gets built than a typical tutorial RAG project.
-- **Embedded, zero server dependency, single C89 file per layer.** Sub-millisecond hybrid search
-  locally, 1M notes in 1.48 GB RAM. A real advantage where self-hosted/offline/small-footprint
-  matters, which a hosted vector DB cannot give you.
+- **Embedded, zero dependencies, single C89 file per layer** - and an optional server (`vserv.c`,
+  2.4 MB idle, TLS through vendored BearSSL) when it has to sit behind a socket. A real advantage
+  where self-hosted/offline/small-footprint matters, which a hosted vector DB cannot give you.
+- **Speed at the same recall, build and load.** On GloVe-100 (Results) it answers 1.4-1.8x more
+  queries per second than FAISS's IVF-PQ fast-scan in a batch on 2 threads, and 1.65-2.5x one query
+  at a time, at every recall@10 from 0.85 to 0.97. The index builds in 8.0 s where FAISS IVF-PQ takes 124.5 s, and a saved index is ready in 7 ms
+  (mmap) where FAISS needs half a second.
 
 **Behind, honestly, no hedging:**
-- **Scale.** Single-node only - no sharding/replication. Measured, not guessed: clean to ~3.4M
-  notes on this 7.8 GB machine under realistic (not idle) load, then a swap-thrashing cliff, not a
-  crash (see "Scale ceiling" above). Milvus/Qdrant/Pinecone scale past that by design, across
-  clusters, to billions of vectors.
+- **Scale.** Single-node only - no sharding/replication. Measured, not guessed: 100M vectors on one
+  2-core box with a 5.84 GiB memory limit (compact mode), 8M notes through the whole vecdb layer;
+  past one machine's disk there is nothing. Milvus/Qdrant/Pinecone scale across machines, to
+  billions of vectors.
+- **Memory and build time against a codes-only index.** turbovec keeps nothing but 4-bit codes (56
+  B/vec on GloVe) and builds in 2.2 s with no clustering; vecindex keeps the rows to re-score, so its
+  smallest mode is 153 B/vec (2-bit codes + int8 rows) and its build is 8 s. turbovec tops out at
+  recall@10 0.85 on GloVe and scans every code of every row per query. No graph index here either.
 - **Embedding quality.** The default is `multilingual-e5-small` (118M params) - mid-tier. Larger
   open models (e5-mistral-7b, NV-Embed) and commercial APIs (OpenAI text-embedding-3-large,
   Voyage, Cohere) score meaningfully higher on standard retrieval benchmarks. `real_val.c` (above)
@@ -616,9 +794,10 @@ Asked directly, honestly, not as a sales pitch:
   point of writing real tests instead of just reading the code), but "no known gaps" is not the
   same claim as "reviewed/battle-tested by others."
 
-**Net:** as a *vector search engine*, this is a solid, well-tested single-node library - it does
-not compete with Pinecone/Qdrant on scale or with top embedding APIs on raw retrieval quality, and
-says so with real numbers rather than assuming either way. As a *memory layer for an agent* (event
+**Net:** as a *vector search engine*, this is a solid, well-tested single-node library that, on one
+machine, builds and loads far faster than FAISS and Qdrant and searches faster at high recall - it does
+not compete with Pinecone/Qdrant on multi-machine scale or with top embedding APIs on raw retrieval
+quality, and says so with real numbers rather than assuming either way. As a *memory layer for an agent* (event
 lifetime, decay, metamemory, deterministic consolidation), it does something none of the
 mainstream RAG/vector-DB products offer natively - which is the more interesting half of this
 project, not "does it beat Qdrant."
