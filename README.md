@@ -41,8 +41,10 @@ probes and re-rank depth for vecindex, nprobe and k_factor for FAISS IVF, efSear
 | turbovec 4-bit | 2.2 s | 105 ms | 56 | 0.8465 | - | - | - | - |
 | turbovec 2-bit | 1.7 s | 69 ms | 30 | 0.5448 | - | - | - | - |
 
-FAISS HNSW32, FAISS IVF4096,Flat and Qdrant are being measured again on this host (a container restart cut that run
-short); their rows go in when it finishes.
+FAISS HNSW32, FAISS IVF4096,Flat and Qdrant are missing here: the cloud container was reclaimed in the middle of
+their runs three times. On the first host they were slower than FAISS IVF-PQ at every recall. `bench/run_all.sh
+DATA_DIR` runs every row of this table, the scale runs and vecdb's 8M notes in one go on any Linux box, and
+`bench/tables.py` turns its output into these tables.
 
 turbovec scans every code of every row (no clustering) and stops at recall@10 0.8465: 256 on 2 threads, 37 one query at a time QPS there.
 Bytes/vec is what the loaded index holds, RAM and file together (vecindex keeps its rows file-backed; the codes it
@@ -70,7 +72,7 @@ Against the fastest other method at each recall:
 
 ### Scale: one 2-core box, a 5.84 GiB memory limit
 
-Still on the previous commits while the runs on 5621db4 finish (they will replace this list):
+Still on the previous commits (`bench/run_all.sh` re-runs them on the current code):
 
 - Old store (`b0e285e`): f32 rows in anonymous memory, OOM-killed between 7M and 8M rows of 128 dimensions during
   ingest.
@@ -91,7 +93,7 @@ Ordered by what the change bought, biggest first.
 | 1 | store rows in 65536-row column chunks, spilled to a file past 256 MB | ingest OOM-killed between 7M and 8M rows (d=128) -> 100M rows (d=96, compact mode) in the same 5.84 GiB | `bench/scale.c` |
 | 2 | load the saved index by mmap instead of rebuilding it | GloVe: 11.9 s -> 1-7 ms | `bench.py` load time |
 | 3 | `tq.c`: rotation + 4-bit fast-scan + exact re-score, replacing the IVF/q4 auto-tuner | 201k Wikipedia vectors: recall@10 76% -> 100%, build 70 s -> 1.1 s | `vcmp.c` (12-core box) |
-| 4 | this round (`5621db4`) as a whole: rows 5, 6 and 12 | old and new code side by side on the Results host: being measured | `bench.py` |
+| 4 | this round (`5621db4`) as a whole: rows 5, 6 and 12 | old and new code side by side on one host: not measured yet | `bench.py` |
 | 5 | probes on int8 + VNNI, a reservoir instead of a heap, radix sort, prefetch two blocks ahead | one query, same probes: 390 -> 194 us (4-bit, probe 96), 378 -> 169 us (2-bit, probe 128); batch of 10k on 2 threads: 6.9k -> 11.3k and 6.7k -> 13.6k QPS | profiler, first host |
 | 6 | rows placed by their 4 closest top cells, 256 sample rows a centroid, one polish round | rows in the wrong cluster 24.4% -> 4.5%; true top 10 inside the 96 closest clusters 87.3% -> 90.0% of queries, 10% fewer rows scanned; build 2.0 -> 4.0 s | profiler, first host |
 | 7 | batch search, cluster by cluster | QPS at recall ~0.97 on 2 threads: 2183 -> 3194 | `bench.py`, first host |
