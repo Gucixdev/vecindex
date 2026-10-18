@@ -1074,7 +1074,7 @@ void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, 
     for (i = 0; i < nq; ++i) store_normalise_(qn + (size_t)i * dim, dim);
     pthread_rwlock_rdlock(&s->lock);
     R = s->tq_rerank > 0 ? s->tq_rerank : (k * 20 > 256 ? k * 20 : 256);
-    for (off = 0; off < nq; off += 1024) {                       /* batches of 1024 bound the per-query heaps */
+    for (off = 0; off < nq; off += 1024) {                       /* batches of 1024 bound the per-query candidates */
         i32 m = nq - off < 1024 ? nq - off : 1024;
         i32 *rows = (i32 *)malloc((size_t)m * (size_t)R * sizeof(i32)), *cnt = (i32 *)malloc((size_t)m * sizeof(i32));
         StoreBatch j;
@@ -1804,6 +1804,54 @@ int main(void)
         print_cstr("  2-bit IVF, every cluster == 2-bit flat: "); print_cstr(all_ok ? "yes" : "NO"); print_cstr("\n");
         if (!all_ok || flat->vd != dim / 2 || ivf->bits != 2) ok = 0;
         tq_free(flat); tq_free(ivf); free(un);
+    }
+
+    {   /* two-level clustering (more than TQ_FLAT_MAX clusters): rows land in their truly closest cluster, every
+         * cluster == flat, batch == one at a time */
+        i32 n2 = 24000, d2 = 32, nc2 = 1500, j, q, inbest = 0, same = 0, all_ok = 1, *mr, mc[32];
+        f32 *x2 = (f32 *)malloc((size_t)n2 * d2 * sizeof(f32)), *sc2;
+        u8 *hv;
+        u32 s2 = 77u;
+        TqCol vcol;
+        Tq *flat, *ivf;
+        for (i = 0; i < n2; ++i) {
+            f32 nr = 0;
+            for (j = 0; j < d2; ++j) { f32 v = sd_f_(&s2); x2[(size_t)i * d2 + j] = v; nr += v * v; }
+            nr = 1.0f / (f32)sqrt((f64)nr);
+            for (j = 0; j < d2; ++j) x2[(size_t)i * d2 + j] *= nr;
+        }
+        vcol = tq_col_flat(x2, (size_t)d2 * sizeof(f32), &hv);
+        flat = tq_build(&vcol, n2, d2, 7u, 0, 2, 4); ivf = tq_build(&vcol, n2, d2, 7u, nc2, 2, 4);
+        sc2 = (f32 *)malloc((size_t)(ivf->nc + 15) / 16 * 16 * sizeof(f32));
+        for (j = 0; j < ivf->nc; ++j) {                         /* the cluster each row sits in vs its closest centroid */
+            i32 sl;
+            for (sl = ivf->cstart[j] * 32; sl < ivf->cstart[j + 1] * 32; ++sl) {
+                i32 row = ivf->slot_row[sl];
+                if (row < 0) continue;
+                tq_score_(x2 + (size_t)row * d2, ivf->ct, (ivf->nc + 15) / 16, d2, sc2);
+                inbest += tq_argmax_(sc2, ivf->nc) == j;
+            }
+        }
+        for (q = 0; q < 30; ++q) {
+            i32 rf[100], rn[100], nf, nn2, k;
+            const f32 *qv = x2 + (size_t)(q * 797) * d2;
+            nf = tq_search(flat, qv, 100, rf, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 0);
+            nn2 = tq_search(ivf, qv, 100, rn, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, ivf->nc);
+            if (nf != nn2) all_ok = 0;
+            for (k = 0; k < nf && all_ok; ++k) if (rf[k] != rn[k]) all_ok = 0;
+        }
+        mr = (i32 *)malloc((size_t)32 * 100 * sizeof(i32));
+        tq_search_many(ivf, x2, 32, 100, mr, mc, (const u64 *)0, 2, 40);
+        for (q = 0; q < 32; ++q) {
+            i32 one[100], no = tq_search(ivf, x2 + (size_t)q * d2, 100, one, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 40), eq = no == mc[q], z;
+            for (z = 0; z < no && eq; ++z) if (one[z] != mr[(size_t)q * 100 + z]) eq = 0;
+            same += eq;
+        }
+        print_cstr("  two-level IVF ("); print_i64(ivf->nc); print_cstr(" clusters): rows in their closest cluster ");
+        print_i64((i64)(1000L * inbest / n2)); print_cstr("/1000, every cluster == flat: "); print_cstr(all_ok ? "yes" : "NO");
+        print_cstr(", batch == one at a time "); print_i64(same); print_cstr("/32\n");
+        if (ivf->nc <= TQ_FLAT_MAX || 1000L * inbest / n2 < 900 || !all_ok || same != 32) ok = 0;
+        tq_free(flat); tq_free(ivf); free(x2); free(sc2); free(mr);
     }
 
     /* batch search: the same answers as one query at a time (flat scan here; IVF + batch in the 2-bit test above) */

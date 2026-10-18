@@ -89,10 +89,11 @@ class VecIndex:
         if not self.s:
             raise RuntimeError("vi_load failed")
 
-    def sweep(self):                                     # clusters: 4 sqrt(n) (GloVe: 4351 of ~270 rows)
+    def sweep(self):                                     # clusters: 4 sqrt(n) (GloVe: 4350 of ~270 rows)
         if self.bits == 2:                               # coarser codes: re-score more candidates
-            return [{"nprobe": p, "rerank": r} for p in (64, 128, 192, 256, 384, 512, 768) for r in (256, 1000)]
-        return [{"nprobe": p} for p in (32, 64, 96, 128, 192, 256, 384, 512, 768)]
+            return [{"nprobe": p, "rerank": r} for p in (48, 64, 96, 128, 192, 256, 384, 512, 768) for r in (256, 1000)]
+        # rerank = rows re-scored exactly, like FAISS's k_factor x k
+        return [{"nprobe": p, "rerank": r} for p in (32, 48, 64, 96, 128, 192, 256, 384, 512, 768) for r in (128, 256)]
 
     def set(self, prm):
         self.lib.vi_set_probe(self.s, prm["nprobe"])
@@ -253,7 +254,7 @@ class Qdrant:
         self.shard = self.qe.EdgeShard.load(self.path, self._cfg(self.threads))
 
     def sweep(self):
-        return [{"hnsw_ef": e} for e in (16, 32, 48, 64, 96, 128, 192, 256, 384)]
+        return [{"hnsw_ef": e} for e in (16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536)]
 
     def set(self, prm):
         self.ef = prm["hnsw_ef"]
@@ -290,14 +291,15 @@ def make(method, dim, threads):
         return TurboVec(dim, threads, 4)
     if method == "turbovec2":
         return TurboVec(dim, threads, 2)
+    # every sweep runs far enough to pass 0.97 recall where the method can, so no curve stops early
     if method == "faiss-hnsw":
-        return Faiss(dim, threads, "HNSW32", [{"efSearch": e} for e in (16, 32, 48, 64, 96, 128, 192, 256, 384)],
+        return Faiss(dim, threads, "HNSW32", [{"efSearch": e} for e in (16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024)],
                      ef_construction=200)
     if method == "faiss-ivfflat":
-        return Faiss(dim, threads, "IVF4096,Flat", [{"nprobe": p} for p in (8, 16, 32, 48, 64, 96, 128, 192)])
+        return Faiss(dim, threads, "IVF4096,Flat", [{"nprobe": p} for p in (16, 32, 64, 96, 128, 192, 256, 384, 512, 768)])
     if method == "faiss-ivfpqfs":
         return Faiss(dim, threads, "IVF4096,PQ50x4fs,RFlat",
-                     [{"nprobe": p, "k_factor": f} for p in (8, 16, 32, 64, 128) for f in (4, 16)])
+                     [{"nprobe": p, "k_factor": f} for p in (16, 32, 64, 128, 256, 512) for f in (4, 16, 64)])
     if method == "qdrant":
         return Qdrant(dim, threads)
     raise SystemExit(f"unknown method {method}")
