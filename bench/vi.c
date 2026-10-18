@@ -20,6 +20,9 @@ void *vi_new2(int dim, int codebits, int vecbytes)
     return s;
 }
 void vi_set_rerank(void *s, int r) { store_set_rerank((RagStore *)s, r); }
+/* self-tuning: the build (and vi_tune) pick the fewest probes that keep recall@10 at r; vi_tune returns what it measured */
+void vi_set_target_recall(void *s, float r) { store_set_target_recall((RagStore *)s, r); }
+float vi_tune(void *s) { return store_tune((RagStore *)s); }
 
 /* adds n rows (ids = first_id + i); returns how many were accepted */
 int vi_add(void *s, const float *v, long n, long first_id)

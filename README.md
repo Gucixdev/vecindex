@@ -473,6 +473,23 @@ Below 600k rows the flat scan is used.
 two-level clustering on 1500 clusters, batch == one query at a time), and the store demo and stress test also pass
 when forced onto IVF at 1500 rows (`-DSTORE_IVF_MIN=1500 -DSTORE_IVF_ROWS=100`).
 
+### Self-tuning: ask for a recall, the store keeps it
+
+`store_set_target_recall(s, 0.95)`: from then on every `store_build` measures recall@10 against exact search and
+picks the fewest IVF probes that reach the target, aiming 1.5 standard errors above it so fresh queries meet it too.
+It measures on the queries the store has actually been answering (a reservoir sample of the last 256, kept while a
+target is set) or, before 64 have come in, on a spread of its own rows (each one's own row left out of the truth).
+`store_tune(s)` measures again on demand - after the traffic or the data have drifted - and the probe count it
+settles on is saved with the index. GloVe-100, `bench/tune.c`, on the Cascade Lake host of the Results section:
+
+| target | tuned at build, on its own rows | held-out recall@10 (2000 queries) | re-tuned on those 2000 | recall@10 on the other 8000 |
+|---|---|---|---|---|
+| 0.90 | 118 probes | 0.9134 | 108 probes | 0.9053 |
+| 0.95 | 264 probes | 0.9528 | 290 probes | 0.9584 |
+
+A tuning costs about 2 s on GloVe, most of it the exact search for the truth; on bigger stores it uses fewer
+queries (at most ~3e10 multiply-adds). The self-test checks it on held-out queries too.
+
 ### Scale: rows in chunks, past RAM
 
 What capped the store before (measured, see Results): every f32 row sat in anonymous memory, and the arrays grew by

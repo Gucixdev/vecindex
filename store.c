@@ -36,9 +36,16 @@
  *     store_set_vec_bytes): 2-bit codes (d/4 bytes a row in RAM instead of d/2) and int8 rows on disk (d + 4
  *     bytes instead of 4d). 100M rows of 96 dimensions then need 2.8 GB of RAM and 11.6 GB of disk.
  *
+ * Self-tuning: store_set_target_recall(s, 0.95) and the store keeps that recall@10 on its own - every build
+ * measures recall against exact search and picks the fewest IVF probes that reach it, on the queries it has
+ * actually been answering (a reservoir of the last STORE_QLOG) or, before there are enough, on its own rows;
+ * store_tune re-measures on demand, as the data or the traffic drift.
+ *
  * Concurrency: an rwlock - store_search(_filter) take the read lock and
  * touch no shared mutable state (own malloc scratch, engine_search_into
- * path); everything that mutates takes the write lock.
+ * path) except the query reservoir, behind its own mutex that a search only
+ * try-locks (a busy reservoir skips the query, nobody waits); everything
+ * that mutates takes the write lock.
  *
  *   gcc -std=c89 -pedantic -Wall -Wextra -D_POSIX_C_SOURCE=200112L -O2 \
  *       -march=native -I. store.c -DSTORE_DEMO -lm -lpthread -o store && ./store
@@ -79,11 +86,15 @@
 #ifndef STORE_IVF_ROWS
 #define STORE_IVF_ROWS 256
 #endif
+static i32 store_ivf_min_ = STORE_IVF_MIN;   /* the self-test lowers it to reach the IVF paths on a small store */
 static i32 store_nclusters_(i32 n)
 {
     i32 a = (i32)(4.0 * eng_sqrt_((f64)n)), b = n / STORE_IVF_ROWS;
-    return n < STORE_IVF_MIN ? 0 : (a < b ? a : b);
+    return n < store_ivf_min_ ? 0 : (a < b ? a : b);
 }
+#ifndef STORE_QLOG
+#define STORE_QLOG 256      /* queries kept for tuning (a reservoir sample of everything answered) */
+#endif
 #ifndef STORE_SPILL_MIN
 #define STORE_SPILL_MIN ((i64)256 << 20)   /* column bytes kept in anonymous memory before chunks go to the spill file */
 #endif
@@ -129,6 +140,13 @@ typedef struct {
     i32      tq_probe;      /* IVF: clusters scanned per query (0 = the index default) */
     i32      tq_threads;    /* threads one query's scan may use (0 = auto: up to 4 on big stores) */
     i32      tq_rerank;     /* candidates re-scored exactly per query (0 = auto: max(20 k, 256)) */
+    f32      tune_target;   /* recall@10 every build keeps by choosing the probes (0 = off) */
+    f32      tune_recall;   /* what the last tuning measured (-1: never tuned) */
+    f32     *qlog;          /* [STORE_QLOG x dim] a reservoir sample of the queries answered, unit length */
+    i32      qlog_n;
+    i64      qlog_seen;
+    u32      qlog_rng;
+    pthread_mutex_t qlog_mu;
     Tq      *tq;            /* fast mode: the TurboQuant-style index */
     i32      fast;          /* 1: store_build skips the auto-tuner (engine_build_fast) */
     f32      fast_target;   /* recall@k the fast build grows nprobe to (default 0.9) */
@@ -496,6 +514,9 @@ RagStore *store_new(Arena *a, i32 dim)
     s->idc.esz = sizeof(i64); s->idc.elem = sizeof(i64);
     s->metac.esz = sizeof(i64); s->metac.elem = sizeof(i64);
     h64_init(&s->dup, 8);
+    s->tune_recall = -1.0f;
+    s->qlog_rng = 0x9e3779b9u;
+    pthread_mutex_init(&s->qlog_mu, (const pthread_mutexattr_t *)0);
     s->spill_fd = -1;
     s->spill_min = STORE_SPILL_MIN;
     if (!sp || strcmp(sp, "off") != 0) {                     /* VECINDEX_SPILL=off keeps everything in memory */
@@ -533,6 +554,7 @@ void store_set_spill(RagStore *s, const char *dir, i64 min_bytes)
 void store_destroy(RagStore *s)
 {
     pthread_rwlock_destroy(&s->lock); tq_free(s->tq); s->tq = (Tq *)0;
+    pthread_mutex_destroy(&s->qlog_mu); free(s->qlog); s->qlog = (f32 *)0;
     sidx_free_(&s->ids_h); h64_free(&s->dup);
     if (s->jf) fclose(s->jf);
     free(s->jpath); s->jpath = (char *)0;
@@ -838,6 +860,8 @@ static i32 store_compact_(RagStore *s)
     return w;
 }
 
+static f32 store_tune_locked_(RagStore *s);
+
 void store_build(RagStore *s)
 {
     i32 w;
@@ -860,6 +884,7 @@ void store_build(RagStore *s)
         free(flat);
     } else s->idx = (EngIndex *)0;
     s->built_upto = w;
+    if (s->tune_target > 0.0f) store_tune_locked_(s);            /* keep the recall asked for */
     pthread_rwlock_unlock(&s->lock);
 }
 
@@ -929,6 +954,169 @@ static void store_rescore_(RagStore *s, const f32 *qn, const i32 *rows, i32 m, i
     }
 }
 
+/* ---- self-tuning: the fewest probes that keep recall@10 at the target ---- */
+
+/* a query into the reservoir (s->qlog): try-locked, so a busy reservoir skips the query and nobody waits */
+static void store_qlog_(RagStore *s, const f32 *qn)
+{
+    i64 slot;
+    if (pthread_mutex_trylock(&s->qlog_mu) != 0) return;
+    if (!s->qlog) s->qlog = (f32 *)malloc((size_t)STORE_QLOG * (size_t)s->dim * sizeof(f32));
+    if (s->qlog) {
+        ++s->qlog_seen;
+        if (s->qlog_n < STORE_QLOG) slot = s->qlog_n++;
+        else slot = (i64)(tq_rng_(&s->qlog_rng) % (u32)(s->qlog_seen < 0x7fffffff ? s->qlog_seen : 0x7fffffff));
+        if (slot < STORE_QLOG) memcpy(s->qlog + (size_t)slot * s->dim, qn, (size_t)s->dim * sizeof(f32));
+    }
+    pthread_mutex_unlock(&s->qlog_mu);
+}
+
+/* the exact top k rows of every query, over the built rows (a query's own row left out when self[q] >= 0): the rows
+ * are read once, each thread takes a range and keeps its own top k, and the ranges are merged at the end */
+typedef struct { const RagStore *s; const f32 *Q; const i32 *self; i32 nq, k; f32 *ts; i32 *tr; } StoreTruth;
+
+static void store_topk_put_(f32 *bs, i32 *br, i32 k, f32 d, i32 r)
+{
+    i32 j = k - 1;
+    if (!(d > bs[k - 1])) return;
+    while (j > 0 && bs[j - 1] < d) { bs[j] = bs[j - 1]; br[j] = br[j - 1]; --j; }
+    bs[j] = d; br[j] = r;
+}
+
+static void store_truth_rows_(void *p, i64 a, i64 b, i32 tid)
+{
+    StoreTruth *j = (StoreTruth *)p;
+    const RagStore *s = j->s;
+    f32 *ts = j->ts + (size_t)tid * j->nq * j->k;
+    i32 *tr = j->tr + (size_t)tid * j->nq * j->k, q;
+    i64 r0, r;
+    for (r0 = a; r0 < b; r0 += 256)                              /* 256 rows stay in cache across all the queries */
+        for (q = 0; q < j->nq; ++q) {
+            const f32 *qv = j->Q + (size_t)q * s->dim;
+            for (r = r0; r < b && r < r0 + 256; ++r) {
+                if (STORE_DEAD(s, r) || (j->self && j->self[q] == (i32)r)) continue;
+                store_topk_put_(ts + (size_t)q * j->k, tr + (size_t)q * j->k, j->k, store_dot_(s, qv, (i32)r), (i32)r);
+            }
+        }
+}
+
+static void store_truth_(const RagStore *s, const f32 *Q, const i32 *self, i32 nq, i32 k, i32 *truth)
+{
+    StoreTruth j;
+    i32 nth = store_ncpu_(), t, q, x;
+    size_t per = (size_t)nq * (size_t)k;
+    if (nth > 64) nth = 64;
+    j.s = s; j.Q = Q; j.self = self; j.nq = nq; j.k = k;
+    j.ts = (f32 *)malloc((size_t)nth * per * sizeof(f32)); j.tr = (i32 *)malloc((size_t)nth * per * sizeof(i32));
+    for (x = 0; x < (i32)((size_t)nth * per); ++x) { j.ts[x] = -1e30f; j.tr[x] = -1; }
+    tq_par_(store_truth_rows_, &j, s->built_upto, nth);
+    for (q = 0; q < nq; ++q)                                     /* fold every thread's top k into thread 0's */
+        for (t = 1; t < nth; ++t)
+            for (x = 0; x < k; ++x)
+                if (j.tr[(size_t)t * per + (size_t)q * k + x] >= 0)
+                    store_topk_put_(j.ts + (size_t)q * k, j.tr + (size_t)q * k, k, j.ts[(size_t)t * per + (size_t)q * k + x], j.tr[(size_t)t * per + (size_t)q * k + x]);
+    memcpy(truth, j.tr, per * sizeof(i32));
+    free(j.ts); free(j.tr);
+}
+
+/* recall@10 of the index at `probe` clusters against the exact truth (the batch path, re-scored exactly as a search) */
+static f32 store_recall_at_(RagStore *s, const f32 *Q, const i32 *self, i32 nq, const i32 *truth, i32 probe)
+{
+    i32 R = s->tq_rerank > 0 ? s->tq_rerank : 256, q, x, z, hits = 0;
+    i32 *rows = (i32 *)malloc((size_t)nq * (size_t)R * sizeof(i32)), *cnt = (i32 *)malloc((size_t)nq * sizeof(i32));
+    tq_search_many(s->tq, Q, nq, R, rows, cnt, s->dead, store_ncpu_(), probe);
+    for (q = 0; q < nq; ++q) {
+        i64 got[11];
+        f32 sc[11];
+        i32 have = 0, kept = 0;
+        store_rescore_(s, Q + (size_t)q * s->dim, rows + (size_t)q * R, cnt[q], 11, got, sc, &have);
+        for (x = 0; x < have && kept < 10; ++x) {
+            if (self && got[x] == self[q]) continue;             /* a row asking for itself finds itself: not a hit */
+            ++kept;
+            for (z = 0; z < 10; ++z) if (truth[(size_t)q * 10 + z] == (i32)got[x]) { ++hits; break; }
+        }
+    }
+    free(rows); free(cnt);
+    return (f32)hits / (f32)(nq * 10);
+}
+
+/* Under the store's write lock: the fewest IVF probes whose recall@10 reaches s->tune_target (plus a margin for the
+ * sample's own error), measured against exact
+ * search on the queries the store has been answering (when 64 or more were kept) or else on a spread of its own rows
+ * (their own row left out of the truth). Up to STORE_QLOG queries, fewer on huge stores (the exact search reads every
+ * row once per query: about 3e10 multiply-adds at most, ~3 s on 2 cores). Returns the recall reached; the probe count
+ * becomes the index's default (saved with it). -1: no IVF index to tune. */
+static f32 store_tune_locked_(RagStore *s)
+{
+    i32 nq, nc, q, lo, hi, p, *self = (i32 *)0, *truth, use_log;
+    f32 *Q, rec, rec_hi, goal;
+    f64 budget = 3e10 / ((f64)(s->built_upto > 0 ? s->built_upto : 1) * (f64)s->dim);
+    if (!s->tq || s->tq->nc <= 1 || s->tune_target <= 0.0f || s->built_upto < 1000) return -1.0f;
+    nc = s->tq->nc;
+    nq = budget > STORE_QLOG ? STORE_QLOG : (budget < 32.0 ? 32 : (i32)budget);
+    Q = (f32 *)malloc((size_t)nq * (size_t)s->dim * sizeof(f32));
+    pthread_mutex_lock(&s->qlog_mu);
+    use_log = s->qlog_n >= 64;
+    if (use_log) {                                               /* real traffic: the queries this store answers */
+        if (nq > s->qlog_n) nq = s->qlog_n;
+        memcpy(Q, s->qlog, (size_t)nq * (size_t)s->dim * sizeof(f32));
+    }
+    pthread_mutex_unlock(&s->qlog_mu);
+    if (!use_log) {                                              /* no traffic yet: rows of its own, spread out */
+        self = (i32 *)malloc((size_t)nq * sizeof(i32));
+        for (q = 0; q < nq; ++q) {
+            i32 r = (i32)((i64)s->built_upto * q / nq) + q % 7;
+            const f32 *v;
+            if (r >= s->built_upto) r = s->built_upto - 1;
+            while (r < s->built_upto - 1 && STORE_DEAD(s, r)) ++r;
+            v = store_row_(s, r, Q + (size_t)q * s->dim);
+            if (v != Q + (size_t)q * s->dim) memcpy(Q + (size_t)q * s->dim, v, (size_t)s->dim * sizeof(f32));
+            self[q] = r;
+        }
+    }
+    truth = (i32 *)malloc((size_t)nq * 10 * sizeof(i32));
+    store_truth_(s, Q, self, nq, 10, truth);
+    /* aim 1.5 standard errors above the target, so fresh queries meet it too, not just half of the time */
+    goal = s->tune_target + 1.5f * (f32)sqrt((f64)s->tune_target * (1.0 - (f64)s->tune_target) / (10.0 * (f64)nq));
+    if (goal > 0.999f) goal = 0.999f;
+    /* recall grows with the probes: double from the default until the target is met, then halve the gap */
+    hi = s->tq->nprobe > 0 ? s->tq->nprobe : 1;
+    rec_hi = store_recall_at_(s, Q, self, nq, truth, hi);
+    lo = 0;
+    while (rec_hi < goal && hi < nc) { lo = hi; hi = hi * 2 < nc ? hi * 2 : nc; rec_hi = store_recall_at_(s, Q, self, nq, truth, hi); }
+    if (rec_hi >= goal)
+        while (hi - lo > 1) {                                    /* the goal is met at hi and not at lo */
+            p = lo + (hi - lo) / 2;
+            rec = store_recall_at_(s, Q, self, nq, truth, p);
+            if (rec >= goal) { hi = p; rec_hi = rec; } else lo = p;
+        }
+    s->tq->nprobe = hi;                                          /* the index's default from now on (and on disk) */
+    s->tq_probe = 0;
+    s->tune_recall = rec_hi;
+    free(Q); free(self); free(truth);
+    return rec_hi;
+}
+
+void store_set_target_recall(RagStore *s, f32 target)
+{
+    pthread_rwlock_wrlock(&s->lock);
+    s->tune_target = target > 0.0f && target < 1.0f ? target : 0.0f;
+    pthread_rwlock_unlock(&s->lock);
+}
+
+/* tune now (after store_build tuned on what it had): returns the recall@10 reached, -1 without an IVF index or a
+ * target. Holds the write lock for the measurement (a few seconds on a million rows). */
+f32 store_tune(RagStore *s)
+{
+    f32 r;
+    pthread_rwlock_wrlock(&s->lock);
+    r = store_tune_locked_(s);
+    pthread_rwlock_unlock(&s->lock);
+    return r;
+}
+
+f32 store_tuned_recall(RagStore *s) { return s->tune_recall; }
+
 static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
                               i64 *out_doc_ids, f32 *out_scores,
                               i64 all_bits, i64 any_bits, int filtered)
@@ -946,6 +1134,7 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
     store_normalise_(qn, dim);
 
     pthread_rwlock_rdlock(&s->lock);
+    if (s->tune_target > 0.0f) store_qlog_(s, qn);
     mcol = store_tqcol_(&s->metac);
 
     if (s->tq) {
@@ -1073,6 +1262,7 @@ void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, 
     memcpy(qn, Q, (size_t)nq * (size_t)dim * sizeof(f32));
     for (i = 0; i < nq; ++i) store_normalise_(qn + (size_t)i * dim, dim);
     pthread_rwlock_rdlock(&s->lock);
+    if (s->tune_target > 0.0f) for (i = 0; i < nq; i += 1 + nq / STORE_QLOG) store_qlog_(s, qn + (size_t)i * dim);
     R = s->tq_rerank > 0 ? s->tq_rerank : (k * 20 > 256 ? k * 20 : 256);
     for (off = 0; off < nq; off += 1024) {                       /* batches of 1024 bound the per-query candidates */
         i32 m = nq - off < 1024 ? nq - off : 1024;
@@ -1852,6 +2042,44 @@ int main(void)
         print_cstr(", batch == one at a time "); print_i64(same); print_cstr("/32\n");
         if (ivf->nc <= TQ_FLAT_MAX || 1000L * inbest / n2 < 900 || !all_ok || same != 32) ok = 0;
         tq_free(flat); tq_free(ivf); free(x2); free(sc2); free(mr);
+    }
+
+    {   /* self-tuning: ask for a recall, check it on queries the tuning never saw */
+        i32 n3 = 30000, d3 = 32, j, q, nq3 = 200, hits = 0, p95, p80, *tr3;
+        f32 *x3 = (f32 *)malloc((size_t)n3 * d3 * sizeof(f32)), *q3 = (f32 *)malloc((size_t)nq3 * d3 * sizeof(f32)), r95, r80;
+        u32 s3 = 991u;
+        RagStore *t3 = store_new(a, d3);
+        for (i = 0; i < n3; ++i) {                              /* 300 topics, rows scattered around them */
+            u32 tp = sd_rng_(&s3) % 300u, s4 = 5000u + tp;
+            for (j = 0; j < d3; ++j) x3[(size_t)i * d3 + j] = sd_f_(&s4) * 1.0f + sd_f_(&s3) * 1.5f;
+            store_add(t3, x3 + (size_t)i * d3, 70000 + i);
+        }
+        for (q = 0; q < nq3; ++q) {                             /* held-out queries: near a topic, not a row */
+            u32 tp = sd_rng_(&s3) % 300u, s4 = 5000u + tp;
+            for (j = 0; j < d3; ++j) q3[(size_t)q * d3 + j] = sd_f_(&s4) * 1.0f + sd_f_(&s3) * 1.5f;
+        }
+        store_ivf_min_ = 2000;
+        store_set_target_recall(t3, 0.95f);
+        store_build(t3);
+        p95 = t3->tq ? t3->tq->nprobe : -1; r95 = store_tuned_recall(t3);
+        tr3 = (i32 *)malloc((size_t)nq3 * 10 * sizeof(i32));
+        for (q = 0; q < nq3; ++q) store_normalise_(q3 + (size_t)q * d3, d3);
+        store_truth_(t3, q3, (const i32 *)0, nq3, 10, tr3);
+        for (q = 0; q < nq3; ++q) {
+            i64 r10[10]; f32 c10[10];
+            i32 got = store_search(t3, q3 + (size_t)q * d3, 10, r10, c10), x, z;
+            for (x = 0; x < got; ++x) for (z = 0; z < 10; ++z) if (tr3[(size_t)q * 10 + z] + 70000 == r10[x]) { ++hits; break; }
+        }
+        store_set_target_recall(t3, 0.80f);
+        r80 = store_tune(t3);                                   /* now on the 200 queries it has just answered */
+        p80 = t3->tq ? t3->tq->nprobe : -1;
+        print_cstr("  self-tuning ("); print_i64(t3->tq ? t3->tq->nc : 0); print_cstr(" clusters): target 0.95 -> ");
+        print_i64(p95); print_cstr(" probes (measured "); print_i64((i64)(1000.0f * r95)); print_cstr("/1000), held-out recall@10 ");
+        print_i64((i64)(1000L * hits / (nq3 * 10))); print_cstr("/1000; target 0.80 on its own traffic -> "); print_i64(p80);
+        print_cstr(" probes ("); print_i64((i64)(1000.0f * r80)); print_cstr("/1000)\n");
+        if (!t3->tq || t3->tq->nc <= 1 || r95 < 0.95f || 1000L * hits / (nq3 * 10) < 920 || p80 > p95 || r80 < 0.80f || p95 >= t3->tq->nc) ok = 0;
+        store_ivf_min_ = STORE_IVF_MIN;
+        store_destroy(t3); free(x3); free(q3); free(tr3);
     }
 
     /* batch search: the same answers as one query at a time (flat scan here; IVF + batch in the 2-bit test above) */
