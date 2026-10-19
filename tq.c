@@ -109,6 +109,9 @@ typedef struct {
     i32   nadd;             /* rows added since */
     f32   fit0;             /* mean squared distance of a built row to its centroid (on a sample) */
     f64   fit_add;          /* the squared distances of the added rows to theirs, summed */
+    i32  *csize;            /* [nc] rows in each cluster, added ones too (NULL: not counted yet - a loaded index) */
+    f64   csum, csq;        /* the sum of csize and of its squares */
+    f64   skew0;            /* tq_skew when the clusters were made (or first counted) */
 } Tq;
 
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512F__)
@@ -821,6 +824,34 @@ static i32 tq_default_probe_(i32 nc)
     return np;
 }
 
+/* How unevenly the rows sit in the clusters: the rows a probe scans when queries land where rows do (sum s^2 / sum s),
+ * over the plain mean cluster size - 1 when every cluster is the same size. Added rows that pile into a few clusters
+ * raise it, and every query near them pays for those big clusters. */
+f64 tq_skew(const Tq *t)
+{
+    if (t->nc <= 1 || !t->csize || t->csum <= 0.0) return 1.0;
+    return (t->csq / t->csum) / (t->csum / (f64)t->nc);
+}
+
+static i32 tq_cblocks_(const Tq *t, i32 c, i32 *out);
+static i32 tq_srow_(const Tq *t, i32 b, i32 k);
+
+/* csize, csum, csq counted from the slots (an index from a file, or after tq_remap) */
+static void tq_count_(Tq *t)
+{
+    i32 c, b, k, *bl;
+    if (t->nc <= 1) return;
+    if (!t->csize) t->csize = (i32 *)malloc((size_t)t->nc * sizeof(i32));
+    bl = (i32 *)malloc((size_t)(t->nblk + t->xn > 0 ? t->nblk + t->xn : 1) * sizeof(i32));
+    t->csum = t->csq = 0.0;
+    for (c = 0; c < t->nc; ++c) {
+        i32 nb = tq_cblocks_(t, c, bl), z = 0;
+        for (b = 0; b < nb; ++b) for (k = 0; k < 32; ++k) { i32 r = tq_srow_(t, bl[b], k); z += r >= 0 && r < t->n; }
+        t->csize[c] = z; t->csum += z; t->csq += (f64)z * z;
+    }
+    free(bl);
+}
+
 /* nc <= 1: flat scan of every row. nc > 1: IVF with about nc clusters (nprobe defaults to min(16%, 4 sqrt nc)).
  * skip (a bitset, IVF only, may be NULL): rows that get no slot - the store's tombstones, left out of a rebuild. */
 static void tq_c8_(Tq *t);
@@ -859,6 +890,8 @@ Tq *tq_build_skip(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, 
         tq_clus_free_(&cl);
         for (tt = 1; tt < nth; ++tt) for (c = 0; c < nc; ++c) aj.cnt[c] += aj.cnt[(size_t)tt * nc + c];
         if (skip) for (i = 0; i < n; ++i) if (TQ_SKIP(skip, i)) { --aj.cnt[slot[i]]; slot[i] = -1; --t->nbuilt; }
+        t->csize = (i32 *)malloc((size_t)nc * sizeof(i32));
+        for (c = 0; c < nc; ++c) { t->csize[c] = aj.cnt[c]; t->csum += aj.cnt[c]; t->csq += (f64)aj.cnt[c] * aj.cnt[c]; }
         {   /* how far a row sits from its centroid, on up to 4096 rows: what added rows are held against (tq_add_put) */
             f64 sum = 0.0;
             i32 got = 0, step = n > 4096 ? n / 4096 : 1;
@@ -882,6 +915,7 @@ Tq *tq_build_skip(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, 
         for (i = 0; i < n; ++i) { i32 s; if (slot[i] < 0) continue; s = pos[slot[i]]++; t->slot_row[s] = i; slot[i] = s; }
         free(aj.cnt);
         t->nprobe = tq_default_probe_(nc);
+        t->skew0 = tq_skew(t);
         t->ct = tq_transpose_(t->cent, nc, dim);
         tq_c8_(t);
     } else {
@@ -942,7 +976,7 @@ void tq_free(Tq *t)
     if (!t->mapped) { free(t->s1); free(t->s2); free(t->perm); free(t->codes); free(t->cent); free(t->cstart); free(t->slot_row); }
     else if (t->slot_own) free(t->slot_row);
     free(t->ct); free(t->c8); free(t->c8b); free(t->c8s);
-    free(t->xcodes); free(t->xslot); free(t->xnext); free(t->xhead); free(t->xtail);
+    free(t->xcodes); free(t->xslot); free(t->xnext); free(t->xhead); free(t->xtail); free(t->csize);
     free(t);
 }
 
@@ -1765,12 +1799,13 @@ i32 tq_add_put(Tq *t, const TqAdd *a, i64 r0)
         t->n = row + 1;
         t->fit_add += (f64)a->d2[i];
         ++t->nadd;
+        if (t->csize && t->nc > 1) { t->csq += 2.0 * t->csize[c] + 1.0; ++t->csize[c]; t->csum += 1.0; }
     }
     return 0;
 }
 
-/* fit0 for an index that came from a file (it is not saved): the mean squared distance of up to 4096 of its rows to
- * their centroids, read through rows */
+/* what an index that came from a file lacks (neither is saved): fit0 - the mean squared distance of up to 4096 of its
+ * rows to their centroids, read through rows - and the cluster sizes, with skew0 taken from them */
 void tq_fit0(Tq *t, const TqCol *rows)
 {
     i64 ns = (i64)t->nblk * 32, sl, step = ns > 4096 ? ns / 4096 : 1;
@@ -1788,6 +1823,7 @@ void tq_fit0(Tq *t, const TqCol *rows)
     }
     t->fit0 = got ? (f32)(sum / got) : 0.0f;
     free(rb);
+    if (!t->csize) { tq_count_(t); t->skew0 = tq_skew(t); }
 }
 
 static i32 tq_pop64_(u64 x)
@@ -1818,6 +1854,7 @@ void tq_remap(Tq *t, const u64 *dead, const i32 *pre, i32 nlive)
         *p = r - pre[r >> 6] - tq_pop64_(dead[r >> 6] & (((u64)1 << (r & 63)) - 1u));
     }
     t->n = nlive;
+    if (t->csize) tq_count_(t);                                  /* the dead rows left their clusters */
 }
 
 #endif /* TQ_C */

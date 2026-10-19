@@ -103,6 +103,15 @@ else
     echo "  (thread sanitizer unavailable - skipped)"
 fi
 
+# ---- the store's live mode (its own indexing / rebuild thread beside adders and searchers), under the thread sanitizer ----
+echo "store threads (live mode)"
+if "$CC" -std=gnu99 -g -O1 -fsanitize=thread -march=native -I. store.c -DSTORE_DEMO -lm -lpthread -o "$OUT/store_tsan" 2>/dev/null; then
+    if TSAN_OPTIONS="halt_on_error=1" "./$OUT/store_tsan" > /dev/null; then echo "  ok   no data race reported"
+    else echo "  ^ store thread test FAILED"; fail=1; fi
+else
+    echo "  (thread sanitizer unavailable - skipped)"
+fi
+
 # ---- crash safety: kill -9 a writer at random moments, the database must reload with everything it synced ----
 echo "vecdb crash test"
 "$CC" -std=gnu99 -O2 -march=native -I. vcrash.c -lm -lpthread -o "$OUT/vcrash" && "./$OUT/vcrash" 25 || { echo "  ^ crash test FAILED"; fail=1; }

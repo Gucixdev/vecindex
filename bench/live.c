@@ -10,8 +10,10 @@
  *   stream [RATE]  a build over 60%; the other 40% streamed in by a thread (RATE rows/s, default flat out) while this
  *           one searches one query at a time, live mode on with rebuilds at 50% growth: query latency before, while
  *           rows stream in, during the rebuild that growth triggers, after; then the sweep
- *   drift   a build over the 60% of rows least aligned with a direction in the data, the 40% most aligned streamed in
- *           (rows the clusters never saw): the sweep with them appended, then after the rebuild live mode decides on
+ *   shift   a build over the 60% of rows least aligned with a direction in the data, the 40% most aligned streamed in:
+ *           the sweep with them appended, then (if live mode finds the data moved) after the rebuild it decides on
+ *   drift   the same, the streamed rows being whole regions the build never saw: every row of 8 of the Voronoi cells
+ *           of 40 random rows (about a fifth of the data)
  * DATA_DIR comes from prepare_glove.py. Doc ids are the row numbers of train.f32, so answers check against gt.i32. */
 #include "store.c"
 
@@ -35,7 +37,7 @@ static double recall_(const i64 *ids, i32 from, i32 cnt)
 /* recall@10 and QPS (one batch of 10k queries on 2 threads) at each probe count */
 static void sweep_(RagStore *s, const char *name)
 {
-    static const i32 P[] = { 32, 48, 64, 96, 128, 192, 256, 384, 512 };
+    static const i32 P[] = { 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512 };
     i32 i;
     for (i = 0; i < (i32)(sizeof(P) / sizeof(P[0])); ++i) {
         double t0;
@@ -48,9 +50,26 @@ static void sweep_(RagStore *s, const char *name)
     store_set_probe(s, 0);
 }
 
+/* skew of the cluster sizes: rows a probe scans on average when queries land like rows (sum s^2 / sum s), over the
+ * plain mean size (sum s / clusters); 1 = all clusters the same size */
+static double skew_(const Tq *t)
+{
+    double s1 = 0, s2 = 0;
+    i32 c, b, k;
+    if (!t || t->nc <= 1) return 1.0;
+    for (c = 0; c < t->nc; ++c) {
+        double z = 0;
+        for (b = t->cstart[c]; b < t->cstart[c + 1]; ++b) for (k = 0; k < 32; ++k) z += t->slot_row[(size_t)b * 32 + k] >= 0;
+        for (b = t->xhead ? t->xhead[c] : -1; b >= 0; b = t->xnext[b]) for (k = 0; k < 32; ++k) z += t->xslot[(size_t)b * 32 + k] >= 0;
+        s1 += z; s2 += z * z;
+    }
+    return (s2 / s1) / (s1 / t->nc);
+}
+
 static void info_(RagStore *s, const char *what)
 {
     i64 ix, rb; f64 rs;
+    printf("%s: cluster size skew %.3f\n", what, skew_(s->tq));
     store_live_stats(s, &ix, &rb, &rs);
     printf("%s: %d rows, %d clusters, %d built + %d added (%d extra blocks), pending %d; indexed live %lld, rebuilds %lld (last %.1fs)\n",
            what, s->count, s->tq ? s->tq->nc : 0, s->tq ? s->tq->nbuilt : 0, s->tq ? s->tq->nadd : 0, s->tq ? s->tq->xn : 0,
@@ -71,6 +90,7 @@ static RagStore *built_(i32 n0, double *bt)
     store_set_spill(s, (const char *)0, 0);
     for (i = 0; i < n0; ++i) store_add(s, X + (size_t)ORD[i] * dim, ORD[i]);
     t0 = now_(); store_build(s); *bt = now_() - t0;
+    printf("built: cluster size skew %.3f\n", skew_(s->tq));
     return s;
 }
 
@@ -109,7 +129,7 @@ int main(int argc, char **argv)
     const char *mode = argc > 2 ? argv[2] : "full";
     RagStore *s;
     double bt, t0;
-    if (argc < 3) { fprintf(stderr, "usage: live DATA_DIR full|tail|stream|drift\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: live DATA_DIR full|tail|stream [RATE]|shift|drift\n"); return 2; }
     X = malloc((size_t)n * dim * 4); Q = malloc((size_t)nq * dim * 4); GT = malloc((size_t)nq * 100 * 4);
     IDS = malloc((size_t)nq * 10 * 8); SC = malloc((size_t)nq * 10 * 4); ORD = malloc((size_t)n * 4);
     sprintf(p, "%s/train.f32", argv[1]); f = fopen(p, "rb"); if (!f || fread(X, 4, (size_t)n * dim, f) != (size_t)n * dim) return 1; fclose(f);
@@ -165,8 +185,8 @@ int main(int argc, char **argv)
         store_set_live(s, 0, 0.5f);
         for (i = 0; i < 20 && store_maintain(s); ++i) {}
         info_(s, "stream"); sweep_(s, "stream");
-    } else if (!strcmp(mode, "drift")) {
-        /* the direction: the mean of 1000 rows around one row (a region of the data); rows sorted by how much they lean
+    } else if (!strcmp(mode, "shift") || !strcmp(mode, "drift")) {
+        /* shift - the direction: the mean of 1000 rows around one row (a region of the data); rows sorted by how much they lean
          * that way - the build gets the 60% that lean least, the stream the rest (in random order) */
         f32 *u = calloc((size_t)dim, 4), *key = malloc((size_t)n * 4);
         i32 j;
@@ -180,29 +200,44 @@ int main(int argc, char **argv)
             free(bs); free(br);
         }
         for (i = 0; i < n; ++i) { key[i] = vs_dot(u, X + (size_t)i * dim, dim); ORD[i] = i; }
+        if (!strcmp(mode, "drift")) {                           /* drift: whole regions the build never sees - the rows
+                                                                 * of 8 of the Voronoi cells of 40 random rows (~20%) */
+            i32 seeds[40], c, best;
+            f32 bs;
+            for (c = 0; c < 40; ++c) seeds[c] = (i32)(tq_rng_(&r) % (u32)n);
+            for (i = 0; i < n; ++i) {
+                for (best = 0, bs = -2.0f, c = 0; c < 40; ++c) {
+                    f32 d = vs_dot(X + (size_t)seeds[c] * dim, X + (size_t)i * dim, dim);
+                    if (d > bs) { bs = d; best = c; }
+                }
+                key[i] = (f32)(best < 8) + 1e-3f * (f32)(tq_rng_(&r) & 1023u);   /* held out last, random within */
+            }
+        }
         KEY = key; qsort(ORD, (size_t)n, 4, cmpk_);           /* ascending */
+        if (!strcmp(mode, "drift")) for (n0 = 0; n0 < n && key[ORD[n0]] < 1.0f; ++n0) {}   /* build = the other cells */
         for (i = n - 1; i > n0; --i) { i32 k = n0 + (i32)(tq_rng_(&r) % (u32)(i - n0 + 1)), w = ORD[i]; ORD[i] = ORD[k]; ORD[k] = w; }
         {   /* how many of the queries' true neighbours are in the streamed part */
             i32 *in = calloc((size_t)n, 4), h = 0;
             for (i = n0; i < n; ++i) in[ORD[i]] = 1;
             for (i = 0; i < nq * 10; ++i) h += in[GT[(size_t)(i / 10) * 100 + i % 10]];
-            printf("drift: %.1f%% of the queries' true top-10 rows are in the streamed 40%%\n", 100.0 * h / (nq * 10.0));
+            printf("%s: %d rows streamed (%.1f%%); %.1f%% of the queries' true top-10 rows are among them\n", mode, n - n0, 100.0 * (n - n0) / n, 100.0 * h / (nq * 10.0));
             free(in);
         }
         s = built_(n0, &bt);
-        printf("drift: build over the %d least-aligned rows %.2fs\n", n0, bt);
+        printf("%s: build over the other %d rows %.2fs\n", mode, n0, bt);
         store_set_live(s, 1, 0.0f);                              /* index the stream, no rebuild yet */
         t0 = now_();
         for (i = n0; i < n; ++i) store_add(s, X + (size_t)ORD[i] * dim, ORD[i]);
         wait_indexed_(s);
         store_set_live(s, 0, 0.0f);
-        printf("drift: %d rows added and indexed in %.2fs; far windows seen: %d (fit0 %.4f, added rows %.4f)\n", n - n0, now_() - t0,
+        printf("%s: %d rows added and indexed in %.2fs; far windows seen: %d (fit0 %.4f, added rows %.4f)\n", mode, n - n0, now_() - t0,
                s->drifted, s->tq->fit0, s->tq->fit_add / (s->tq->nadd ? s->tq->nadd : 1));
         info_(s, "appended"); sweep_(s, "appended");
         store_set_live(s, 0, 1.0f);                              /* rebuilds allowed: live mode's own decision */
+        printf("%s: skew %.3f (at the build %.3f); rebuild reason %d (0 none, 3 growth, 4 far rows, 6 skew)\n", mode, tq_skew(s->tq), s->tq->skew0, store_due_(s));
         t0 = now_(); i = store_maintain(s);
-        printf("drift: maintenance step %.2fs, did %s%s%s\n", now_() - t0, i & 1 ? "index " : "", i & 2 ? "rebuild " : "", i & 4 ? "tune" : "");
-        info_(s, "rebuilt"); sweep_(s, "rebuilt");
+        printf("%s: maintenance step %.2fs, did: %s%s%s\n", mode, now_() - t0, i & 1 ? "index " : "", i & 2 ? "rebuild " : "", i ? "" : "nothing (no rebuild due)");
+        if (i & 2) { info_(s, "rebuilt"); sweep_(s, "rebuilt"); }
         free(u); free(key);
     } else { fprintf(stderr, "unknown mode %s\n", mode); return 2; }
     store_destroy(s);
