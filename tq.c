@@ -18,9 +18,15 @@
  * quarter of the bytes) and exact scores for the few near the cut; the scan keeps its candidates in a reservoir
  * (append, cut to the best R with a quickselect now and then) and prefetches two blocks ahead.
  *
+ * Rows added after the build go straight into the index: each into its closest cluster, first into the free slots of
+ * the cluster's last block, then into extra blocks (arrays of their own, chained cluster by cluster), so the built
+ * arrays - possibly a mapped file - never move. The rotation and the codebook need no training, so an added row is
+ * coded exactly like a built one; only the clusters age, and tq_add_put keeps the numbers that say when to rebuild.
+ *
  *   Tq *tq_build(rows, n, dim, seed, nc, nthreads)   rows: n x dim f32 (unit length), possibly in chunks
  *   tq_search(tq, q, R, rows, filter..., nthreads)    the R best rows by approximate inner product
  *   tq_search_many(tq, Q, nq, R, ...)                 the same for a batch, cluster by cluster
+ *   tq_add_prep / tq_add_put                          rows n, n+1, ... into the index (prep reads only: no lock)
  *   tq_free
  * C89, AVX2 / AVX-512 (VNNI) kernels when compiled with -march=native, scalar otherwise; threads via pthreads. */
 #ifndef TQ_C
@@ -92,6 +98,17 @@ typedef struct {
     i32  *c8b;
     f32  *c8s;
     i32   c8d4;             /* dims / 4, rounded up */
+    /* rows added after the build (tq_add_put): extra blocks are numbered from nblk on and live in arrays of their own */
+    i32   xn, xcap;         /* extra blocks in use / allocated */
+    u8   *xcodes;           /* [xcap x vd x 16] */
+    i32  *xslot;            /* [xcap x 32] the row in each slot, -1 = free */
+    i32  *xnext;            /* [xcap] the cluster's next extra block, -1 = none */
+    i32  *xhead, *xtail;    /* [max(nc, 1)] a cluster's first and last extra block, -1 = none */
+    i32   slot_own;         /* slot_row was malloc'd for a mapped index (tq_remap): tq_free frees it */
+    i32   nbuilt;           /* rows the build placed */
+    i32   nadd;             /* rows added since */
+    f32   fit0;             /* mean squared distance of a built row to its centroid (on a sample) */
+    f64   fit_add;          /* the squared distances of the added rows to theirs, summed */
 } Tq;
 
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512F__)
@@ -804,10 +821,12 @@ static i32 tq_default_probe_(i32 nc)
     return np;
 }
 
-/* nc <= 1: flat scan of every row. nc > 1: IVF with about nc clusters (nprobe defaults to min(16%, 4 sqrt nc)). */
+/* nc <= 1: flat scan of every row. nc > 1: IVF with about nc clusters (nprobe defaults to min(16%, 4 sqrt nc)).
+ * skip (a bitset, IVF only, may be NULL): rows that get no slot - the store's tombstones, left out of a rebuild. */
 static void tq_c8_(Tq *t);
+#define TQ_SKIP(s, i) ((s) && (((s)[(size_t)(i) >> 6] >> ((u32)(i) & 63u)) & 1u))
 
-Tq *tq_build(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, i32 bits)
+Tq *tq_build_skip(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, i32 bits, const u64 *skip)
 {
     Tq *t = (Tq *)calloc(1, sizeof(Tq));
     f64 t0 = tq_now_();
@@ -816,7 +835,7 @@ Tq *tq_build(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, i32 b
     u32 r = seed ? seed : 0x7154u;
     TqEncJob ej;
     if (nth < 1) nth = 1;
-    t->dim = dim; t->dpad = dim + (dim & 1); t->n = n;
+    t->dim = dim; t->dpad = dim + (dim & 1); t->n = n; t->nbuilt = n;
     t->bits = bits == 2 ? 2 : 4; t->vd = tq_vd_(t->dpad, t->bits);
     t->s1 = (f32 *)malloc((size_t)t->dpad * sizeof(f32)); t->s2 = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
     t->perm = (i32 *)malloc((size_t)t->dpad * sizeof(i32));
@@ -839,6 +858,19 @@ Tq *tq_build(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, i32 b
         if (verbose) fprintf(stderr, "tq_build: assign %d rows %.2fs\n", n, tq_now_() - t0);
         tq_clus_free_(&cl);
         for (tt = 1; tt < nth; ++tt) for (c = 0; c < nc; ++c) aj.cnt[c] += aj.cnt[(size_t)tt * nc + c];
+        if (skip) for (i = 0; i < n; ++i) if (TQ_SKIP(skip, i)) { --aj.cnt[slot[i]]; slot[i] = -1; --t->nbuilt; }
+        {   /* how far a row sits from its centroid, on up to 4096 rows: what added rows are held against (tq_add_put) */
+            f64 sum = 0.0;
+            i32 got = 0, step = n > 4096 ? n / 4096 : 1;
+            f32 *rb = (f32 *)malloc((size_t)dim * sizeof(f32));
+            for (i = 0; i < n; i += step) {
+                if (slot[i] < 0) continue;
+                sum += 2.0 - 2.0 * (f64)vs_dot(tq_row_(rows, i, rb), t->cent + (size_t)slot[i] * dim, dim);
+                ++got;
+            }
+            t->fit0 = got ? (f32)(sum / got) : 0.0f;
+            free(rb);
+        }
         t->cstart = (i32 *)malloc((size_t)(nc + 1) * sizeof(i32));
         for (c = 0; c < nc; ++c) { t->cstart[c] = blk; blk += (aj.cnt[c] + 31) / 32; }
         t->cstart[nc] = blk;
@@ -847,7 +879,7 @@ Tq *tq_build(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, i32 b
         for (i = 0; i < nslots; ++i) t->slot_row[i] = -1;
         pos = aj.cnt;                                            /* reuse: next free slot of each cluster */
         for (c = 0; c < nc; ++c) pos[c] = t->cstart[c] * 32;
-        for (i = 0; i < n; ++i) { i32 s = pos[slot[i]]++; t->slot_row[s] = i; slot[i] = s; }
+        for (i = 0; i < n; ++i) { i32 s; if (slot[i] < 0) continue; s = pos[slot[i]]++; t->slot_row[s] = i; slot[i] = s; }
         free(aj.cnt);
         t->nprobe = tq_default_probe_(nc);
         t->ct = tq_transpose_(t->cent, nc, dim);
@@ -864,6 +896,9 @@ Tq *tq_build(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, i32 b
     if (verbose) fprintf(stderr, "tq_build: encode done %.2fs\n", tq_now_() - t0);
     return t;
 }
+
+Tq *tq_build(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, i32 bits)
+{ return tq_build_skip(rows, n, dim, seed, nc, nth, bits, (const u64 *)0); }
 
 /* the int8 copy of the centroids that picks the probes (VNNI builds): each dimension scaled by its largest |value|
  * over all centroids, so every dimension uses the full 8 bits */
@@ -905,7 +940,9 @@ void tq_free(Tq *t)
 {
     if (!t) return;
     if (!t->mapped) { free(t->s1); free(t->s2); free(t->perm); free(t->codes); free(t->cent); free(t->cstart); free(t->slot_row); }
+    else if (t->slot_own) free(t->slot_row);
     free(t->ct); free(t->c8); free(t->c8b); free(t->c8s);
+    free(t->xcodes); free(t->xslot); free(t->xnext); free(t->xhead); free(t->xtail);
     free(t);
 }
 
@@ -920,8 +957,32 @@ static i64 tq_ram_(const Tq *t)
         b += (i64)t->nblk * t->vd * 16 + (i64)t->dpad * 12;
         if (t->slot_row) b += (i64)t->nblk * 32 * 4;
         if (t->nc > 1) b += (i64)t->nc * t->dim * 4 + (i64)(t->nc + 1) * 4;
-    }
+    } else if (t->slot_own) b += (i64)t->nblk * 32 * 4;
+    if (t->xcap) b += (i64)t->xcap * ((i64)t->vd * 16 + 32 * 4 + 4) + (i64)(t->nc > 1 ? t->nc : 1) * 8;
     return b;
+}
+
+/* block b of the scan: built (b < nblk) or added later (an extra block) */
+static const u8 *tq_bptr_(const Tq *t, i32 b)
+{
+    size_t bb = (size_t)t->vd * 16;
+    return b < t->nblk ? t->codes + (size_t)b * bb : t->xcodes + (size_t)(b - t->nblk) * bb;
+}
+
+/* the row in slot k of block b; -1 or >= t->n: none */
+static i32 tq_srow_(const Tq *t, i32 b, i32 k)
+{
+    if (b >= t->nblk) return t->xslot[(size_t)(b - t->nblk) * 32 + (size_t)k];
+    return t->slot_row ? t->slot_row[(size_t)b * 32 + (size_t)k] : b * 32 + k;
+}
+
+/* blocks of cluster c (flat: c = 0) - its built range, then its extra blocks - into out (NULL: just count them) */
+static i32 tq_cblocks_(const Tq *t, i32 c, i32 *out)
+{
+    i32 b, nb = 0, b0 = t->nc > 1 ? t->cstart[c] : 0, b1 = t->nc > 1 ? t->cstart[c + 1] : t->nblk;
+    for (b = b0; b < b1; ++b) { if (out) out[nb] = b; ++nb; }
+    for (b = t->xhead ? t->xhead[c] : -1; b >= 0; b = t->xnext[b]) { if (out) out[nb] = t->nblk + b; ++nb; }
+    return nb;
 }
 
 /* ---- scanning ---- */
@@ -1140,17 +1201,17 @@ static void *tq_job_(void *arg)
     i32 b, k, bb = t->vd * 16;
     u16 sc[32];
     for (b = j->b0; b < j->b1; ++b) {
-        i32 blk = j->blks ? j->blks[b] : b, base = blk * 32;
+        i32 blk = j->blks ? j->blks[b] : b;
         u32 m;
         if (b + 2 < j->b1)                                       /* two blocks ahead: the hardware prefetcher stops at every
                                                                   * 4 KB page and every jump to another cluster */
-            tq_prefetch_blk_(t->codes + (size_t)(j->blks ? j->blks[b + 2] : b + 2) * (size_t)bb, bb);
-        m = tq_block_(t->codes + (size_t)blk * (size_t)bb, j->lut, t->vd, tq_res_kthr_(&j->res), sc);
+            tq_prefetch_blk_(tq_bptr_(t, j->blks ? j->blks[b + 2] : b + 2), bb);
+        m = tq_block_(tq_bptr_(t, blk), j->lut, t->vd, tq_res_kthr_(&j->res), sc);
         if (tq_res_all_(&j->res)) m = 0xffffffffu;               /* no threshold yet: every row counts */
         while (m) {
             i32 row;
             k = tq_ctz_(m); m &= m - 1u;
-            row = t->slot_row ? t->slot_row[base + k] : base + k;
+            row = tq_srow_(t, blk, k);
             if (row < 0 || row >= t->n) continue;                /* padding */
             if (j->dead && ((j->dead[(u32)row >> 6] >> (row & 63)) & 1u)) continue;
             if (j->filtered) {
@@ -1393,12 +1454,12 @@ i32 tq_search(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, cons
         if (np > t->nc) np = t->nc;
         pc = (i32 *)malloc((size_t)np * sizeof(i32));
         tq_probe_(t, q, np, scr, pc);
-        for (i = 0; i < np; ++i) nb += t->cstart[pc[i] + 1] - t->cstart[pc[i]];
+        for (i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], (i32 *)0);
         blks = (i32 *)malloc((size_t)(nb ? nb : 1) * sizeof(i32));
-        for (nb = 0, i = 0; i < np; ++i) { i32 b; for (b = t->cstart[pc[i]]; b < t->cstart[pc[i] + 1]; ++b) blks[nb++] = b; }
+        for (nb = 0, i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], blks + nb);
         nblk_scan = nb;
         free(scr); free(pc);
-    } else nblk_scan = t->nblk;
+    } else nblk_scan = t->nblk + t->xn;                          /* flat: added blocks hold rows in order too */
     if (nthreads < 1) nthreads = 1;
     if (nthreads > 16) nthreads = 16;
     if (nblk_scan < 64) nthreads = 1;
@@ -1447,13 +1508,13 @@ static void tq_many_push_(const TqMany *m, TqRes *rs, const u8 *blk, i32 blkno, 
 {
     const Tq *t = m->t;
     u16 sc[32];
-    i32 k, base = blkno * 32;
+    i32 k;
     u32 msk = tq_block_(blk, lut, t->vd, tq_res_kthr_(rs), sc);
     if (tq_res_all_(rs)) msk = 0xffffffffu;
     while (msk) {
         i32 row;
         k = tq_ctz_(msk); msk &= msk - 1u;
-        row = t->slot_row ? t->slot_row[base + k] : base + k;
+        row = tq_srow_(t, blkno, k);
         if (row < 0 || row >= t->n) continue;
         if (m->dead && ((m->dead[(u32)row >> 6] >> (row & 63)) & 1u)) continue;
         tq_res_push_(rs, ((u64)sc[k] << 32) | (u64)(u32)row);
@@ -1505,6 +1566,8 @@ static void tq_many_one_(const Tq *t, const f32 *Q, i32 nq, i32 R, i32 np, i32 *
         i32 b2;
         c = m.probes[(size_t)q * np];
         for (b2 = t->cstart[c]; b2 < t->cstart[c + 1]; ++b2) tq_many_push_(&m, &m.res[q], t->codes + (size_t)b2 * bb, b2, m.luts + (size_t)q * m.lutb);
+        for (b2 = t->xhead ? t->xhead[c] : -1; b2 >= 0; b2 = t->xnext[b2])
+            tq_many_push_(&m, &m.res[q], t->xcodes + (size_t)b2 * bb, t->nblk + b2, m.luts + (size_t)q * m.lutb);
         tq_res_cut_(&m.res[q]);
     }
     if (np) {                                                    /* cluster -> the queries that still have to scan it */
@@ -1525,14 +1588,19 @@ static void tq_many_one_(const Tq *t, const f32 *Q, i32 nq, i32 R, i32 np, i32 *
                 else if (nx < t->nc && t->cstart[nx] + pf < t->cstart[nx + 1]) tq_prefetch_blk_(t->codes + (size_t)(t->cstart[nx] + pf) * bb, (i32)bb);
                 for (x = m.cq0[c]; x < m.cq0[c + 1]; ++x) { q = m.cq[x]; tq_many_push_(&m, &m.res[q], blk, b2, m.luts + (size_t)q * m.lutb); }
             }
+            for (b2 = t->xhead ? t->xhead[c] : -1; b2 >= 0; b2 = t->xnext[b2]) {   /* rows added since the build */
+                const u8 *blk = t->xcodes + (size_t)b2 * bb;
+                if (t->xnext[b2] >= 0) tq_prefetch_blk_(t->xcodes + (size_t)t->xnext[b2] * bb, (i32)bb);
+                for (x = m.cq0[c]; x < m.cq0[c + 1]; ++x) { q = m.cq[x]; tq_many_push_(&m, &m.res[q], blk, t->nblk + b2, m.luts + (size_t)q * m.lutb); }
+            }
         }
     } else {                                                     /* flat: tiles of blocks x groups of queries */
-        i32 b0, q0, b2;
-        for (b0 = 0; b0 < t->nblk; b0 += TQ_MANY_BG)
+        i32 b0, q0, b2, nbt = t->nblk + t->xn;
+        for (b0 = 0; b0 < nbt; b0 += TQ_MANY_BG)
             for (q0 = 0; q0 < nq; q0 += TQ_MANY_QG)
-                for (b2 = b0; b2 < t->nblk && b2 < b0 + TQ_MANY_BG; ++b2)
+                for (b2 = b0; b2 < nbt && b2 < b0 + TQ_MANY_BG; ++b2)
                     for (q = q0; q < nq && q < q0 + TQ_MANY_QG; ++q)
-                        tq_many_push_(&m, &m.res[q], t->codes + (size_t)b2 * bb, b2, m.luts + (size_t)q * m.lutb);
+                        tq_many_push_(&m, &m.res[q], tq_bptr_(t, b2), b2, m.luts + (size_t)q * m.lutb);
     }
     for (q = 0; q < nq; ++q) cnt[q] = tq_res_rows_(&m.res[q], rows + (size_t)q * R, mt);   /* best first */
     free(m.res); free(m.luts); free(m.probes); free(m.cq0); free(m.cq);
@@ -1563,6 +1631,193 @@ void tq_search_many(const Tq *t, const f32 *Q, i32 nq, i32 R, i32 *rows, i32 *cn
     j.np = t->nc > 1 ? (probe > 0 ? probe : t->nprobe) : 0;
     if (j.np > t->nc) j.np = t->nc;
     tq_par2_(tq_many_range_, &j, nq, nthreads);
+}
+
+/* ---- rows added after the build ---- */
+
+/* rows prepared for tq_add_put: the closest cluster of each (0 when flat), its squared distance to that centroid, and
+ * its code bytes (vd a row) */
+typedef struct { i32 m; i32 *cl; f32 *d2; u8 *cd; } TqAdd;
+
+typedef struct { const Tq *t; const TqCol *rows; i64 r0; TqAdd *a; } TqPrepJob;
+
+static void tq_prep_rows_(void *p, i64 a, i64 b, i32 tid)
+{
+    TqPrepJob *j = (TqPrepJob *)p;
+    const Tq *t = j->t;
+    i32 dim = t->dim, r, *cl = j->a->cl;
+    f32 *x = (f32 *)malloc((size_t)8 * (size_t)dim * sizeof(f32));
+    f32 *rot = (f32 *)malloc((size_t)t->dpad * sizeof(f32)), *tmp = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
+    u8 *scr = t->nc > 1 ? (u8 *)malloc(tq_probe_scr_(t)) : (u8 *)0;
+#if TQ_VNNI
+    i32 ng16 = (t->nc + 15) / 16 * 16;
+    u32 *qws = t->c8 ? (u32 *)malloc((size_t)8 * (size_t)t->c8d4 * sizeof(u32)) : (u32 *)0, *qp[8];
+    i32 *s8 = t->c8 ? (i32 *)malloc((size_t)8 * (size_t)ng16 * sizeof(i32)) : (i32 *)0, *sp[8];
+#endif
+    i64 i;
+    (void)tid;
+    for (i = a; i < b; i += 8) {
+        i32 g = b - i < 8 ? (i32)(b - i) : 8;
+        for (r = 0; r < g; ++r) {
+            f32 *dst = x + (size_t)r * dim;
+            const f32 *src = tq_row_(j->rows, j->r0 + i + r, dst);
+            if (src != dst) memcpy(dst, src, (size_t)dim * sizeof(f32));
+        }
+        if (t->nc > 1) {
+#if TQ_VNNI
+            if (t->c8 && g == 8) {                               /* 8 rows per pass over the int8 centroids, like a batch */
+                u64 *key = (u64 *)(void *)scr, *ktmp = key + ng16;
+                i32 *cand = (i32 *)(void *)(ktmp + ng16) + ng16;
+                for (r = 0; r < 8; ++r) { qp[r] = qws + (size_t)r * t->c8d4; sp[r] = s8 + (size_t)r * ng16; tq_q8_(t, x + (size_t)r * dim, qp[r]); }
+                tq_score8x8_(t, qp, sp);
+                for (r = 0; r < 8; ++r) tq_pick_(key, tq_cands_(t, x + (size_t)r * dim, 1, sp[r], key, cand), 1, ktmp, cl + i + r, 0);
+            } else
+#endif
+            for (r = 0; r < g; ++r) tq_probe_(t, x + (size_t)r * dim, 1, scr, cl + i + r);
+            for (r = 0; r < g; ++r) j->a->d2[i + r] = 2.0f - 2.0f * vs_dot(x + (size_t)r * dim, t->cent + (size_t)cl[i + r] * dim, dim);
+        } else for (r = 0; r < g; ++r) { cl[i + r] = 0; j->a->d2[i + r] = 0.0f; }
+        for (r = 0; r < g; ++r) { tq_rot_(t, x + (size_t)r * dim, rot, tmp); tq_encode_row_(t, rot, j->a->cd + (size_t)(i + r) * (size_t)t->vd); }
+    }
+    free(x); free(rot); free(tmp); free(scr);
+#if TQ_VNNI
+    free(qws); free(s8);
+#endif
+}
+
+void tq_add_free(TqAdd *a) { free(a->cl); free(a->d2); free(a->cd); memset(a, 0, sizeof(*a)); }
+
+/* Rows r0 .. r0 + m - 1 of `rows` (unit length) prepared for tq_add_put, on nth threads. Only reads t, so it can run
+ * while searches do, as long as nothing adds to t or replaces it meanwhile. 0, or -1 when memory runs out. */
+i32 tq_add_prep(const Tq *t, const TqCol *rows, i64 r0, i32 m, i32 nth, TqAdd *a)
+{
+    TqPrepJob j;
+    size_t n1 = (size_t)(m > 0 ? m : 1);
+    a->m = m > 0 ? m : 0;
+    a->cl = (i32 *)malloc(n1 * sizeof(i32)); a->d2 = (f32 *)malloc(n1 * sizeof(f32)); a->cd = (u8 *)malloc(n1 * (size_t)t->vd);
+    if (!a->cl || !a->d2 || !a->cd) { tq_add_free(a); return -1; }
+    j.t = t; j.rows = rows; j.r0 = r0; j.a = a;
+    if (a->m) tq_par_(tq_prep_rows_, &j, a->m, nth);
+    return 0;
+}
+
+/* a new extra block at the end of cluster c's chain: 0, or -1 when memory runs out */
+static i32 tq_xblock_(Tq *t, i32 c)
+{
+    i32 b, k, nh = t->nc > 1 ? t->nc : 1;
+    if (!t->xhead) {
+        t->xhead = (i32 *)malloc((size_t)nh * sizeof(i32)); t->xtail = (i32 *)malloc((size_t)nh * sizeof(i32));
+        if (!t->xhead || !t->xtail) { free(t->xhead); free(t->xtail); t->xhead = t->xtail = (i32 *)0; return -1; }
+        for (k = 0; k < nh; ++k) t->xhead[k] = t->xtail[k] = -1;
+    }
+    if (t->xn == t->xcap) {                                      /* grow by half: an add copies O(1) bytes on average */
+        i32 cap = t->xcap + t->xcap / 2 + 64;
+        u8 *xc = (u8 *)realloc(t->xcodes, (size_t)cap * (size_t)t->vd * 16);
+        i32 *xs, *xx;
+        if (!xc) return -1;
+        t->xcodes = xc;
+        if (!(xs = (i32 *)realloc(t->xslot, (size_t)cap * 32 * sizeof(i32)))) return -1;
+        t->xslot = xs;
+        if (!(xx = (i32 *)realloc(t->xnext, (size_t)cap * sizeof(i32)))) return -1;
+        t->xnext = xx;
+        t->xcap = cap;
+    }
+    b = t->xn++;
+    memset(t->xcodes + (size_t)b * (size_t)t->vd * 16, 0, (size_t)t->vd * 16);
+    for (k = 0; k < 32; ++k) t->xslot[(size_t)b * 32 + (size_t)k] = -1;
+    t->xnext[b] = -1;
+    if (t->xtail[c] >= 0) t->xnext[t->xtail[c]] = b; else t->xhead[c] = b;
+    t->xtail[c] = b;
+    return 0;
+}
+
+/* Rows r0 .. r0 + m - 1, prepared by tq_add_prep against this same t, into the index: r0 must be t->n (rows go in in
+ * order). A row takes a free slot of its cluster's last block, or opens an extra block. Writes t: no search may run
+ * meanwhile. 0, or -1 (r0 out of order, or memory ran out - the rows placed until then stay). */
+i32 tq_add_put(Tq *t, const TqAdd *a, i64 r0)
+{
+    i32 i, d, vd = t->vd;
+    if (r0 != (i64)t->n) return -1;
+    for (i = 0; i < a->m; ++i) {
+        i32 row = (i32)(r0 + i), c = t->nc > 1 ? a->cl[i] : 0, b = -1, k = 32;
+        const u8 *cd = a->cd + (size_t)i * (size_t)vd;
+        u8 *blk;
+        if (t->xtail && t->xtail[c] >= 0) {                      /* the cluster already spilled into extra blocks */
+            i32 xb = t->xtail[c];
+            for (k = 0; k < 32 && t->xslot[(size_t)xb * 32 + (size_t)k] >= 0; ++k) {}
+            b = t->nblk + xb;
+        } else {                                                 /* else the padding of its last built block */
+            i32 b0 = t->nc > 1 ? t->cstart[c] : 0, last = t->nc > 1 ? t->cstart[c + 1] - 1 : t->nblk - 1;
+            if (last >= b0) {
+                if (t->slot_row) for (k = 0; k < 32 && t->slot_row[(size_t)last * 32 + (size_t)k] >= 0; ++k) {}
+                else k = row - last * 32;                        /* flat, slot = row */
+                b = last;
+            }
+        }
+        if (b < 0 || k < 0 || k >= 32) {                         /* full, or no block yet: open an extra one */
+            if (tq_xblock_(t, c) != 0) return -1;
+            b = t->nblk + t->xtail[c]; k = 0;
+        }
+        blk = (u8 *)tq_bptr_(t, b);
+        if (k < 16) for (d = 0; d < vd; ++d) { u8 *q = blk + (size_t)d * 16 + (size_t)k; *q = (u8)((*q & 0xf0) | cd[d]); }
+        else for (d = 0; d < vd; ++d) { u8 *q = blk + (size_t)d * 16 + (size_t)(k - 16); *q = (u8)((*q & 0x0f) | (cd[d] << 4)); }
+        if (b >= t->nblk) t->xslot[(size_t)(b - t->nblk) * 32 + (size_t)k] = row;
+        else if (t->slot_row) t->slot_row[(size_t)b * 32 + (size_t)k] = row;
+        t->n = row + 1;
+        t->fit_add += (f64)a->d2[i];
+        ++t->nadd;
+    }
+    return 0;
+}
+
+/* fit0 for an index that came from a file (it is not saved): the mean squared distance of up to 4096 of its rows to
+ * their centroids, read through rows */
+void tq_fit0(Tq *t, const TqCol *rows)
+{
+    i64 ns = (i64)t->nblk * 32, sl, step = ns > 4096 ? ns / 4096 : 1;
+    f64 sum = 0.0;
+    i32 got = 0, c = 0;
+    f32 *rb;
+    if (t->nc <= 1 || !t->slot_row || ns == 0) return;
+    rb = (f32 *)malloc((size_t)t->dim * sizeof(f32));
+    for (sl = 0; sl < ns; sl += step) {
+        i32 r = t->slot_row[sl], b = (i32)(sl / 32);
+        if (r < 0 || r >= t->n) continue;
+        while (c < t->nc - 1 && t->cstart[c + 1] <= b) ++c;    /* slots in order: the cluster only moves forward */
+        sum += 2.0 - 2.0 * (f64)vs_dot(tq_row_(rows, r, rb), t->cent + (size_t)c * t->dim, t->dim);
+        ++got;
+    }
+    t->fit0 = got ? (f32)(sum / got) : 0.0f;
+    free(rb);
+}
+
+static i32 tq_pop64_(u64 x)
+{
+#if defined(__GNUC__)
+    return __builtin_popcountl((unsigned long)x);
+#else
+    i32 c = 0;
+    for (; x; x &= x - 1u) ++c;
+    return c;
+#endif
+}
+
+/* The caller dropped its dead rows and moved the rest down, order kept. Every slot follows its row: row r becomes
+ * r minus the dead rows before it, a dead row's slot goes free, and the index covers nlive rows. dead: the bitset
+ * from before (rows [0, t->n)); pre[w]: dead rows in its words [0, w). A flat index gets an explicit slot_row. */
+void tq_remap(Tq *t, const u64 *dead, const i32 *pre, i32 nlive)
+{
+    i64 s, ns = (i64)t->nblk * 32;
+    if (!t->slot_row) {
+        t->slot_row = (i32 *)malloc((size_t)(ns ? ns : 1) * sizeof(i32));
+        for (s = 0; s < ns; ++s) t->slot_row[s] = s < (i64)t->n ? (i32)s : -1;
+        t->slot_own = t->mapped;
+    }
+    for (s = 0; s < ns + (i64)t->xn * 32; ++s) {
+        i32 *p = s < ns ? &t->slot_row[s] : &t->xslot[s - ns], r = *p;
+        if (r < 0 || r >= t->n || TQ_SKIP(dead, r)) { *p = -1; continue; }
+        *p = r - pre[r >> 6] - tq_pop64_(dead[r >> 6] & (((u64)1 << (r & 63)) - 1u));
+    }
+    t->n = nlive;
 }
 
 #endif /* TQ_C */

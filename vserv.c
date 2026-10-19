@@ -1,12 +1,16 @@
 /* vserv.c - vecindex over a socket: libc + pthreads + Linux epoll, and TLS through the vendored BearSSL
  * (third_party/bearssl, MIT, no malloc inside). Nothing else.
  *
- *   vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-d DIM] [-x] [-c CERT.pem -k KEY.pem [-a CA.pem] [-P] [-T]] STORE.vxi
+ *   vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-d DIM] [-x] [-L] [-r RECALL] [-c CERT.pem -k KEY.pem [-a CA.pem] [-P] [-T]] STORE.vxi
  *     -s PATH   Unix socket, created mode 0600 (default ./vecindex.sock when -p is not given)
  *     -p PORT   TCP port, bound to 127.0.0.1 unless -b gives another address
  *     -t N      worker threads (default: online CPUs)
  *     -d DIM    dimension of a new, empty store when STORE.vxi does not exist yet
  *     -x        save the store to STORE.vxi on SIGINT / SIGTERM
+ *     -L        live: added rows are indexed as they come and the index is rebuilt in the background as it ages
+ *               (grown 2x, the data drifted, a quarter deleted) - no build calls needed (store_set_live)
+ *     -r R      keep recall@10 at R (e.g. 0.95): the probes are tuned on the queries the server answers, after every
+ *               build or rebuild (store_set_target_recall)
  *     -c, -k    TLS: certificate chain and private key (PEM, EC or RSA). The TCP port then takes only TLS: HTTPS,
  *               or the binary protocol inside TLS (-P lets plaintext in too). The Unix socket takes TLS as well and
  *               still accepts plaintext from local clients, unless -T
@@ -957,7 +961,8 @@ int main(int argc, char **argv)
 {
     static Arena arena;
     const char *sock = (const char *)0, *bind_addr = "127.0.0.1", *cert = (const char *)0, *key = (const char *)0, *ca = (const char *)0;
-    i32 port = 0, nth = 0, dim = 0, save_on_exit = 0, i, j;
+    i32 port = 0, nth = 0, dim = 0, save_on_exit = 0, live = 0, i, j;
+    f32 recall = 0.0f;
     VsWorker *ws;
     struct sigaction sa;
     double t0;
@@ -969,13 +974,15 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) nth = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) dim = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-x")) save_on_exit = 1;
+        else if (!strcmp(argv[i], "-L")) live = 1;
+        else if (!strcmp(argv[i], "-r") && i + 1 < argc) recall = (f32)atof(argv[++i]);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) cert = argv[++i];
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) key = argv[++i];
         else if (!strcmp(argv[i], "-a") && i + 1 < argc) ca = argv[++i];
         else if (!strcmp(argv[i], "-P")) vs_plain_ok = 1;
         else if (!strcmp(argv[i], "-T")) vs_unix_tls_only = 1;
         else if (argv[i][0] != '-' && !vs_path) vs_path = argv[i];
-        else { fprintf(stderr, "usage: vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-d DIM] [-x] [-c CERT -k KEY [-a CA] [-P] [-T]] STORE.vxi\n"); return 2; }
+        else { fprintf(stderr, "usage: vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-d DIM] [-x] [-L] [-r RECALL] [-c CERT -k KEY [-a CA] [-P] [-T]] STORE.vxi\n"); return 2; }
     }
     if (!vs_path) { fprintf(stderr, "vserv: no store file given\n"); return 2; }
     if ((cert || key || ca || vs_unix_tls_only) && !(cert && key)) { fprintf(stderr, "vserv: TLS needs both -c CERT and -k KEY\n"); return 2; }
@@ -1003,6 +1010,8 @@ int main(int argc, char **argv)
     }
     vs_dim = vs_store->dim;
     store_set_threads(vs_store, 1);              /* one query per thread: the workers are the parallelism */
+    if (recall > 0.0f) store_set_target_recall(vs_store, recall);
+    if (live) store_set_live(vs_store, 1, 1.0f);
     /* one request: headers + a JSON vector (~24 bytes a number) or the binary frame */
     vs_reqcap = 2048 + vs_dim * 24;
     if (vs_reqcap < 4096) vs_reqcap = 4096;
@@ -1028,8 +1037,8 @@ int main(int argc, char **argv)
             epoll_ctl(w->ep, EPOLL_CTL_ADD, vs_ls[j].fd, &e);
         }
     }
-    fprintf(stderr, "vserv: %s: %d rows x %d, loaded in %.1f ms; %d threads;%s%s%s%s%s%s\n", vs_path, store_count(vs_store), vs_dim,
-            (vs_now_() - t0) * 1e3, nth, sock ? " unix " : "", sock ? sock : "", port ? " tcp " : "", port ? bind_addr : "",
+    fprintf(stderr, "vserv: %s: %d rows x %d, loaded in %.1f ms; %d threads;%s%s%s%s%s%s%s\n", vs_path, store_count(vs_store), vs_dim,
+            (vs_now_() - t0) * 1e3, nth, live ? " live;" : "", sock ? " unix " : "", sock ? sock : "", port ? " tcp " : "", port ? bind_addr : "",
             vs_tls_on ? (vs_ntas_() ? " (TLS, client certificates required)" : " (TLS)") : "",
             vs_tls_on ? (vs_plain_ok ? " + plaintext on tcp" : (vs_unix_tls_only ? "" : "; plaintext on unix only")) : "");
     for (i = 0; i < nth; ++i) pthread_create(&ws[i].th, (const pthread_attr_t *)0, vs_worker_, &ws[i]);

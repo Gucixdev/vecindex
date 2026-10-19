@@ -41,6 +41,14 @@
  * actually been answering (a reservoir of the last STORE_QLOG) or, before there are enough, on its own rows;
  * store_tune re-measures on demand, as the data or the traffic drift.
  *
+ * Live mode: store_set_live(s, 1, grow) and nobody has to call store_build again. A thread of the store's own codes
+ * each added row into its closest cluster (until then the pending tail's exact scan finds it); when the index has
+ * aged - grown by `grow`, a window of new rows sitting far from every centroid (the data moved), a quarter of it
+ * deleted - it rebuilds on a snapshot of the rows while searches go on with the old index, and swaps the new one in;
+ * with a target recall set it re-tunes after each. The work runs on half the cores. store_maintain runs one such
+ * step by hand. store_save writes the appended rows into the file's plain layout, and deletes no longer cost the
+ * saved index: compaction renumbers the rows inside it instead of dropping it.
+ *
  * Concurrency: an rwlock - store_search(_filter) take the read lock and
  * touch no shared mutable state (own malloc scratch, engine_search_into
  * path) except the query reservoir, behind its own mutex that a search only
@@ -147,6 +155,22 @@ typedef struct {
     i64      qlog_seen;
     u32      qlog_rng;
     pthread_mutex_t qlog_mu;
+    i32      tuned_n;       /* rows in the index when it was last tuned (0: not tuned since it was built) */
+    i32      tuned_log;     /* that tuning ran on logged traffic (not on the store's own rows) */
+    /* live mode (store_set_live): a thread of the store's own indexes new rows and rebuilds the index as it ages */
+    i32      live_on;
+    f32      live_grow;     /* rebuild once the rows added since the build reach this share of the rows built; 0: never */
+    pthread_t mt;
+    pthread_mutex_t mt_mu;  /* held through one maintenance step; store_build / store_save / store_tune take it too */
+    pthread_mutex_t mt_cmu; /* with mt_cv: wakes the thread (rows pending, or stop) */
+    pthread_cond_t  mt_cv;
+    i32      mt_stop;
+    i32      dead_built;    /* tombstones the last rebuild already left out of the index */
+    i64      mods, rebuilt_mods;      /* adds + deletes so far, and when the last rebuild started */
+    f64      win_sum;       /* the added rows' squared distances to their centroids, this window */
+    i32      win_n, drifted;            /* rows in the window; windows that sat too far since the build */
+    i64      n_indexed, n_rebuilds, rebuild_us;   /* what maintenance did (store_live_stats) */
+    i64      rebuilding;    /* 1 while a live rebuild runs */
     Tq      *tq;            /* fast mode: the TurboQuant-style index */
     i32      fast;          /* 1: store_build skips the auto-tuner (engine_build_fast) */
     f32      fast_target;   /* recall@k the fast build grows nprobe to (default 0.9) */
@@ -517,6 +541,10 @@ RagStore *store_new(Arena *a, i32 dim)
     s->tune_recall = -1.0f;
     s->qlog_rng = 0x9e3779b9u;
     pthread_mutex_init(&s->qlog_mu, (const pthread_mutexattr_t *)0);
+    s->live_grow = 1.0f;
+    pthread_mutex_init(&s->mt_mu, (const pthread_mutexattr_t *)0);
+    pthread_mutex_init(&s->mt_cmu, (const pthread_mutexattr_t *)0);
+    pthread_cond_init(&s->mt_cv, (const pthread_condattr_t *)0);
     s->spill_fd = -1;
     s->spill_min = STORE_SPILL_MIN;
     if (!sp || strcmp(sp, "off") != 0) {                     /* VECINDEX_SPILL=off keeps everything in memory */
@@ -551,8 +579,12 @@ void store_set_spill(RagStore *s, const char *dir, i64 min_bytes)
     pthread_rwlock_unlock(&s->lock);
 }
 
+static void store_live_stop_(RagStore *s);
+
 void store_destroy(RagStore *s)
 {
+    store_live_stop_(s);
+    pthread_mutex_destroy(&s->mt_mu); pthread_mutex_destroy(&s->mt_cmu); pthread_cond_destroy(&s->mt_cv);
     pthread_rwlock_destroy(&s->lock); tq_free(s->tq); s->tq = (Tq *)0;
     pthread_mutex_destroy(&s->qlog_mu); free(s->qlog); s->qlog = (f32 *)0;
     sidx_free_(&s->ids_h); h64_free(&s->dup);
@@ -613,6 +645,9 @@ static i32 store_ncpu_(void)
     long c = sysconf(_SC_NPROCESSORS_ONLN);
     return c < 1 ? 1 : (c > 16 ? 16 : (i32)c);
 }
+
+/* threads for work in the background (live indexing, rebuilds, tuning): half the cores, so searches keep the rest */
+static i32 store_bg_threads_(void) { i32 c = store_ncpu_() / 2; return c < 1 ? 1 : c; }
 
 static Tq *store_tq_build_(RagStore *s, i32 n)
 {
@@ -698,6 +733,7 @@ static void store_put_row_(RagStore *s, i32 r, const f32 *v)
 /* fast build: one k-means + q4 instead of the auto-tuner's candidate bake-off */
 void store_set_fast(RagStore *s, f32 target_recall)
 {
+    pthread_mutex_lock(&s->mt_mu);
     pthread_rwlock_wrlock(&s->lock);
     s->fast = 1; s->fast_target = target_recall > 0.0f ? target_recall : 0.9f;
     if (!s->tq && s->count > 0 && s->built_upto == s->count) {   /* a loaded, already-built store */
@@ -705,6 +741,7 @@ void store_set_fast(RagStore *s, f32 target_recall)
         s->tq = store_tq_build_(s, s->count);
     }
     pthread_rwlock_unlock(&s->lock);
+    pthread_mutex_unlock(&s->mt_mu);
 }
 
 void store_set_goal(RagStore *s, EngGoal g)
@@ -734,12 +771,14 @@ i32 store_add_meta(RagStore *s, const f32 *vec, i64 doc_id, i64 meta)
     store_note_row_(s, r);
     s->live += 1;
     s->count += 1;
+    ++s->mods;
     if (((i64)s->count & (STORE_CROWS - 1)) == 0) store_chunk_done_(s, (i32)(((i64)s->count >> STORE_CSHIFT) - 1));
     if (s->jf) {                                                  /* journal: 'A' id meta vec[dim] (the normalised row) */
         u8 op = 'A';
         fwrite(&op, 1, 1, s->jf); fwrite(&doc_id, 8, 1, s->jf); fwrite(&meta, 8, 1, s->jf);
         fwrite(v, sizeof(f32), (size_t)s->dim, s->jf);
     }
+    if (s->live_on && ((s->count - s->built_upto) & 255) == 1) pthread_cond_signal(&s->mt_cv);   /* the live thread */
     pthread_rwlock_unlock(&s->lock);
     return 0;
 }
@@ -763,7 +802,7 @@ i32 store_delete(RagStore *s, i64 doc_id)
     pthread_rwlock_wrlock(&s->lock);
     store_idmap_locked_(s);
     for (r = store_find_(s, doc_id); r >= 0; r = store_prev_(s, r))
-        if (!STORE_DEAD(s, r)) { STORE_KILL(s, r); ++hit; --s->live; }
+        if (!STORE_DEAD(s, r)) { STORE_KILL(s, r); ++hit; --s->live; ++s->mods; }
     if (s->jf) { u8 op = 'D'; fwrite(&op, 1, 1, s->jf); fwrite(&doc_id, 8, 1, s->jf); }
     pthread_rwlock_unlock(&s->lock);
     return hit;
@@ -833,11 +872,29 @@ i32 store_get_meta(RagStore *s, i64 doc_id, i64 *meta)
     return r >= 0 ? 0 : -1;
 }
 
-/* drop tombstoned rows (moving the survivors down, order kept); a store without tombstones is left untouched */
+/* tombstones among rows [0, r), with pre[w] = tombstones in words [0, w) */
+static i32 store_dead_before_(const RagStore *s, const i32 *pre, i32 r)
+{
+    return pre[r >> 6] + ((r & 63) ? tq_pop64_(s->dead[r >> 6] & (((u64)1 << (r & 63)) - 1u)) : 0);
+}
+
+/* drop tombstoned rows (moving the survivors down, order kept); a store without tombstones is left untouched. The
+ * scan index follows its rows (tq_remap); an engine index cannot, so it is dropped (its rows pend until a build). */
 static i32 store_compact_(RagStore *s)
 {
     i32 i, w = 0;
     if (s->live == s->count) { if (s->built_upto > s->count) s->built_upto = s->count; return s->count; }
+    {
+        i64 words = ((i64)s->count + 63) >> 6, x;
+        i32 *pre = (i32 *)malloc((size_t)(words + 1) * sizeof(i32)), acc = 0, bu;
+        for (x = 0; x <= words; ++x) { pre[x] = acc; if (x < words) acc += tq_pop64_(s->dead[x]); }
+        bu = s->built_upto - store_dead_before_(s, pre, s->built_upto);
+        if (s->tq) tq_remap(s->tq, s->dead, pre, bu);
+        if (s->idx) { s->idx = (EngIndex *)0; arena_reset(&s->idx_arena); bu = 0; }
+        s->built_upto = bu;
+        s->dead_built = 0;
+        free(pre);
+    }
     for (i = 0; i < s->count; ++i) {
         if (STORE_DEAD(s, i)) continue;
         if (w != i) {
@@ -851,7 +908,6 @@ static i32 store_compact_(RagStore *s)
     memset(s->dead, 0, (size_t)s->dead_words * sizeof(u64));
     s->count = w;
     s->live = w;
-    if (s->built_upto > w) s->built_upto = w;
 #if defined(__GNUC__)
     __atomic_store_n(&s->idmap_ok, 0, __ATOMIC_RELEASE);        /* rows moved: the lookups are rebuilt on next use */
 #else
@@ -860,32 +916,39 @@ static i32 store_compact_(RagStore *s)
     return w;
 }
 
-static f32 store_tune_locked_(RagStore *s);
+static f32 store_tune_run_(RagStore *s, i32 nth);
+
+static i32 store_uses_tq_(const RagStore *s) { return s->fast || (s->goal.mode == ENG_MAX_ACC && s->goal.max_code_bytes >= s->dim * 4); }
+
+/* the engine index (the q1-q5 / IVF / HNSW tuner) over rows [0, w), under the write lock */
+static void store_engine_build_(RagStore *s, i32 w)
+{
+    f32 *flat = (f32 *)malloc((size_t)w * (size_t)s->dim * sizeof(f32));   /* the tuner wants one contiguous array */
+    i32 i;
+    for (i = 0; i < w; ++i) { f32 *dst = flat + (size_t)i * s->dim; const f32 *v = store_row_(s, i, dst); if (v != dst) memcpy(dst, v, (size_t)s->dim * sizeof(f32)); }
+    s->idx = engine_build(&s->idx_arena, flat, w, s->dim, s->goal);
+    free(flat);
+}
 
 void store_build(RagStore *s)
 {
     i32 w;
+    pthread_mutex_lock(&s->mt_mu);                               /* not in the middle of a live rebuild */
     pthread_rwlock_wrlock(&s->lock);
+    tq_free(s->tq); s->tq = (Tq *)0;                             /* rebuilt below: no use remapping it */
     w = store_compact_(s);
     arena_reset(&s->idx_arena);
-    tq_free(s->tq); s->tq = (Tq *)0;
+    s->tuned_n = 0; s->dead_built = 0; s->win_sum = 0.0; s->win_n = 0; s->drifted = 0;
     /* Auto choice: with no memory budget (the default) the data-oblivious 4-bit scan + exact re-score wins
      * on accuracy and speed and needs no training. The q1-q5 / IVF / HNSW tuner (engine_build) only earns
      * its 10-70 s when the goal is a SMALL index (ENG_MIN_SIZE, or a code budget below f32 size). */
-    if (s->fast || (s->goal.mode == ENG_MAX_ACC && s->goal.max_code_bytes >= s->dim * 4)) {
-        s->idx = (EngIndex *)0;
-        if (w > 0) s->tq = store_tq_build_(s, w);
-    } else if (w > 0) {
-        /* the tuner wants one contiguous array (it copies what it keeps) */
-        f32 *flat = (f32 *)malloc((size_t)w * (size_t)s->dim * sizeof(f32));
-        i32 i;
-        for (i = 0; i < w; ++i) { f32 *dst = flat + (size_t)i * s->dim; const f32 *v = store_row_(s, i, dst); if (v != dst) memcpy(dst, v, (size_t)s->dim * sizeof(f32)); }
-        s->idx = engine_build(&s->idx_arena, flat, w, s->dim, s->goal);
-        free(flat);
-    } else s->idx = (EngIndex *)0;
+    s->idx = (EngIndex *)0;
+    if (w > 0 && store_uses_tq_(s)) s->tq = store_tq_build_(s, w);
+    else if (w > 0) store_engine_build_(s, w);
     s->built_upto = w;
-    if (s->tune_target > 0.0f) store_tune_locked_(s);            /* keep the recall asked for */
     pthread_rwlock_unlock(&s->lock);
+    store_tune_run_(s, store_ncpu_());                           /* keep the recall asked for, if one is (searches go on) */
+    pthread_mutex_unlock(&s->mt_mu);
 }
 
 /* ------------------------------------------------------------------ *
@@ -971,9 +1034,84 @@ static void store_qlog_(RagStore *s, const f32 *qn)
     pthread_mutex_unlock(&s->qlog_mu);
 }
 
-/* the exact top k rows of every query, over the built rows (a query's own row left out when self[q] >= 0): the rows
- * are read once, each thread takes a range and keeps its own top k, and the ranges are merged at the end */
-typedef struct { const RagStore *s; const f32 *Q; const i32 *self; i32 nq, k; f32 *ts; i32 *tr; } StoreTruth;
+/* ---- reading rows without the lock: what the live thread builds, codes and measures on ---- */
+
+/* Rows [0, n) as they are now: the chunk pointers of the vector (and scale) columns and, if asked, the tombstones,
+ * copied - adds may grow the columns meanwhile, but no row below n moves while mt_mu is held (only a compaction moves
+ * rows, and it runs under mt_mu), and no chunk is ever freed before store_destroy. Taken under the read lock. */
+typedef struct { i32 n; u8 **vch, **sch; u64 *dead; TqCol col, scol; } StoreSnap;
+
+static void store_snap_(const RagStore *s, i32 n, i32 with_dead, StoreSnap *sn)
+{
+    i32 nch = (i32)(((i64)n + STORE_CROWS - 1) >> STORE_CSHIFT);
+    size_t nw = ((size_t)n + 63) >> 6;
+    memset(sn, 0, sizeof(*sn));
+    sn->n = n;
+    sn->vch = (u8 **)malloc((size_t)(nch ? nch : 1) * sizeof(u8 *));
+    if (nch) memcpy(sn->vch, s->vec.chunk, (size_t)nch * sizeof(u8 *));
+    sn->col = store_tqcol_(&s->vec); sn->col.chunk = sn->vch;
+    if (s->vbytes == 1) {
+        sn->sch = (u8 **)malloc((size_t)(nch ? nch : 1) * sizeof(u8 *));
+        if (nch) memcpy(sn->sch, s->vsc.chunk, (size_t)nch * sizeof(u8 *));
+        sn->scol = store_tqcol_(&s->vsc); sn->scol.chunk = sn->sch;
+        sn->col.i8 = 1; sn->col.dim = s->dim; sn->col.scale = &sn->scol;
+    }
+    if (with_dead) {
+        sn->dead = (u64 *)calloc(nw ? nw : 1, sizeof(u64));
+        if (nw) memcpy(sn->dead, s->dead, nw * sizeof(u64));
+    }
+}
+
+static void store_snap_free_(StoreSnap *sn) { free(sn->vch); free(sn->sch); free(sn->dead); memset(sn, 0, sizeof(*sn)); }
+
+/* q . row r of a column (q unit length; int8 rows times their scale) */
+static f32 store_cdot_(const TqCol *c, const f32 *q, i64 r, i32 dim)
+{
+    const i8 *x;
+    f32 acc = 0.0f;
+    i32 d = 0;
+    if (!c->i8) return vs_dot(q, TQ_ROW(c, r), dim);
+    x = (const i8 *)(const void *)TQ_AT(c, r);
+#if defined(__AVX512F__)
+    {   __m512 a = _mm512_setzero_ps();
+        for (; d + 16 <= dim; d += 16)
+            a = _mm512_fmadd_ps(_mm512_loadu_ps(q + d), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(x + d)))), a);
+        acc = _mm512_reduce_add_ps(a); }
+#endif
+    for (; d < dim; ++d) acc += q[d] * (f32)x[d];
+    return acc * *(const f32 *)(const void *)TQ_AT(c->scale, r);
+}
+
+/* maintenance counters, read without the lock (store_live_stats) */
+static void store_stat_add_(i64 *p, i64 v)
+{
+#if defined(__GNUC__)
+    __atomic_add_fetch(p, v, __ATOMIC_RELAXED);
+#else
+    *p += v;
+#endif
+}
+static i64 store_stat_get_(const i64 *p)
+{
+#if defined(__GNUC__)
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+#else
+    return *p;
+#endif
+}
+static void store_stat_set_(i64 *p, i64 v)
+{
+#if defined(__GNUC__)
+    __atomic_store_n(p, v, __ATOMIC_RELAXED);
+#else
+    *p = v;
+#endif
+}
+
+/* the exact top k rows of every query among rows [0, n) of a column (tombstones skipped, a query's own row left out
+ * when self[q] >= 0): the rows are read once, each thread takes a range and keeps its own top k, and the ranges are
+ * merged at the end */
+typedef struct { const TqCol *col; const u64 *dead; i32 dim; const f32 *Q; const i32 *self; i32 nq, k; f32 *ts; i32 *tr; } StoreTruth;
 
 static void store_topk_put_(f32 *bs, i32 *br, i32 k, f32 d, i32 r)
 {
@@ -986,30 +1124,29 @@ static void store_topk_put_(f32 *bs, i32 *br, i32 k, f32 d, i32 r)
 static void store_truth_rows_(void *p, i64 a, i64 b, i32 tid)
 {
     StoreTruth *j = (StoreTruth *)p;
-    const RagStore *s = j->s;
     f32 *ts = j->ts + (size_t)tid * j->nq * j->k;
     i32 *tr = j->tr + (size_t)tid * j->nq * j->k, q;
     i64 r0, r;
     for (r0 = a; r0 < b; r0 += 256)                              /* 256 rows stay in cache across all the queries */
         for (q = 0; q < j->nq; ++q) {
-            const f32 *qv = j->Q + (size_t)q * s->dim;
+            const f32 *qv = j->Q + (size_t)q * j->dim;
             for (r = r0; r < b && r < r0 + 256; ++r) {
-                if (STORE_DEAD(s, r) || (j->self && j->self[q] == (i32)r)) continue;
-                store_topk_put_(ts + (size_t)q * j->k, tr + (size_t)q * j->k, j->k, store_dot_(s, qv, (i32)r), (i32)r);
+                if (TQ_SKIP(j->dead, r) || (j->self && j->self[q] == (i32)r)) continue;
+                store_topk_put_(ts + (size_t)q * j->k, tr + (size_t)q * j->k, j->k, store_cdot_(j->col, qv, r, j->dim), (i32)r);
             }
         }
 }
 
-static void store_truth_(const RagStore *s, const f32 *Q, const i32 *self, i32 nq, i32 k, i32 *truth)
+static void store_truth_(const TqCol *col, const u64 *dead, i32 n, i32 dim, const f32 *Q, const i32 *self, i32 nq, i32 k, i32 *truth, i32 nth)
 {
     StoreTruth j;
-    i32 nth = store_ncpu_(), t, q, x;
+    i32 t, q, x;
     size_t per = (size_t)nq * (size_t)k;
     if (nth > 64) nth = 64;
-    j.s = s; j.Q = Q; j.self = self; j.nq = nq; j.k = k;
+    j.col = col; j.dead = dead; j.dim = dim; j.Q = Q; j.self = self; j.nq = nq; j.k = k;
     j.ts = (f32 *)malloc((size_t)nth * per * sizeof(f32)); j.tr = (i32 *)malloc((size_t)nth * per * sizeof(i32));
     for (x = 0; x < (i32)((size_t)nth * per); ++x) { j.ts[x] = -1e30f; j.tr[x] = -1; }
-    tq_par_(store_truth_rows_, &j, s->built_upto, nth);
+    tq_par_(store_truth_rows_, &j, n, nth);
     for (q = 0; q < nq; ++q)                                     /* fold every thread's top k into thread 0's */
         for (t = 1; t < nth; ++t)
             for (x = 0; x < k; ++x)
@@ -1020,11 +1157,11 @@ static void store_truth_(const RagStore *s, const f32 *Q, const i32 *self, i32 n
 }
 
 /* recall@10 of the index at `probe` clusters against the exact truth (the batch path, re-scored exactly as a search) */
-static f32 store_recall_at_(RagStore *s, const f32 *Q, const i32 *self, i32 nq, const i32 *truth, i32 probe)
+static f32 store_recall_at_(RagStore *s, const f32 *Q, const i32 *self, i32 nq, const i32 *truth, i32 probe, i32 nth)
 {
     i32 R = s->tq_rerank > 0 ? s->tq_rerank : 256, q, x, z, hits = 0;
     i32 *rows = (i32 *)malloc((size_t)nq * (size_t)R * sizeof(i32)), *cnt = (i32 *)malloc((size_t)nq * sizeof(i32));
-    tq_search_many(s->tq, Q, nq, R, rows, cnt, s->dead, store_ncpu_(), probe);
+    tq_search_many(s->tq, Q, nq, R, rows, cnt, s->dead, nth, probe);
     for (q = 0; q < nq; ++q) {
         i64 got[11];
         f32 sc[11];
@@ -1040,59 +1177,90 @@ static f32 store_recall_at_(RagStore *s, const f32 *Q, const i32 *self, i32 nq, 
     return (f32)hits / (f32)(nq * 10);
 }
 
-/* Under the store's write lock: the fewest IVF probes whose recall@10 reaches s->tune_target (plus a margin for the
- * sample's own error), measured against exact
- * search on the queries the store has been answering (when 64 or more were kept) or else on a spread of its own rows
- * (their own row left out of the truth). Up to STORE_QLOG queries, fewer on huge stores (the exact search reads every
- * row once per query: about 3e10 multiply-adds at most, ~3 s on 2 cores). Returns the recall reached; the probe count
- * becomes the index's default (saved with it). -1: no IVF index to tune. */
-static f32 store_tune_locked_(RagStore *s)
+/* the same under the read lock (the caller holds none): one measurement is all a search ever waits for */
+static f32 store_recall_rd_(RagStore *s, const f32 *Q, const i32 *self, i32 nq, const i32 *truth, i32 probe, i32 nth)
 {
-    i32 nq, nc, q, lo, hi, p, *self = (i32 *)0, *truth, use_log;
-    f32 *Q, rec, rec_hi, goal;
-    f64 budget = 3e10 / ((f64)(s->built_upto > 0 ? s->built_upto : 1) * (f64)s->dim);
-    if (!s->tq || s->tq->nc <= 1 || s->tune_target <= 0.0f || s->built_upto < 1000) return -1.0f;
-    nc = s->tq->nc;
-    nq = budget > STORE_QLOG ? STORE_QLOG : (budget < 32.0 ? 32 : (i32)budget);
-    Q = (f32 *)malloc((size_t)nq * (size_t)s->dim * sizeof(f32));
+    f32 r;
+    pthread_rwlock_rdlock(&s->lock);
+    r = store_recall_at_(s, Q, self, nq, truth, probe, nth);
+    pthread_rwlock_unlock(&s->lock);
+    return r;
+}
+
+/* The queries to tune on, into Q[nq x dim]: the logged traffic when 64 or more were kept (*self = NULL), else a
+ * spread of the store's own live rows below n (*self[q] = that row, left out of its own truth). Returns how many. */
+static i32 store_tune_queries_(RagStore *s, const TqCol *col, const u64 *dead, i32 n, f32 *Q, i32 nq, i32 **self, i32 *from_log)
+{
+    i32 q;
+    *self = (i32 *)0;
     pthread_mutex_lock(&s->qlog_mu);
-    use_log = s->qlog_n >= 64;
-    if (use_log) {                                               /* real traffic: the queries this store answers */
+    *from_log = s->qlog_n >= 64;
+    if (*from_log) {                                             /* real traffic: the queries this store answers */
         if (nq > s->qlog_n) nq = s->qlog_n;
         memcpy(Q, s->qlog, (size_t)nq * (size_t)s->dim * sizeof(f32));
     }
     pthread_mutex_unlock(&s->qlog_mu);
-    if (!use_log) {                                              /* no traffic yet: rows of its own, spread out */
-        self = (i32 *)malloc((size_t)nq * sizeof(i32));
-        for (q = 0; q < nq; ++q) {
-            i32 r = (i32)((i64)s->built_upto * q / nq) + q % 7;
-            const f32 *v;
-            if (r >= s->built_upto) r = s->built_upto - 1;
-            while (r < s->built_upto - 1 && STORE_DEAD(s, r)) ++r;
-            v = store_row_(s, r, Q + (size_t)q * s->dim);
-            if (v != Q + (size_t)q * s->dim) memcpy(Q + (size_t)q * s->dim, v, (size_t)s->dim * sizeof(f32));
-            self[q] = r;
-        }
+    if (*from_log) return nq;
+    *self = (i32 *)malloc((size_t)nq * sizeof(i32));             /* no traffic yet: rows of its own, spread out */
+    for (q = 0; q < nq; ++q) {
+        i32 r = (i32)((i64)n * q / nq) + q % 7;
+        f32 *dst = Q + (size_t)q * s->dim;
+        const f32 *v;
+        if (r >= n) r = n - 1;
+        while (r < n - 1 && TQ_SKIP(dead, r)) ++r;
+        v = tq_row_(col, r, dst);
+        if (v != dst) memcpy(dst, v, (size_t)s->dim * sizeof(f32));
+        (*self)[q] = r;
     }
+    return nq;
+}
+
+/* The fewest IVF probes whose recall@10 reaches s->tune_target (plus a margin for the sample's own error), measured
+ * against exact search on the queries the store has been answering (when 64 or more were kept) or else on a spread of
+ * its own rows (their own row left out of the truth). Up to STORE_QLOG queries, fewer on huge stores (the exact search
+ * reads every row once per query: about 3e10 multiply-adds at most, ~3 s on 2 cores). The probe count becomes the
+ * index's default (saved with it). Returns the recall reached, -1 with no IVF index to tune.
+ * Called with mt_mu held and no lock: the exact truth runs on a snapshot with no lock at all, each recall measurement
+ * under the read lock, and the result goes in under the write lock - searches go on throughout. nth: threads. */
+static f32 store_tune_run_(RagStore *s, i32 nth)
+{
+    i32 nq, nc, n, lo, hi, p, *self = (i32 *)0, *truth, from_log = 0, np0;
+    f32 *Q, rec, rec_hi, goal, target;
+    f64 budget;
+    StoreSnap sn;
+    Tq *t;
+    pthread_rwlock_rdlock(&s->lock);
+    t = s->tq; n = s->built_upto; target = s->tune_target;
+    if (!t || t->nc <= 1 || target <= 0.0f || n < 1000 || t->n != n) { pthread_rwlock_unlock(&s->lock); return -1.0f; }
+    nc = t->nc; np0 = t->nprobe;
+    store_snap_(s, n, 1, &sn);
+    pthread_rwlock_unlock(&s->lock);
+    budget = 3e10 / ((f64)n * (f64)s->dim);
+    nq = budget > STORE_QLOG ? STORE_QLOG : (budget < 32.0 ? 32 : (i32)budget);
+    Q = (f32 *)malloc((size_t)nq * (size_t)s->dim * sizeof(f32));
+    nq = store_tune_queries_(s, &sn.col, sn.dead, n, Q, nq, &self, &from_log);
     truth = (i32 *)malloc((size_t)nq * 10 * sizeof(i32));
-    store_truth_(s, Q, self, nq, 10, truth);
+    store_truth_(&sn.col, sn.dead, n, s->dim, Q, self, nq, 10, truth, nth);
     /* aim 1.5 standard errors above the target, so fresh queries meet it too, not just half of the time */
-    goal = s->tune_target + 1.5f * (f32)sqrt((f64)s->tune_target * (1.0 - (f64)s->tune_target) / (10.0 * (f64)nq));
+    goal = target + 1.5f * (f32)sqrt((f64)target * (1.0 - (f64)target) / (10.0 * (f64)nq));
     if (goal > 0.999f) goal = 0.999f;
     /* recall grows with the probes: double from the default until the target is met, then halve the gap */
-    hi = s->tq->nprobe > 0 ? s->tq->nprobe : 1;
-    rec_hi = store_recall_at_(s, Q, self, nq, truth, hi);
+    hi = np0 > 0 ? np0 : 1;
+    rec_hi = store_recall_rd_(s, Q, self, nq, truth, hi, nth);
     lo = 0;
-    while (rec_hi < goal && hi < nc) { lo = hi; hi = hi * 2 < nc ? hi * 2 : nc; rec_hi = store_recall_at_(s, Q, self, nq, truth, hi); }
+    while (rec_hi < goal && hi < nc) { lo = hi; hi = hi * 2 < nc ? hi * 2 : nc; rec_hi = store_recall_rd_(s, Q, self, nq, truth, hi, nth); }
     if (rec_hi >= goal)
         while (hi - lo > 1) {                                    /* the goal is met at hi and not at lo */
             p = lo + (hi - lo) / 2;
-            rec = store_recall_at_(s, Q, self, nq, truth, p);
+            rec = store_recall_rd_(s, Q, self, nq, truth, p, nth);
             if (rec >= goal) { hi = p; rec_hi = rec; } else lo = p;
         }
-    s->tq->nprobe = hi;                                          /* the index's default from now on (and on disk) */
-    s->tq_probe = 0;
-    s->tune_recall = rec_hi;
+    pthread_rwlock_wrlock(&s->lock);
+    if (s->tq == t) {                                            /* the index's default from now on (and on disk) */
+        t->nprobe = hi; s->tq_probe = 0; s->tune_recall = rec_hi; s->tuned_n = t->n; s->tuned_log = from_log;
+    }
+    pthread_rwlock_unlock(&s->lock);
+    store_snap_free_(&sn);
     free(Q); free(self); free(truth);
     return rec_hi;
 }
@@ -1104,18 +1272,242 @@ void store_set_target_recall(RagStore *s, f32 target)
     pthread_rwlock_unlock(&s->lock);
 }
 
-/* tune now (after store_build tuned on what it had): returns the recall@10 reached, -1 without an IVF index or a
- * target. Holds the write lock for the measurement (a few seconds on a million rows). */
+/* tune now (store_build tuned on what it had): returns the recall@10 reached, -1 without an IVF index or a target.
+ * Searches go on meanwhile (a few seconds on a million rows). */
 f32 store_tune(RagStore *s)
 {
     f32 r;
-    pthread_rwlock_wrlock(&s->lock);
-    r = store_tune_locked_(s);
-    pthread_rwlock_unlock(&s->lock);
+    pthread_mutex_lock(&s->mt_mu);
+    r = store_tune_run_(s, store_ncpu_());
+    pthread_mutex_unlock(&s->mt_mu);
     return r;
 }
 
 f32 store_tuned_recall(RagStore *s) { return s->tune_recall; }
+
+/* ---- live mode: rows indexed as they come, the index rebuilt as it ages ---- */
+
+#ifndef STORE_LIVE_CHUNK
+#define STORE_LIVE_CHUNK 4096   /* rows coded per step of live indexing */
+#endif
+#ifndef STORE_LIVE_MIN
+#define STORE_LIVE_MIN 1024     /* rows before a live store builds its first index */
+#endif
+#ifndef STORE_LIVE_DRIFT
+#define STORE_LIVE_DRIFT 1.25   /* rebuild once added rows sit this much farther from their centroids than built ones */
+#endif
+
+/* How well the rows going in fit the clusters, a window of max(1000, a twentieth of the build) rows at a time: a
+ * window whose rows sit STORE_LIVE_DRIFT times farther from their centroids than the built rows did means the data
+ * has moved away from the clusters (one far window is enough; the old rows added since cannot water it down). Under
+ * the write lock, mt_mu held. */
+static void store_fit_(RagStore *s, const Tq *t, const TqAdd *ad, i32 m)
+{
+    i32 i, win = t->nbuilt / 20 > 1000 ? t->nbuilt / 20 : 1000;
+    if (t->nc <= 1 || !(t->fit0 > 1e-6f)) return;
+    for (i = 0; i < m; ++i) {
+        s->win_sum += (f64)ad->d2[i];
+        if (++s->win_n >= win) {
+            if (s->win_sum > STORE_LIVE_DRIFT * (f64)t->fit0 * (f64)s->win_n) ++s->drifted;
+            s->win_sum = 0.0; s->win_n = 0;
+        }
+    }
+}
+
+/* Index the pending tail, STORE_LIVE_CHUNK rows at a time: coded on a snapshot with no lock held (searches and adds go
+ * on), then placed under the write lock (a few stores a row). mt_mu held. Returns the rows indexed. */
+static i32 store_index_pending_(RagStore *s, i32 nth)
+{
+    i32 done = 0;
+    for (;;) {
+        StoreSnap sn;
+        TqAdd ad;
+        Tq *t;
+        i32 r0, m, ok;
+        pthread_rwlock_rdlock(&s->lock);
+        t = s->tq; r0 = s->built_upto; m = s->count - r0;
+        if (!t || s->idx || m <= 0 || t->n != r0) { pthread_rwlock_unlock(&s->lock); break; }
+        if (m > STORE_LIVE_CHUNK) m = STORE_LIVE_CHUNK;
+        store_snap_(s, r0 + m, 0, &sn);
+        pthread_rwlock_unlock(&s->lock);
+        if (t->nc > 1 && !(t->fit0 > 0.0f)) tq_fit0(t, &sn.col);   /* a loaded index: what its rows fit like */
+        ok = tq_add_prep(t, &sn.col, r0, m, nth, &ad) == 0;
+        store_snap_free_(&sn);
+        if (!ok) break;
+        pthread_rwlock_wrlock(&s->lock);
+        if (s->tq == t && s->built_upto == r0) {
+            ok = tq_add_put(t, &ad, r0) == 0;
+            store_fit_(s, t, &ad, t->n - r0);
+            done += t->n - r0;
+            s->built_upto = t->n;                                /* what went in: all of it, unless memory ran out */
+        } else ok = 0;
+        pthread_rwlock_unlock(&s->lock);
+        tq_add_free(&ad);
+        if (!ok) break;
+    }
+    store_stat_add_(&s->n_indexed, done);
+    return done;
+}
+
+/* the same with the write lock held: store_save indexes what came in after its store_index_pending_ */
+static void store_index_locked_(RagStore *s)
+{
+    TqCol sc, col;
+    TqAdd ad;
+    i32 r0 = s->built_upto, m = s->count - r0;
+    if (!s->tq || s->idx || m <= 0 || s->tq->n != r0) return;
+    col = store_vcol_(s, &sc);
+    if (s->tq->nc > 1 && !(s->tq->fit0 > 0.0f)) tq_fit0(s->tq, &col);
+    if (tq_add_prep(s->tq, &col, r0, m, store_ncpu_(), &ad) != 0) return;
+    tq_add_put(s->tq, &ad, r0);
+    store_fit_(s, s->tq, &ad, s->tq->n - r0);
+    store_stat_add_(&s->n_indexed, s->tq->n - r0);
+    s->built_upto = s->tq->n;
+    tq_add_free(&ad);
+}
+
+/* Rebuild the scan index over every row there is, off the lock: clustering and codes are computed on a snapshot
+ * (tombstones left out) while searches go on with the old index, which is swapped out under the write lock. Rows added
+ * meanwhile pend, and get indexed like any other. mt_mu held. 0, or -1 when there was nothing to build. */
+static i32 store_rebuild_(RagStore *s, i32 nth)
+{
+    StoreSnap sn;
+    Tq *nt, *old;
+    i32 n, nc, live, dead, bits;
+    u32 seed;
+    f64 t0 = tq_now_();
+    pthread_rwlock_rdlock(&s->lock);
+    n = s->count; live = s->live; dead = n - live; bits = s->codebits; seed = s->goal.seed;
+    if (live <= 0 || s->idx) { pthread_rwlock_unlock(&s->lock); return -1; }
+    store_snap_(s, n, 1, &sn);
+    s->rebuilt_mods = s->mods;
+    pthread_rwlock_unlock(&s->lock);
+    store_stat_set_(&s->rebuilding, 1);
+    nc = store_nclusters_(live);
+    nt = tq_build_skip(&sn.col, n, s->dim, seed, nc, nth, bits, nc > 1 ? sn.dead : (const u64 *)0);
+    store_snap_free_(&sn);
+    if (!nt) { store_stat_set_(&s->rebuilding, 0); return -1; }
+    pthread_rwlock_wrlock(&s->lock);
+    old = s->tq;
+    if (old && old->nc > 1 && nt->nc > 1 && s->tuned_n > 0) {   /* the tuned share of the clusters, until re-tuned */
+        i32 np = (i32)((f64)old->nprobe * (f64)nt->nc / (f64)old->nc + 0.5);
+        nt->nprobe = np < 1 ? 1 : (np > nt->nc ? nt->nc : np);
+    }
+    s->tq = nt;
+    s->built_upto = n;
+    s->tuned_n = 0;
+    s->dead_built = nt->nc > 1 ? dead : 0;                       /* a flat index keeps its tombstones' slots */
+    s->win_sum = 0.0; s->win_n = 0; s->drifted = 0;
+    pthread_rwlock_unlock(&s->lock);
+    tq_free(old);
+    store_stat_set_(&s->rebuilding, 0);
+    store_stat_add_(&s->n_rebuilds, 1);
+    store_stat_set_(&s->rebuild_us, (i64)((tq_now_() - t0) * 1e6));
+    return 0;
+}
+
+/* Why the index should be rebuilt now, 0 if it should not: 1 there is none yet, 2 the store grew into IVF size, 3 it
+ * grew by live_grow since the build, 4 a window of added rows sat STORE_LIVE_DRIFT times farther from their centroids
+ * than the built rows (store_fit_: the data moved), 5 a quarter of the index is tombstones. Nothing changed since the last
+ * rebuild: 0. Under the read lock. */
+static i32 store_due_(const RagStore *s)
+{
+    const Tq *t = s->tq;
+    i32 dead = s->count - s->live - s->dead_built;
+    if (s->idx || s->mods == s->rebuilt_mods) return 0;          /* an engine index is store_build's business */
+    if (!t) return s->live >= STORE_LIVE_MIN ? 1 : 0;
+    if (s->live_grow <= 0.0f) return 0;
+    if (t->nc <= 1) return store_nclusters_(s->live) > 1 ? 2 : 0;
+    if ((f64)t->nadd >= (f64)s->live_grow * (f64)(t->nbuilt > 0 ? t->nbuilt : 1)) return 3;
+    if (s->drifted) return 4;
+    if ((i64)dead * 4 > (i64)t->n) return 5;
+    return 0;
+}
+
+/* re-tune: a target is set and the index was rebuilt, grew by a tenth, or real traffic arrived to tune on */
+static i32 store_tune_due_(RagStore *s)
+{
+    const Tq *t = s->tq;
+    i32 nlog;
+    if (s->tune_target <= 0.0f || !t || t->nc <= 1 || s->built_upto < 1000 || t->n != s->built_upto) return 0;
+    if (s->tuned_n <= 0 || (i64)t->n * 10 >= (i64)s->tuned_n * 11) return 1;
+    pthread_mutex_lock(&s->qlog_mu); nlog = s->qlog_n; pthread_mutex_unlock(&s->qlog_mu);
+    return !s->tuned_log && nlog >= 64;
+}
+
+/* One maintenance step, now - what the live thread runs again and again: index the pending rows, rebuild if the index
+ * has aged (store_due_), re-tune if a target recall is set and the index changed. Searches go on throughout (the work
+ * takes half the cores); an add waits at most while a chunk of rows is placed or an index swapped. Returns what it did:
+ * 1 indexed, 2 rebuilt, 4 tuned. */
+i32 store_maintain(RagStore *s)
+{
+    i32 did = 0, due, tune, nth = store_bg_threads_();
+    pthread_mutex_lock(&s->mt_mu);
+    if (store_index_pending_(s, nth) > 0) did |= 1;
+    pthread_rwlock_rdlock(&s->lock); due = store_due_(s); pthread_rwlock_unlock(&s->lock);
+    if (due && store_rebuild_(s, nth) == 0) { did |= 2; if (store_index_pending_(s, nth) > 0) did |= 1; }
+    pthread_rwlock_rdlock(&s->lock); tune = store_tune_due_(s); pthread_rwlock_unlock(&s->lock);
+    if (tune && store_tune_run_(s, nth) >= 0.0f) did |= 4;
+    pthread_mutex_unlock(&s->mt_mu);
+    return did;
+}
+
+static void *store_live_main_(void *p)
+{
+    RagStore *s = (RagStore *)p;
+    for (;;) {
+        i32 did, stop;
+        pthread_mutex_lock(&s->mt_cmu); stop = s->mt_stop; pthread_mutex_unlock(&s->mt_cmu);
+        if (stop) break;
+        did = store_maintain(s);
+        pthread_mutex_lock(&s->mt_cmu);
+        if (!did && !s->mt_stop) {                               /* nothing to do: sleep until an add, at most 50 ms */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 50000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
+            pthread_cond_timedwait(&s->mt_cv, &s->mt_cmu, &ts);
+        }
+        pthread_mutex_unlock(&s->mt_cmu);
+    }
+    return (void *)0;
+}
+
+static void store_live_stop_(RagStore *s)
+{
+    if (!s->live_on) return;
+    pthread_mutex_lock(&s->mt_cmu); s->mt_stop = 1; pthread_cond_signal(&s->mt_cv); pthread_mutex_unlock(&s->mt_cmu);
+    pthread_join(s->mt, (void **)0);
+    pthread_rwlock_wrlock(&s->lock); s->live_on = 0; pthread_rwlock_unlock(&s->lock);
+}
+
+/* Live mode on or off. On: a thread of the store's own indexes rows as they are added - within ~50 ms; until then the
+ * exact scan of the pending tail finds them, as always - and rebuilds the index off the lock as it ages: grown by
+ * `grow` since the last build (1.0: doubled; 0: never rebuild), the added rows sitting STORE_LIVE_DRIFT times farther
+ * from their centroids than the built ones (the data moved), or a quarter of it tombstones. With a target recall
+ * (store_set_target_recall) it re-tunes the probes after every rebuild and every tenth more rows. A store with no
+ * index yet gets one at STORE_LIVE_MIN rows. */
+void store_set_live(RagStore *s, i32 on, f32 grow)
+{
+    pthread_mutex_lock(&s->mt_mu);
+    s->live_grow = grow > 0.0f ? grow : 0.0f;
+    pthread_mutex_unlock(&s->mt_mu);
+    if (on && !s->live_on) {
+        s->mt_stop = 0;
+        if (pthread_create(&s->mt, (const pthread_attr_t *)0, store_live_main_, s) == 0) {
+            pthread_rwlock_wrlock(&s->lock); s->live_on = 1; pthread_rwlock_unlock(&s->lock);
+            pthread_cond_signal(&s->mt_cv);
+        }
+    } else if (!on) store_live_stop_(s);
+}
+
+/* what maintenance has done: rows indexed after a build, rebuilds, seconds the last rebuild took (any may be NULL) */
+void store_live_stats(RagStore *s, i64 *indexed, i64 *rebuilds, f64 *last_rebuild_s)
+{
+    if (indexed) *indexed = store_stat_get_(&s->n_indexed);
+    if (rebuilds) *rebuilds = store_stat_get_(&s->n_rebuilds);
+    if (last_rebuild_s) *last_rebuild_s = 1e-6 * (f64)store_stat_get_(&s->rebuild_us);
+}
 
 static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
                               i64 *out_doc_ids, f32 *out_scores,
@@ -1434,21 +1826,33 @@ static int store_col_w_(FILE *f, const SCol *c, i64 n)
     return 0;
 }
 
+/* The blocks go out cluster by cluster - the built ones, then those added since - so the file holds a plain index
+ * again (a flat index without slot_row adds rows in order, so its blocks stay in row order) */
 static int store_tq_w_(FILE *f, const Tq *t)
 {
-    i32 h[8];
-    size_t ncode = (size_t)t->nblk * (size_t)t->vd * 16;
-    h[0] = t->dim; h[1] = t->dpad; h[2] = t->n; h[3] = t->nblk; h[4] = t->nc; h[5] = t->nprobe;
+    i32 h[8], c, nb, i, nc1 = t->nc > 1 ? t->nc : 1, *bl, *cs, bad = 0;
+    size_t bb = (size_t)t->vd * 16;
+    h[0] = t->dim; h[1] = t->dpad; h[2] = t->n; h[3] = t->nblk + t->xn; h[4] = t->nc; h[5] = t->nprobe;
     h[6] = t->slot_row != (i32 *)0; h[7] = t->bits == 2 ? 2 : 0;                     /* 0 = 4-bit (older files) */
     if (store_pad_(f) || STORE_W32(f, h, 8)
         || store_pad_(f) || STORE_W32(f, t->s1, (size_t)t->dpad)
         || store_pad_(f) || STORE_W32(f, t->s2, (size_t)t->dpad)
         || store_pad_(f) || STORE_W32(f, t->perm, (size_t)t->dpad)) return -1;
+    bl = (i32 *)malloc((size_t)(h[3] > 0 ? h[3] : 1) * sizeof(i32));
+    cs = (i32 *)malloc((size_t)(nc1 + 1) * sizeof(i32));
+    for (nb = 0, c = 0; c < nc1; ++c) { cs[c] = nb; nb += tq_cblocks_(t, c, bl + nb); }
+    cs[nc1] = nb;
     if (t->nc > 1 && (store_pad_(f) || STORE_W32(f, t->cent, (size_t)t->nc * (size_t)t->dim)
-                      || store_pad_(f) || STORE_W32(f, t->cstart, (size_t)t->nc + 1))) return -1;
-    if (t->slot_row && (store_pad_(f) || STORE_W32(f, t->slot_row, (size_t)t->nblk * 32))) return -1;
-    if (store_pad_(f) || (ncode && fwrite(t->codes, 1, ncode, f) != ncode)) return -1;
-    return 0;
+                      || store_pad_(f) || STORE_W32(f, cs, (size_t)t->nc + 1))) bad = 1;
+    if (!bad && h[6]) {
+        bad = store_pad_(f) != 0;
+        for (i = 0; i < nb && !bad; ++i)
+            bad = STORE_W32(f, bl[i] < t->nblk ? t->slot_row + (size_t)bl[i] * 32 : t->xslot + (size_t)(bl[i] - t->nblk) * 32, 32) != 0;
+    }
+    if (!bad) bad = store_pad_(f) != 0;
+    for (i = 0; i < nb && !bad; ++i) bad = fwrite(tq_bptr_(t, bl[i]), 1, bb, f) != bb;
+    free(bl); free(cs);
+    return bad ? -1 : 0;
 }
 
 i32 store_save(RagStore *s, const char *path)
@@ -1456,22 +1860,26 @@ i32 store_save(RagStore *s, const char *path)
     FILE *f;
     char *tmp;
     i32 hdr[4], ext[4];
-    i32 live, stale;
+    i32 live, had_idx;
     u8 kind;
 
+    pthread_mutex_lock(&s->mt_mu);
+    store_index_pending_(s, store_ncpu_());                      /* the pending tail into the index, searches going on */
     pthread_rwlock_wrlock(&s->lock);
-    stale = s->count != s->live;                                 /* compaction is about to move rows under the index */
-    live = store_compact_(s);
+    store_index_locked_(s);                                      /* and what came in meanwhile: the file gets the index */
+    had_idx = s->idx != (EngIndex *)0;
+    live = store_compact_(s);                                    /* the scan index follows its rows */
+    if (had_idx && !s->idx && live > 0) { store_engine_build_(s, live); s->built_upto = live; }   /* an engine index cannot */
     tmp = (char *)malloc(strlen(path) + 5); strcpy(tmp, path); strcat(tmp, ".tmp");
     f = fopen(tmp, "wb");                                        /* the old file stays intact until the new one is complete and on disk */
-    if (!f) { free(tmp); pthread_rwlock_unlock(&s->lock); return -1; }
+    if (!f) { free(tmp); pthread_rwlock_unlock(&s->lock); pthread_mutex_unlock(&s->mt_mu); return -1; }
 
     hdr[0] = (i32)STORE_MAGIC; hdr[1] = s->vbytes == 1 ? STORE_VERSION_I8 : STORE_VERSION;   /* f32 stores stay v5 */
     hdr[2] = s->dim; hdr[3] = live;
     ext[0] = 1; ext[1] = ext[2] = ext[3] = 0;                    /* v6: rows are int8 */
     /* 0: no index (load rebuilds), 1: engine index, 2: the scan index */
     kind = (u8)(s->idx != (EngIndex *)0 && s->built_upto == live ? 1
-              : (s->tq && !stale && s->built_upto == live && s->tq->n == live ? 2 : 0));
+              : (s->tq && s->built_upto == live && s->tq->n == live ? 2 : 0));
 
     store_advise_(s, MADV_SEQUENTIAL);                           /* the save streams every row: read ahead */
     if (STORE_W32(f, hdr, 4)
@@ -1485,14 +1893,17 @@ i32 store_save(RagStore *s, const char *path)
         || (kind == 1 && engine_save(s->idx, f))
         || (kind == 2 && store_tq_w_(f, s->tq))) {
         store_advise_(s, MADV_RANDOM);
-        fclose(f); remove(tmp); free(tmp); pthread_rwlock_unlock(&s->lock); return -1;
+        fclose(f); remove(tmp); free(tmp); pthread_rwlock_unlock(&s->lock); pthread_mutex_unlock(&s->mt_mu); return -1;
     }
     store_advise_(s, MADV_RANDOM);
-    if (store_fsync_(f) != 0 || fclose(f) != 0 || rename(tmp, path) != 0) { remove(tmp); free(tmp); pthread_rwlock_unlock(&s->lock); return -1; }
+    if (store_fsync_(f) != 0 || fclose(f) != 0 || rename(tmp, path) != 0) {
+        remove(tmp); free(tmp); pthread_rwlock_unlock(&s->lock); pthread_mutex_unlock(&s->mt_mu); return -1;
+    }
     free(tmp);
     store_fsync_dir_(path);
     store_journal_reset_(s, path);
     pthread_rwlock_unlock(&s->lock);
+    pthread_mutex_unlock(&s->mt_mu);
     return 0;
 }
 
@@ -1563,6 +1974,7 @@ static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows)
     if (h[0] <= 0 || h[1] < h[0] || h[2] != rows || h[3] < 0 || h[4] < 0) return (Tq *)0;
     t = (Tq *)calloc(1, sizeof(Tq));
     t->dim = h[0]; t->dpad = h[1]; t->n = h[2]; t->nblk = h[3]; t->nc = h[4]; t->nprobe = h[5];
+    t->nbuilt = t->n;                                            /* growth counts from the load (fit0: on first add) */
     t->bits = h[7] == 2 ? 2 : 4; t->vd = tq_vd_(t->dpad, t->bits);
     t->mapped = map != (u8 *)0;
     o = STORE_AL(o + 32);
@@ -1692,6 +2104,37 @@ RagStore *store_load(Arena *a, const char *path)
 
 static u32 sd_rng_(u32 *s) { *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5; return *s; }
 static f32 sd_f_(u32 *s) { return (f32)sd_rng_(s) / (f32)0xffffffffu - 0.5f; }
+
+/* rows [from, to) of x into s from a thread of its own; `done` tells the searching thread how far it got */
+typedef struct { RagStore *s; const f32 *x; i32 dim, from, to; i64 id0; i32 done; } SdAdder;
+static void *sd_adder_(void *p)
+{
+    SdAdder *a = (SdAdder *)p;
+    i32 i;
+    for (i = a->from; i < a->to; ++i) {
+        store_add(a->s, a->x + (size_t)i * a->dim, a->id0 + i);
+        __atomic_store_n(&a->done, i + 1, __ATOMIC_RELEASE);
+        if (i % 1000 == 999) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 1000000L; nanosleep(&ts, (struct timespec *)0); }
+    }
+    return (void *)0;
+}
+
+/* recall@10 of store s on queries Q against the exact top 10 of rows [0, n) of x (ids id0 + row; gone[r]: deleted) */
+static f32 sd_recall_(RagStore *s, const f32 *x, i32 n, i32 dim, const f32 *Q, i32 nq, i64 id0, const u8 *gone)
+{
+    i32 q, r, j, hits = 0;
+    for (q = 0; q < nq; ++q) {
+        const f32 *qv = Q + (size_t)q * dim;
+        f32 bs[10]; i32 br[10];
+        i64 got[10]; f32 gs[10];
+        i32 h;
+        for (j = 0; j < 10; ++j) { bs[j] = -1e30f; br[j] = -1; }
+        for (r = 0; r < n; ++r) if (!gone || !gone[r]) store_topk_put_(bs, br, 10, vs_dot(qv, x + (size_t)r * dim, dim), r);
+        h = store_search(s, qv, 10, got, gs);
+        for (j = 0; j < h; ++j) { i32 z; for (z = 0; z < 10; ++z) if (br[z] >= 0 && id0 + br[z] == got[j]) { ++hits; break; } }
+    }
+    return (f32)hits / (f32)(nq * 10);
+}
 
 int main(void)
 {
@@ -2064,7 +2507,7 @@ int main(void)
         p95 = t3->tq ? t3->tq->nprobe : -1; r95 = store_tuned_recall(t3);
         tr3 = (i32 *)malloc((size_t)nq3 * 10 * sizeof(i32));
         for (q = 0; q < nq3; ++q) store_normalise_(q3 + (size_t)q * d3, d3);
-        store_truth_(t3, q3, (const i32 *)0, nq3, 10, tr3);
+        { TqCol sc3, c3 = store_vcol_(t3, &sc3); store_truth_(&c3, t3->dead, t3->built_upto, d3, q3, (const i32 *)0, nq3, 10, tr3, 2); }
         for (q = 0; q < nq3; ++q) {
             i64 r10[10]; f32 c10[10];
             i32 got = store_search(t3, q3 + (size_t)q * d3, 10, r10, c10), x, z;
@@ -2103,6 +2546,137 @@ int main(void)
         if (same != nq) ok = 0;
         free(bi); free(bs);
         store_destroy(b);
+    }
+
+    {   /* Live ingest. (1) rows added to a built index are rows like the built ones: probing every cluster gives the
+         * flat scan of all the rows, the batch path agrees, a flat index takes added rows the same way, and an added row
+         * lands in its closest cluster. (2) a live store: rows streamed in by another thread while this one searches -
+         * indexed by the store's own thread, rebuilt as it grows, tuned to the recall asked for; deletes + save keep
+         * the index (nothing rebuilt at load); rows from new topics are noticed as a drift and trigger a rebuild. */
+        i32 n4 = 24000, n40 = 16000, d4 = 32, nd = 3000, nq4 = 100, j, q, bits, same = 0, tot = 0, inbest = 0, sameb = 0;
+        i32 miss = 0, looks = 0, sameld = 0, mc[32], did = 0, reasons = 0;
+        i32 *mr = (i32 *)malloc((size_t)32 * 100 * sizeof(i32));
+        f32 *x4 = (f32 *)malloc((size_t)(n4 + nd) * d4 * sizeof(f32)), *q4 = (f32 *)malloc((size_t)(2 * nq4) * d4 * sizeof(f32));
+        f32 *qd = q4 + (size_t)nq4 * d4, sc4[64], r_live, r_saved, r_d0, r_d1, rt;
+        u8 *hv, *gone = (u8 *)calloc((size_t)(n4 + nd), 1);
+        u32 s5 = 4242u;
+        TqCol vcol;
+        RagStore *lv, *ld;
+        SdAdder ad4;
+        pthread_t th;
+        i64 nidx = 0, nreb = 0, nreb0 = 0;
+        f64 rbs = 0.0;
+        for (i = 0; i < n4 + nd + 2 * nq4; ++i) {               /* 200 topics; the drift rows and queries: 30 new ones */
+            i32 newt = (i >= n4 && i < n4 + nd) || i >= n4 + nd + nq4;
+            u32 tp = newt ? 1000u + sd_rng_(&s5) % 30u : sd_rng_(&s5) % 200u, s6 = 300u + tp;
+            f32 *v = i < n4 + nd ? x4 + (size_t)i * d4 : q4 + (size_t)(i - n4 - nd) * d4, nr = 0.0f;
+            for (j = 0; j < d4; ++j) { v[j] = sd_f_(&s6) + sd_f_(&s5) * 0.8f; nr += v[j] * v[j]; }
+            nr = 1.0f / (f32)sqrt((f64)nr);
+            for (j = 0; j < d4; ++j) v[j] *= nr;
+        }
+        vcol = tq_col_flat(x4, (size_t)d4 * sizeof(f32), &hv);
+        for (bits = 4; bits >= 2; bits -= 2) {
+            Tq *all = tq_build(&vcol, n4, d4, 7u, 0, 2, bits), *ivf = tq_build(&vcol, n40, d4, 7u, 60, 2, bits);
+            Tq *fl = tq_build(&vcol, n40 + 7, d4, 7u, 0, 2, bits);
+            TqAdd ta;
+            if (tq_add_prep(ivf, &vcol, n40, n4 - n40, 2, &ta) != 0 || tq_add_put(ivf, &ta, n40) != 0) ok = 0;
+            if (bits == 4) for (j = 0; j < ta.m; ++j) {          /* the closest centroid, by exact f32 scores */
+                tq_score_(x4 + (size_t)(n40 + j) * d4, ivf->ct, (ivf->nc + 15) / 16, d4, sc4);
+                inbest += tq_argmax_(sc4, ivf->nc) == ta.cl[j];
+            }
+            tq_add_free(&ta);
+            if (tq_add_prep(fl, &vcol, n40 + 7, n4 - n40 - 7, 2, &ta) != 0 || tq_add_put(fl, &ta, n40 + 7) != 0) ok = 0;
+            tq_add_free(&ta);
+            for (q = 0; q < 30; ++q) {
+                i32 ra[100], ri[100], rf[100], na, ni, nf, k, eq;
+                const f32 *qv = x4 + (size_t)(q * 797) * d4;
+                na = tq_search(all, qv, 100, ra, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 0);
+                ni = tq_search(ivf, qv, 100, ri, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, ivf->nc);
+                nf = tq_search(fl, qv, 100, rf, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 2, 0);
+                eq = na == ni && na == nf;
+                for (k = 0; k < na && eq; ++k) if (ra[k] != ri[k] || ra[k] != rf[k]) eq = 0;
+                same += eq; ++tot;
+            }
+            tq_search_many(ivf, x4 + (size_t)n40 * d4, 32, 100, mr, mc, (const u64 *)0, 2, 12);   /* queries: added rows */
+            for (q = 0; q < 32; ++q) {
+                i32 one[100], no = tq_search(ivf, x4 + (size_t)(n40 + q) * d4, 100, one, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 12), eq = no == mc[q], z;
+                for (z = 0; z < no && eq; ++z) if (one[z] != mr[(size_t)q * 100 + z]) eq = 0;
+                sameb += eq;
+            }
+            if (ivf->xn == 0 || fl->xn == 0 || ivf->n != n4 || fl->n != n4) ok = 0;
+            tq_free(all); tq_free(ivf); tq_free(fl);
+        }
+        print_cstr("  live: added rows == built rows (all clusters of built + added == flat of all, flat + added == flat of all) ");
+        print_i64(same); print_cstr("/"); print_i64(tot); print_cstr(", batch == one at a time "); print_i64(sameb);
+        print_cstr("/64, added rows in their closest cluster "); print_i64((i64)(1000L * inbest / (n4 - n40))); print_cstr("/1000\n");
+        if (same != tot || sameb != 64 || 1000L * inbest / (n4 - n40) < 990) ok = 0;
+
+        store_ivf_min_ = 2000;                                   /* IVF from 2000 rows, so a small store has clusters */
+        lv = store_new(a, d4);
+        store_set_target_recall(lv, 0.95f);
+        store_set_live(lv, 1, 1.0f);
+        ad4.s = lv; ad4.x = x4; ad4.dim = d4; ad4.from = 0; ad4.to = n4; ad4.id0 = 600000; ad4.done = 0;
+        pthread_create(&th, (const pthread_attr_t *)0, sd_adder_, &ad4);
+        while ((j = __atomic_load_n(&ad4.done, __ATOMIC_ACQUIRE)) < n4) {   /* every row added so far is found */
+            i64 r1[1]; f32 c1[1];
+            i32 row;
+            if (j == 0) continue;
+            row = (i32)(sd_rng_(&s5) % (u32)j);
+            if (store_search(lv, x4 + (size_t)row * d4, 1, r1, c1) < 1 || r1[0] != 600000 + row) ++miss;
+            ++looks;
+        }
+        pthread_join(th, (void **)0);
+        for (j = 0; j < 20000 && store_pending(lv) > 0; ++j) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 1000000L; nanosleep(&ts, (struct timespec *)0); }
+        store_set_live(lv, 0, 1.0f);                             /* stop the thread; settle by hand */
+        for (j = 0; j < 20 && store_maintain(lv); ++j) {}
+        store_live_stats(lv, &nidx, &nreb, &rbs);
+        rt = store_tuned_recall(lv);
+        r_live = sd_recall_(lv, x4, n4, d4, q4, nq4, 600000, (const u8 *)0);
+        print_cstr("  live store: "); print_i64(n4); print_cstr(" rows streamed in while searching - added rows found "); print_i64(looks - miss);
+        print_cstr("/"); print_i64(looks); print_cstr(", "); print_i64(nidx); print_cstr(" indexed as they came, "); print_i64(nreb);
+        print_cstr(" rebuilds, "); print_i64(lv->tq ? lv->tq->nc : 0); print_cstr(" clusters, tuned to "); print_i64((i64)(1000.0f * rt));
+        print_cstr("/1000, held-out recall@10 "); print_i64((i64)(1000.0f * r_live)); print_cstr("/1000\n");
+        if (miss || looks < 100 || store_pending(lv) != 0 || !lv->tq || lv->tq->nc <= 1 || nreb < 1 || rt < 0.95f || r_live < 0.92f) ok = 0;
+
+        for (i = 0; i < n4; i += 12) { store_delete(lv, 600000 + i); gone[i] = 1; }
+        r_live = sd_recall_(lv, x4, n4, d4, q4, nq4, 600000, gone);
+        if (store_save(lv, "/tmp/store_demo_live.vxi") != 0) ok = 0;
+        r_saved = sd_recall_(lv, x4, n4, d4, q4, nq4, 600000, gone);   /* compacted: the index followed its rows */
+        ld = store_load(a, "/tmp/store_demo_live.vxi");
+        if (!ld || !ld->tq || ld->tq->xn != 0 || ld->tq->n != store_count(ld) || store_pending(ld) != 0 || ld->tq->nprobe != lv->tq->nprobe) ok = 0;
+        else for (q = 0; q < nq4; ++q) {
+            i64 r1[10], r2[10]; f32 c1[10], c2[10];
+            i32 h1 = store_search(lv, q4 + (size_t)q * d4, 10, r1, c1), h2 = store_search(ld, q4 + (size_t)q * d4, 10, r2, c2), eq = h1 == h2, z;
+            for (z = 0; z < h1 && eq; ++z) if (r1[z] != r2[z]) eq = 0;
+            for (z = 0; z < h2; ++z) if (r2[z] >= 600000 && r2[z] < 600000 + n4 && gone[r2[z] - 600000]) eq = 0;
+            sameld += eq;
+        }
+        print_cstr("  deletes + save: recall@10 "); print_i64((i64)(1000.0f * r_live)); print_cstr(" -> "); print_i64((i64)(1000.0f * r_saved));
+        print_cstr(" after the compaction, loaded without a rebuild, same top-10 on "); print_i64(sameld); print_cstr("/"); print_i64(nq4); print_cstr("\n");
+        if (r_saved != r_live || sameld != nq4) ok = 0;
+
+        if (ld) {
+            store_live_stats(ld, (i64 *)0, &nreb0, (f64 *)0);
+            store_set_live(ld, 0, 0.0f);                         /* no rebuilds: just index the new rows */
+            for (i = n4; i < n4 + nd; ++i) store_add(ld, x4 + (size_t)i * d4, 600000 + i);
+            store_maintain(ld);
+            store_set_probe(ld, 8);
+            r_d0 = sd_recall_(ld, x4, n4 + nd, d4, qd, nq4, 600000, gone);
+            reasons = ld->drifted;
+            store_set_live(ld, 0, 1.0f);                         /* rebuilds allowed again */
+            did = store_maintain(ld);
+            store_live_stats(ld, (i64 *)0, &nreb, (f64 *)0);
+            r_d1 = sd_recall_(ld, x4, n4 + nd, d4, qd, nq4, 600000, gone);
+            print_cstr("  drift: "); print_i64(nd); print_cstr(" rows from 30 new topics -> "); print_i64(reasons);
+            print_cstr(" far windows, rebuilt "); print_i64(nreb - nreb0); print_cstr("x; recall@10 of their queries at 8 probes ");
+            print_i64((i64)(1000.0f * r_d0)); print_cstr(" -> "); print_i64((i64)(1000.0f * r_d1)); print_cstr("/1000\n");
+            if (reasons < 1 || !(did & 2) || nreb != nreb0 + 1 || r_d1 < r_d0 + 0.05f) ok = 0;
+            store_destroy(ld);
+        }
+        store_ivf_min_ = STORE_IVF_MIN;
+        store_destroy(lv);
+        remove("/tmp/store_demo_live.vxi"); remove("/tmp/store_demo_live.vxi.j");
+        free(mr); free(x4); free(q4); free(gone);
     }
 
     /* journal: base save, then only the changes are synced; a reload replays them (torn tail tolerated) */

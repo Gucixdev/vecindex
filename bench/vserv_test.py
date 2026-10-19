@@ -23,8 +23,8 @@ def check(cond, what):
         fails += 1
 
 
-def start():
-    p = subprocess.Popen([VSERV, "-s", SOCK, "-p", str(PORT), "-t", "2", "-d", str(DIM), "-x", STORE], stderr=subprocess.PIPE)
+def start(store=None, extra=()):
+    p = subprocess.Popen([VSERV, "-s", SOCK, "-p", str(PORT), "-t", "2", "-d", str(DIM), "-x", *extra, store or STORE], stderr=subprocess.PIPE)
     for _ in range(200):
         if os.path.exists(SOCK):
             try:
@@ -210,5 +210,26 @@ try:
 finally:
     p.send_signal(signal.SIGTERM)
     p.wait(timeout=30)
+# live mode (-L): rows added without any build get indexed by the server's own thread
+p = start(os.path.join(tmp, "live.vxi"), ("-L", "-r", "0.9"))
+try:
+    s = unix()
+    t0 = time.time()
+    for i in range(3000):
+        st, _, _ = bin_call(s, 2, 0, struct.pack("<q", 100000 + i) + struct.pack("<%df" % DIM, *vecs[i % N]))
+    st = {}
+    for _ in range(250):
+        code, st = http("GET", "/stats")
+        if st.get("pending") == 0 and st.get("built"):
+            break
+        time.sleep(0.02)
+    check(st.get("pending") == 0 and st.get("built") and st.get("count") == 3000,
+          "live (-L): 3000 adds, no build call -> indexed by the server in %.2fs %s" % (time.time() - t0, st))
+    st, hits = bin_search(s, vecs[1234], 1)
+    check(st == 0 and hits and hits[0][0] == 101234, "live (-L): search finds an added row %s" % (hits[:1],))
+finally:
+    p.send_signal(signal.SIGTERM)
+    p.wait(timeout=30)
+check(p.returncode == 0, "live (-L): clean exit with the live thread running")
 print("vserv:", "OK" if not fails else "%d FAILED" % fails)
 sys.exit(1 if fails else 0)
