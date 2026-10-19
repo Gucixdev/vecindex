@@ -15,8 +15,9 @@ It used to live in [holyc](https://github.com/Gucixdev/holyc) as `ragdb/`; its h
 
 ## Results
 
-Everything in this section was measured on one machine, in one session: 2 vCPUs of an Intel Xeon @ 2.80GHz (Cascade
-Lake: AVX-512 with VNNI, 1 MB of L2 per core, 33 MB of L3 shared), the shell's cgroup capped at 5.84 GiB, Linux 6.18.
+Everything in this section was measured on one kind of machine: 2 vCPUs of an Intel Xeon @ 2.80GHz (Cascade Lake:
+AVX-512 with VNNI, 1 MB of L2 per core, 33 MB of L3 shared), the shell's cgroup capped at 5.84 GiB, Linux 6.18 - the
+library comparison in one session, the live-ingest rows (`bench/live.c`) in a later one on the same kind of host.
 FAISS 1.15.1 (pip), turbovec 1.1.2, qdrant-edge-py 0.8.0 and vecindex (through a ctypes shim, `bench/vi.c`) all run
 through the same harness, `bench/bench.py`, so every library pays the same Python call per query.
 
@@ -69,6 +70,7 @@ Against the fastest other method at each recall:
 | load a saved index | 7-8 ms (mmap) | FAISS IVF-PQ 510 ms; turbovec 69-105 ms | **9-70x faster** |
 | memory | 153 B/vec (2-bit + int8 rows) to 475 (4-bit + f32 rows) | FAISS IVF-PQ 436; turbovec 30-56 (codes only) | 2.8x smaller than FAISS at recall 0.97; **turbovec is 2.7x smaller** but stops at recall 0.85 |
 | best recall@10 reached | 0.9884 | FAISS IVF-PQ 0.9785; turbovec 0.8465 | higher |
+| rows added after a build | coded into their clusters by the store's own thread (105k rows/s on one core); 0.85-0.99x a fresh build's QPS at equal recall; rebuilt off the lock when grown 2x, drifted or skewed | FAISS IVF: `add` codes into the trained lists, retraining is up to the caller; Qdrant: HNSW inserts, background optimizers | not compared here (only vecindex measured) |
 
 ### Scale: one 2-core box, a 5.84 GiB memory limit
 
@@ -93,15 +95,17 @@ Ordered by what the change bought, biggest first.
 | 1 | store rows in 65536-row column chunks, spilled to a file past 256 MB | ingest OOM-killed between 7M and 8M rows (d=128) -> 100M rows (d=96, compact mode) in the same 5.84 GiB | `bench/scale.c` |
 | 2 | load the saved index by mmap instead of rebuilding it | GloVe: 11.9 s -> 1-7 ms | `bench.py` load time |
 | 3 | `tq.c`: rotation + 4-bit fast-scan + exact re-score, replacing the IVF/q4 auto-tuner | 201k Wikipedia vectors: recall@10 76% -> 100%, build 70 s -> 1.1 s | `vcmp.c` (12-core box) |
-| 4 | this round (`5621db4`) as a whole: rows 5, 6 and 12 | old and new code side by side on one host: not measured yet | `bench.py` |
-| 5 | probes on int8 + VNNI, a reservoir instead of a heap, radix sort, prefetch two blocks ahead | one query, same probes: 390 -> 194 us (4-bit, probe 96), 378 -> 169 us (2-bit, probe 128); batch of 10k on 2 threads: 6.9k -> 11.3k and 6.7k -> 13.6k QPS | profiler, first host |
-| 6 | rows placed by their 4 closest top cells, 256 sample rows a centroid, one polish round | rows in the wrong cluster 24.4% -> 4.5%; true top 10 inside the 96 closest clusters 87.3% -> 90.0% of queries, 10% fewer rows scanned; build 2.0 -> 4.0 s | profiler, first host |
-| 7 | batch search, cluster by cluster | QPS at recall ~0.97 on 2 threads: 2183 -> 3194 | `bench.py`, first host |
-| 8 | 2-bit codes + int8 rows | 471 -> 150 B/vec for 1.5 recall points at the same probe | `bench.py`, first host |
-| 9 | vecdb: varint postings, 12-byte hash slots, a slab | 669 -> 392 B a note; 4M -> 8M notes in the cgroup | `vbench1m.c` |
-| 10 | threaded build: two-level k-means, AVX-512 scoring, encoding per block range | 1M rows: 7.6 -> 2.25 s | `bench/scale.c` |
-| 11 | AVX-512 scan kernel with the threshold test in registers, quickselect for the probes, rows prefetched for re-scoring | 1 thread: 344 -> 408 QPS at nprobe 96, 176 -> 245 at nprobe 192 (same recall) | `bench.py`, first host |
-| 12 | 8 queries per pass over the int8 centroids (batch) | probes cost a batched query 9 us (27-31 us for a query alone) | profiler, first host |
+| 4 | live mode: rows added after a build coded into their closest clusters, instead of waiting in the exact-scan tail | 40% of GloVe added after the build: 96 -> 5,393 QPS at recall@10 ~0.96 (56x) | `bench/live.c` |
+| 5 | a live rebuild running beside the indexing, catching up on new rows before the swap | rows streaming in at 50k/s, query p50 / p99 during the rebuild: 3.57 / 9.22 -> 0.68 / 4.76 ms | `bench/live.c` |
+| 6 | this round (`5621db4`) as a whole: rows 7, 8 and 14 | old and new code side by side on one host: not measured yet | `bench.py` |
+| 7 | probes on int8 + VNNI, a reservoir instead of a heap, radix sort, prefetch two blocks ahead | one query, same probes: 390 -> 194 us (4-bit, probe 96), 378 -> 169 us (2-bit, probe 128); batch of 10k on 2 threads: 6.9k -> 11.3k and 6.7k -> 13.6k QPS | profiler, first host |
+| 8 | rows placed by their 4 closest top cells, 256 sample rows a centroid, one polish round | rows in the wrong cluster 24.4% -> 4.5%; true top 10 inside the 96 closest clusters 87.3% -> 90.0% of queries, 10% fewer rows scanned; build 2.0 -> 4.0 s | profiler, first host |
+| 9 | batch search, cluster by cluster | QPS at recall ~0.97 on 2 threads: 2183 -> 3194 | `bench.py`, first host |
+| 10 | 2-bit codes + int8 rows | 471 -> 150 B/vec for 1.5 recall points at the same probe | `bench.py`, first host |
+| 11 | vecdb: varint postings, 12-byte hash slots, a slab | 669 -> 392 B a note; 4M -> 8M notes in the cgroup | `vbench1m.c` |
+| 12 | threaded build: two-level k-means, AVX-512 scoring, encoding per block range | 1M rows: 7.6 -> 2.25 s | `bench/scale.c` |
+| 13 | AVX-512 scan kernel with the threshold test in registers, quickselect for the probes, rows prefetched for re-scoring | 1 thread: 344 -> 408 QPS at nprobe 96, 176 -> 245 at nprobe 192 (same recall) | `bench.py`, first host |
+| 14 | 8 queries per pass over the int8 centroids (batch) | probes cost a batched query 9 us (27-31 us for a query alone) | profiler, first host |
 
 What gave the least (measured, then dropped): a second polish round (+0.1 recall points for +0.85 s of build), 8 top
 cells instead of 4 (+0.15 points, +32% build), checking each centroid's nearest neighbours after the assignment (no
@@ -120,6 +124,8 @@ Measured on this host unless noted; ordered by how much of a query (or a build) 
 | 4 | exact re-scoring reads R random rows of 400 bytes | 11-25 us a query at R = 128-256 (first host) | int8 rows: 104 bytes, about 1 recall point |
 | 5 | probe selection at 40000 clusters (100M rows) | 40000 x 96 int8 bytes a query | a two-level probe (top cells first) |
 | 6 | the Python call per query in the harness | the same few microseconds for every library | - |
+| 7 | live mode: an add burst faster than one core indexes (105k rows/s on GloVe at 2,772 clusters) waits in the exact-scan tail, which every query reads whole | p50 2.6 ms, p99 17 ms for the ~5 s after 473k rows came in at 440k rows/s | index a backlog on every core; make adds wait once the tail passes a bound |
+| 8 | a live rebuild is a whole rebuild: every row re-clustered, two indexes in RAM until the swap | GloVe: 8.7 s on one core, +59 MB; 100M rows: minutes and +2.4 GB | split and merge single clusters in place (SPFresh-style) instead |
 
 ### Reproduce
 
@@ -132,6 +138,8 @@ python3 bench/bench.py DATA_DIR vecindex --threads 2 --lat 1000          # also 
 (cd bench && gcc -std=gnu99 -O2 -march=native -I.. scale.c -lm -lpthread -o scale)
 bench/scale 100000000 96 --bits 2 --int8 --probe 1000,2000,4000,8000 --rerank 1000 --nq 100
 gcc -std=gnu99 -O2 -march=native -I. vbench1m.c -lm -lpthread -o .build/vbench1m && .build/vbench1m 8000000
+(cd bench && gcc -std=gnu99 -O2 -march=native -I.. live.c -lm -lpthread -o live)
+bench/live DATA_DIR full        # also: tail, stream 50000, stream, shift, drift (live ingest, below)
 ```
 
 ## Overview
@@ -152,12 +160,12 @@ section; run `./run` / `./run stress` / `./run bench` / `./run real_val` yoursel
 | area | status | evidence |
 |---|---|---|
 | Crash safety | atomic per-file + cross-file (generation-suffix) writes | `vcrash.c`/`vcrash2.c`, 25-90 rounds, always consistent |
-| Concurrency | one rwlock per layer, both TSan-clean | `vthreads.c`/`mthreads.c` in `./run` |
+| Concurrency | one rwlock per layer, TSan-clean, the store's live thread too | `vthreads.c`/`mthreads.c` and the store self-test under TSan in `./run` (it found two real races in live mode, fixed) |
 | Fuzzing | 3 fuzzers (parser, rule engine, malformed input) | `vfuzz.c`/`mrfuzz.c` - the rule-parser one found and fixed a real stack-overflow crash on its first run |
 | Adversarial stress | real invariant checks, not just "doesn't crash" | `stress.c`/`mstress.c` - found and fixed 5 real bugs this way |
 | Static analysis | clang analyzer + clang-tidy across the core, findings triaged not just counted | 2 real (currently-unreachable) issues fixed, the rest confirmed false-positive/non-actionable by hand-tracing, not dismissed on sight |
 | Scale | measured to the actual breaking point, not extrapolated | store: 100M vectors (d=96, 2-bit + int8) ingested, built and searched in a 5.84 GiB cgroup on 2 cores; the old store was OOM-killed between 7M and 8M. vecdb: 8M notes end to end where the old code died at ~4M (see Results) |
-| Server | `vserv.c`: epoll, Unix + TCP, HTTP/1.1 + binary, TLS 1.2 (BearSSL), mutual TLS | `bench/vserv_test.py` (26 checks) and `bench/vserv_tls_test.py` (22 checks) in `./run` |
+| Server | `vserv.c`: epoll, Unix + TCP, HTTP/1.1 + binary, TLS 1.2 (BearSSL), mutual TLS | `bench/vserv_test.py` (29 checks) and `bench/vserv_tls_test.py` (22 checks) in `./run` |
 | Retrieval quality | a real SQuAD-based benchmark, not hand-labeled questions | `real_val.c`: gold@10 up to 85.6%, vs an 87.1% ceiling for this embedder (measured directly) - the ANN index is near-lossless relative to what the embedder allows |
 | Reranking | a real cross-encoder second pass, with a measured effect | `rerank.c`: MRR 0.751->0.887, gold@1 62.1%->81.5% on the subset where it has room to help |
 | Independent review | **not done** | every test here was written and run by the same person who wrote the code - real bugs were still found this way, but this is not the same claim as external review |
@@ -175,6 +183,7 @@ The store is opened with `store_load` (mmap), so a 100M-row file is ready in mil
 ```sh
 ./run                                    # builds .build/vserv (BearSSL into .build/libbearssl.a first)
 .build/vserv -s /run/vx.sock -p 8077 -t 2 -x docs.vxi            # Unix socket (0600) + TCP on 127.0.0.1
+.build/vserv -p 8077 -L -r 0.95 -x docs.vxi                      # live: adds indexed as they come, no /build
 .build/vserv -p 8443 -c cert.pem -k key.pem [-a clients-ca.pem] [-T] docs.vxi   # TLS, optional mutual TLS
 curl -s localhost:8077/stats
 curl -s -X POST 'localhost:8077/search?k=5' -d '[0.1, 0.2, ...]'
@@ -195,8 +204,11 @@ requires client certificates (mutual TLS). TLS is sniffed per connection (`0x16`
 Measured: 2.4 MB idle RSS; 4.2 KB per open plaintext connection, 20.7 KB per TLS connection (300 open). From
 Python clients on 2 cores: ~15-19k searches/s plaintext, ~10.7k over TLS on the first 2-core host; 8.9-10.6k and
 5.7-7.5k on the Cascade Lake host of the Results section (2k rows; the Python clients are the bottleneck).
-`bench/vserv_test.py` (26 checks: both protocols, both sockets, pipelining, a request trickled byte by byte,
-oversized and malformed input, 8 concurrent clients, SIGTERM saves, restart) and `bench/vserv_tls_test.py` (22
+`-L` puts the store in live mode (added rows are indexed by the server's own thread and the index is rebuilt in the
+background as it ages - no `/build` calls) and `-r 0.95` keeps recall@10 at 0.95 (the probes tuned on the queries it
+answers); see "Live ingest" below. `bench/vserv_test.py` (29 checks: both protocols, both sockets, pipelining, a
+request trickled byte by byte, oversized and malformed input, 8 concurrent clients, SIGTERM saves, restart, live mode:
+3000 adds over the socket and no build call, indexed by the server in 0.19 s) and `bench/vserv_tls_test.py` (22
 checks: resumption on every reconnect, multi-record replies, plaintext refused, untrusted CA, mTLS accept/reject,
 RSA key, curl, TLS on the Unix socket) run in `./run`.
 
@@ -489,6 +501,63 @@ settles on is saved with the index. GloVe-100, `bench/tune.c`, on the Cascade La
 
 A tuning costs about 2 s on GloVe, most of it the exact search for the truth; on bigger stores it uses fewer
 queries (at most ~3e10 multiply-adds). The self-test checks it on held-out queries too.
+
+### Live ingest: rows indexed as they come, the index rebuilt as it ages
+
+`store_set_live(s, 1, 1.0f)` (or `vserv -L`) and nobody has to call `store_build` again:
+
+- A thread of the store's own codes every added row into its closest cluster, 4096 rows at a time: coded off the
+  lock, placed under the write lock. The rotation and the 4-bit codebook need no training, so an added row gets the
+  same codes a build would give it (the self-test checks it: built + added rows probed over every cluster == a flat
+  scan of all of them). Until a row is indexed, the exact scan of the pending tail finds it, as before.
+- It rebuilds the index when it has aged: grown by `grow` since the last build (1.0 = doubled), a window of new rows
+  sitting 1.25x farther from their centroids than the built rows did (the data moved), the cluster sizes 1.2x more
+  uneven than at the build (new rows piling into a few clusters), or a quarter of it deleted. The rebuild runs beside
+  the indexing, catches up on the rows that came in meanwhile and is swapped in under the write lock; searches use
+  the old index until then. With a target recall set (`store_set_target_recall`) it re-tunes after each rebuild.
+- Background work takes half the cores. `store_maintain` runs one step by hand, `store_live_stats` reports.
+- Deletes no longer cost the saved index: the compaction renumbers the rows inside it, `store_save` writes added rows
+  in the plain layout, and a load is still an mmap.
+
+GloVe-100, `bench/live.c`, on the Cascade Lake host of the Results section. QPS: one batch of the 10k queries on 2
+threads at the fastest probe count that reaches the recall (the same index measured twice differs by up to 10%):
+
+| what the index holds | recall@10 >= 0.85 | >= 0.90 | >= 0.95 | >= 0.97 |
+|---|---:|---:|---:|---:|
+| one build over all 1,183,514 rows | 13,800 | 10,430 | 6,229 | 4,292 |
+| 60% built, the other 40% added live | 13,707 (0.99x) | 8,858 (0.85x) | 5,745 (0.92x) | 3,806 (0.89x) |
+| 74% built, 26% from regions the build never saw added live | 12,803 (0.93x) | 8,723 (0.84x) | 5,694 (0.91x) | 3,712 (0.86x) |
+| 60% built, the 40% leaning one direction added live | 10,105 (0.73x) | 6,820 (0.65x) | 4,943 (0.79x) | 3,175 (0.74x) |
+| the same after the rebuild live mode chose on its own (skew 1.51, 1.13 at the build) | 14,928 (1.08x) | 10,151 (0.97x) | 6,305 (1.01x) | 3,900 (0.91x) |
+
+Before live mode the same 40% waited in the exact-scan tail: 96 QPS at recall@10 0.9589, against 5,393 at 0.9608
+with them indexed (56x). Indexing them took 4.5 s on one core (105k rows/s).
+
+Searching while rows stream in: one query at a time on one thread, 473k rows added by another thread at 50k rows/s,
+live mode with rebuilds at +50%:
+
+| phase | queries | p50 | p99 | max |
+|---|---:|---:|---:|---:|
+| idle, before | 3,000 | 0.42 ms | 0.71 ms | 4.7 ms |
+| rows streaming in, indexed as they come | 10,517 | 0.61 ms | 2.63 ms | 15.6 ms |
+| the rebuild live mode started at +50% (8.7 s) | 9,976 | 0.73 ms | 4.40 ms | 11.1 ms |
+| after | 1,692 | 0.58 ms | 0.83 ms | 1.7 ms |
+
+Before the rebuild ran beside the indexing (rows arriving meanwhile waited in the exact tail): p50 3.57 ms, p99 9.22
+ms during it and p50 1.23 ms right after. A burst at full speed - 473k rows in 1.07 s, four times faster than one core
+indexes - still fills the tail: p50 2.60 ms, p99 17.3 ms for the ~5 s until it is indexed.
+
+Which signal fires where, measured: new rows drawn like the old ones leave the cluster-size skew where it was (1.142
+-> 1.152); rows from 8 held-out Voronoi regions (26% of GloVe) raise it from 1.147 to 1.229 and sit only 3.6% farther
+from their centroids - in 100 dimensions the remaining centroids still cover them, no rebuild is due, and the table
+above shows they cost about what random rows do; rows leaning one direction raise it to 1.509, and live mode rebuilds.
+On the self-test's 32-dimensional topics, rows from 30 new topics sit far from every centroid: two far windows, one
+rebuild, recall@10 of their queries at 8 probes 0.763 -> 0.953.
+
+Costs and limits: a rebuild holds the old and the new index at once (GloVe, 4-bit: +59 MB of codes; 100M rows, 2-bit:
++2.4 GB, too much for the 5.84 GiB box of the 100M run - keep `grow` at 0 there); rebuilding 100M rows takes minutes
+(the build alone was 225 s); a burst faster than one core indexes waits in the exact tail; the growth and skew
+baselines start over when a store is loaded.
 
 ### Scale: rows in chunks, past RAM
 

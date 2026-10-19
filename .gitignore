@@ -7,3 +7,5 @@ bench/libvi.so
 bench/.venv/
 bench/data/
 bench/scale
+bench/live
+bench/tune
