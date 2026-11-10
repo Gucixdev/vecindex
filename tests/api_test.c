@@ -188,6 +188,37 @@ int main(void)
         vec_(17, v);
         k = vi_search_hybrid(db, v, (const char *)0, 0, 3, ids, s2);
         check(k == 3 && ids[0] == (((vi_i64)2 << 20) | 1), "vi_search_hybrid with the vector only");
+        {
+            vi_i64 all[40], best[5], gi[10];
+            float as[40], gs[10];
+            int na, j, ok = 1;
+            for (j = 0; j < 5; ++j) best[j] = -1;
+            na = vi_search(db, v, 40, all, as);                      /* every row ranked: each document's first hit */
+            for (j = 0; j < na; ++j) if (best[all[j] >> 20] < 0) best[all[j] >> 20] = all[j];
+            k = vi_search_grouped(db, v, 3, 20, gi, gs);
+            for (j = 0; j < k; ++j) ok &= gi[j] == best[gi[j] >> 20] && (j == 0 || gs[j] <= gs[j - 1]);
+            check(na == 40 && k == 3 && gi[0] == (((vi_i64)2 << 20) | 1) && ok && (gi[0] >> 20) != (gi[1] >> 20)
+                  && (gi[0] >> 20) != (gi[2] >> 20) && (gi[1] >> 20) != (gi[2] >> 20),
+                  "vi_search_grouped 3, shift 20: three documents, each by its best chunk, best first");
+            k = vi_search_grouped(db, v, 10, 20, gi, gs);
+            for (j = 0, ok = 1; j < k; ++j) ok &= gi[j] == best[gi[j] >> 20];
+            check(k == 5 && ok, "vi_search_grouped 10 over 5 documents: the 5, each once");
+            check(vi_search_grouped(db, v, 3, 0, gi, gs) == 3 && gi[0] == all[0] && gi[1] == all[1], "vi_search_grouped shift 0: vi_search");
+            check(vi_search_grouped(db, v, 3, 64, gi, gs) == -1 && strstr(vi_error(), "shift") != 0, "vi_search_grouped shift 64: refused");
+        }
+        {   /* one document crowds the top: 600 chunks next to the query, three more documents further off */
+            vi_db *m = vi_open((const char *)0, DIM, 0);
+            vi_i64 gi[4];
+            float gs[4], q[DIM];
+            int j, d;
+            vec_(5000, q);
+            for (j = 0; m && j < 600; ++j) { for (d = 0; d < DIM; ++d) w[d] = q[d] + 0.001f * (float)(j % 7) * (d == j % DIM); vi_add(m, j, w); }
+            for (j = 1; m && j <= 3; ++j) { vec_(5000 + j, w); for (d = 0; d < DIM; ++d) w[d] = 0.5f * w[d] + 0.5f * q[d]; vi_add(m, ((vi_i64)j << 20) | 3, w); }
+            k = m ? vi_search_grouped(m, q, 4, 20, gi, gs) : 0;
+            check(k == 4 && (gi[0] >> 20) == 0 && gi[1] != gi[2] && (gi[1] & 0xfffff) == 3 && (gi[2] & 0xfffff) == 3 && (gi[3] & 0xfffff) == 3,
+                  "vi_search_grouped: past a document of 600 chunks to the next three");
+            if (m) vi_close(m);
+        }
         check(vi_add_text(db, ((vi_i64)2 << 20) | 5, v, "replaced text", -1) == 0 && vi_get_text(db, ((vi_i64)2 << 20) | 5, buf, (int)sizeof(buf)) == 13,
               "vi_add_text replaces the text with the row");
         vi_close(db);

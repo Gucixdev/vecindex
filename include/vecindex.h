@@ -182,6 +182,13 @@ VI_API int vi_search_tagged(vi_db *db, const float *query, int k, vi_i64 all, vi
  * such search builds the word index over every text; later writes keep it current. */
 VI_API int vi_search_hybrid(vi_db *db, const float *query, const char *text, int tlen, int k, vi_i64 *ids, float *scores);
 
+/* vi_search with at most one hit a group, the group of an id being id >> shift (unsigned): with ids made as
+ * doc << 20 | chunk, shift 20 gives the best chunk of each of the k nearest documents instead of k chunks of one.
+ * shift 0: every id its own group, as vi_search. Hits best first, scores as vi_search; returns how many groups were
+ * found (fewer than k when the store has fewer, or when the 65536 nearest rows hold fewer), or -1 (as vi_search, or
+ * a shift outside 0-63). */
+VI_API int vi_search_grouped(vi_db *db, const float *query, int k, int shift, vi_i64 *ids, float *scores);
+
 /* nq queries (queries: nq x dim) on up to threads threads (0: every core); ids and scores (cosines) get k slots a
  * query, a missing hit has id -1 and score -1. 0, or -1 when an argument or a query is wrong. */
 VI_API int vi_search_batch(vi_db *db, const float *queries, int nq, int k, vi_i64 *ids, float *scores, int threads);

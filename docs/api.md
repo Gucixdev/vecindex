@@ -58,6 +58,7 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_label(db, name, parent)`, `vi_label_add(db, id, labels)`, `vi_label_remove(db, id, labels)`, `vi_search_labeled(db, q, k, all, any, none, ids, scores)` | labels in a hierarchy on rows, and a search over every label of `all`, one of `any`, none of `none` |
 | `vi_search(db, q, k, ids, scores)` | the k nearest rows, best first |
 | `vi_search_tagged(db, q, k, all, any, ids, scores)` | the same over rows whose tag has every bit of `all` and one of `any` |
+| `vi_search_grouped(db, q, k, shift, ids, scores)` | at most one hit a group (`id >> shift`): with `shift` 20 and ids `doc << 20 \| chunk`, the best chunk of each of the k nearest documents |
 | `vi_search_batch(db, qs, nq, k, ids, scores, threads)` | many queries on several threads |
 | `vi_build(db)` | builds the index (searches before it scan the new rows exactly) |
 | `vi_set_recall(db, target)` | keeps recall@10 at `target`: every build picks the fewest probes that reach it |
@@ -202,7 +203,9 @@ with P/Invoke, Zig with `@cImport`, Lua with LuaJIT's FFI); those were not run h
 
 A model answers better from a whole passage than from the sentence that matched, and an embedding matches a short
 chunk better than a long one. So keep both: one row per small chunk, its text beside it, and an id that names the
-document - `doc << 20 | chunk` - so the chunks around a hit, or all of them, come back with one `vi_range`.
+document - `doc << 20 | chunk` - so the chunks around a hit, or all of them, come back with one `vi_range`. When one
+document holds many close chunks, `vi_search_grouped(db, q, k, 20, ids, scores)` returns k documents, each by its
+best chunk, instead of k chunks of the same one.
 
 ```c
 #include "vecindex.h"
