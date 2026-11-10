@@ -104,6 +104,11 @@ VI_API vi_i64 vi_count(vi_db *db);
  * out. */
 VI_API int vi_add(vi_db *db, vi_i64 id, const float *vec);
 
+/* A new vector for the row with this id - a document embedded again by a new model - that keeps the rest of it: the
+ * tag, labels, number and text stay (vi_add starts the row over). One change, journaled as one record. 0, or -1 when
+ * there is no such row (vi_error() says so), the vector is refused as vi_add refuses it, or memory ran out. */
+VI_API int vi_update(vi_db *db, vi_i64 id, const float *vec);
+
 /* vi_add for n rows (vecs: n x dim, row after row); returns how many went in. When some were refused, vi_error()
  * names the first: "row 17 (id 9042): the vector has a NaN ...". */
 VI_API int vi_add_batch(vi_db *db, int n, const vi_i64 *ids, const float *vecs);
@@ -141,6 +146,7 @@ VI_API int vi_range(vi_db *db, vi_i64 lo, vi_i64 hi, vi_i64 *ids, int max);
 typedef struct vi_batch vi_batch;
 VI_API vi_batch *vi_batch_begin(vi_db *db);
 VI_API int vi_batch_add(vi_batch *b, vi_i64 id, const float *vec);
+VI_API int vi_batch_update(vi_batch *b, vi_i64 id, const float *vec);   /* vi_update; an id with no row by then: nothing */
 VI_API int vi_batch_add_text(vi_batch *b, vi_i64 id, const float *vec, const char *text, int len);
 VI_API int vi_batch_delete(vi_batch *b, vi_i64 id);
 VI_API int vi_batch_delete_range(vi_batch *b, vi_i64 lo, vi_i64 hi);

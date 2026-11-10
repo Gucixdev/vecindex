@@ -48,6 +48,7 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_open(path, dim, flags)` | opens the store in `path`, or creates it with `dim` dimensions; `path` NULL: in memory; `flags` `VI_LIVE` indexes added rows as they come |
 | `vi_close(db)` | flushes the journal to the disk and frees the handle |
 | `vi_add(db, id, vec)`, `vi_add_batch(db, n, ids, vecs)` | adds rows, or replaces the row with that id (one change: a crash leaves the old row or the new one); a vector with a NaN or an infinity is refused |
+| `vi_update(db, id, vec)`, `vi_batch_update(b, id, vec)` | a new vector for the row - re-embedded by a new model - that keeps its tag, labels, number and text (`vi_add` starts the row over); one journal record |
 | `vi_delete(db, id)` | removes the row with this id |
 | `vi_delete_range(db, lo, hi)` | removes every row with an id in `[lo, hi]`: all the chunks of a document when ids are `doc << 20 \| chunk` |
 | `vi_get(db, id, out)` | the stored, unit-normalised vector |

@@ -516,6 +516,50 @@ int main(void)
         remove(fn); remove(jn);
     }
 
+    /* vi_update: a new vector, the tag, number and text kept - live, through the journal, a batch and a save */
+    {
+        char fn[64], jn[72], tb[32];
+        vi_i64 tag = 0, num = 0;
+        float g[DIM];
+        int pass, ok, j, k;
+        vi_batch *b;
+        sprintf(fn, "/tmp/vecindex_api_upd_%d.vxi", (int)getpid());
+        sprintf(jn, "%s.j", fn);
+        db = vi_open(fn, DIM, 0);
+        for (i = 0; db && i < 200; ++i) { vec_(i, v); vi_add(db, i, v); }
+        vec_(900, v);
+        if (db) { vi_add_text(db, 5, v, "zebra quartz", -1); vi_set_tag(db, 5, 0x50); vi_set_num(db, 5, 1999); }
+        vec_(901, w);
+        check(db && vi_update(db, 5, w) == 0 && vi_update(db, 4444, w) == -1 && strstr(vi_error(), "4444") != 0,
+              "vi_update of a row, and of no row: -1 naming the id");
+        for (pass = 0; pass < 3; ++pass) {                       /* live, after a reopen (journal), after save + reopen */
+            ok = db && vi_get(db, 5, g) == 0 && vi_count(db) == 200 && vi_get_tag(db, 5, &tag) == 0 && tag == 0x50
+                 && vi_get_num(db, 5, &num) == 0 && num == 1999 && vi_get_text(db, 5, tb, sizeof tb) == 12 && !memcmp(tb, "zebra quartz", 12);
+            {   double dw = 0.0, ww = 0.0;                       /* the new vector: a cosine store keeps its direction */
+                for (j = 0; j < DIM; ++j) { dw += (double)g[j] * w[j]; ww += (double)w[j] * w[j]; }
+                ok &= dw / sqrt(ww) > 0.999;
+            }
+            k = db ? vi_search_hybrid(db, (const float *)0, "quartz", -1, 1, got, sc) : 0;
+            ok &= k == 1 && got[0] == 5;
+            k = db ? vi_search_range(db, w, 1, 1999, 1999, got, sc) : 0;
+            ok &= k == 1 && got[0] == 5;
+            check(ok, pass == 0 ? "vi_update: the new vector, tag, number and text kept, found by words and range"
+                      : (pass == 1 ? "vi_update after a reopen: the journal replayed it" : "vi_update after a save and a reopen"));
+            if (db) { if (pass == 1) vi_save(db, (const char *)0); vi_close(db); }
+            db = vi_open(fn, 0, 0);
+        }
+        b = db ? vi_batch_begin(db) : (vi_batch *)0;
+        vec_(902, w);
+        vec_(903, g);
+        check(b && vi_batch_add(b, 300, g) == 0 && vi_batch_update(b, 300, w) == 0 && vi_batch_update(b, 5, g) == 0
+              && vi_batch_update(b, 7777, g) == 0 && vi_batch_commit(b, 1) == 4, "vi_batch_update: on a row the batch adds, a row the store has, a missing id");
+        check(db && vi_count(db) == 201 && vi_get_tag(db, 5, &tag) == 0 && tag == 0x50 && vi_get_num(db, 5, &num) == 0 && num == 1999
+              && vi_search(db, g, 1, got, sc) == 1 && got[0] == 5 && vi_search(db, w, 1, got, sc) == 1 && got[0] == 300,
+              "the batch's updates are in, the row's tag and number kept");
+        if (db) vi_close(db);
+        remove(fn); remove(jn);
+    }
+
     /* shards: rows split over three stores of a directory, one search over all of them, the same hits as one store */
     {
         char dp[64], fp[96];

@@ -108,6 +108,13 @@ i32 store_batch_put(StoreWb *b, const f32 *vec, i64 id, i64 meta)
     return store_batch_row_(b, 'P', vec, id, meta, 0);
 }
 
+/* A new vector for id, its tag, number and text kept (store_update) - on the row the batch added before it, or the
+ * row the store has; an id with neither by then is left alone */
+i32 store_batch_update(StoreWb *b, const f32 *vec, i64 id)
+{
+    return store_batch_row_(b, 'U', vec, id, 0, 0);
+}
+
 /* The same with a text (len 0: none; at most STORE_TXMAX bytes) */
 i32 store_batch_put_text(StoreWb *b, const f32 *vec, i64 id, i64 meta, const char *text, i32 len)
 {
@@ -157,7 +164,7 @@ static size_t store_batch_reclen_(const RagStore *s, const u8 *r)
     u32 n;
     if (r[0] == 'D') return 9;
     if (r[0] == 'R' || r[0] == 'N') return 17;
-    if (r[0] == 'P') return 17 + vb;
+    if (r[0] == 'P' || r[0] == 'U') return 17 + vb;
     memcpy(&n, r + 17 + vb, 4);                                  /* 'Q' */
     return 21 + vb + n;
 }
@@ -271,6 +278,7 @@ i32 store_batch_commit(StoreWb *b, i32 sync)
             continue;
         }
         memcpy(b->tmp, r + 17, vb);                              /* aligned for the row code */
+        if (r[0] == 'U') { store_update_locked_(s, b->tmp, id); continue; }
         store_kill_id_locked_(s, id);
         store_append_locked_(s, b->tmp, id, meta);
         if (r[0] == 'Q') {

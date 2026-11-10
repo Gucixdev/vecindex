@@ -1268,7 +1268,7 @@ static void store_jrec_(RagStore *s, u8 op, i64 id, i64 meta, const f32 *vec)
     i32 np = 0;
     pt[np] = &op; pl[np++] = 1; pt[np] = &id; pl[np++] = 8;
     if (op != 'D') { pt[np] = &meta; pl[np++] = 8; }
-    if (op == 'A' || op == 'P') { pt[np] = vec; pl[np++] = sizeof(f32) * (size_t)s->dim; }
+    if (op == 'A' || op == 'P' || op == 'U') { pt[np] = vec; pl[np++] = sizeof(f32) * (size_t)s->dim; }
     store_jframe_(s, pt, pl, np);
 }
 
@@ -1349,6 +1349,41 @@ i32 store_put(RagStore *s, const f32 *vec, i64 doc_id, i64 meta)
     store_jrec_(s, 'P', doc_id, meta, s->addbuf);
     pthread_rwlock_unlock(&s->lock);
     return 0;
+}
+
+/* A new vector for doc_id, the rest of the row kept: the newest live row's tag (labels with it), number and text go
+ * to the new row, every row with doc_id goes. The text is not copied - the new row points at the same bytes, and the
+ * word index, keyed by the id, stays as it is. Under the write lock, vec finite; 0, or -1: no live row with doc_id,
+ * a damaged one, or no memory (nothing changed). The caller journals it. */
+static i32 store_live_row_(const RagStore *s, i64 doc_id);
+static i32 store_update_locked_(RagStore *s, const f32 *vec, i64 doc_id)
+{
+    i32 r = store_live_row_(s, doc_id), q, n;
+    i64 meta, num;
+    u64 txo;
+    if (r < 0 || store_row_bad_(s, r)) return -1;
+    meta = STORE_META(s, r);
+    num = s->has_num ? STORE_NUM(s, r) : 0;
+    txo = s->has_text ? STORE_TXO(s, r) : 0;
+    if (store_reserve_(s, (i64)s->count + 1) != 0) return -1;   /* before the kill */
+    for (q = store_find_(s, doc_id); q >= 0; q = store_prev_(s, q))
+        if (!STORE_DEAD(s, q)) { STORE_KILL(s, q); --s->live; ++s->mods; if (q != r) store_tx_drop_(s, q); }
+    store_append_locked_(s, vec, doc_id, meta);
+    n = s->count - 1;
+    if (txo) STORE_TXO(s, n) = txo;                              /* txlive and the word index: unchanged */
+    if (num) { STORE_NUM(s, n) = num; STORE_RCK(s, n) = store_rck_row_(s, n); }
+    return 0;
+}
+i32 store_update(RagStore *s, const f32 *vec, i64 doc_id)
+{
+    i32 rc;
+    if (!store_finite_(vec, s->dim)) return -1;
+    pthread_rwlock_wrlock(&s->lock);
+    store_idmap_locked_(s);
+    rc = store_update_locked_(s, vec, doc_id);
+    if (rc == 0) store_jrec_(s, 'U', doc_id, 0, s->addbuf);
+    pthread_rwlock_unlock(&s->lock);
+    return rc;
 }
 
 i32 store_delete(RagStore *s, i64 doc_id)

@@ -142,9 +142,9 @@ static i32 store_jrec_play_(RagStore *s, FILE *f, u8 op, f32 *vec, char **txt, i
         }
         if (n && fread(*txt, 1, (size_t)n, f) != (size_t)n) return -1;
         store_put_text(s, vec, id, meta, *txt, (i32)n);
-    } else if (op == 'A' || op == 'P') {
+    } else if (op == 'A' || op == 'P' || op == 'U') {
         if (fread(&id, 8, 1, f) != 1 || fread(&meta, 8, 1, f) != 1 || fread(vec, sizeof(f32), (size_t)s->dim, f) != (size_t)s->dim) return -1;
-        if (op == 'A') store_add_meta(s, vec, id, meta); else store_put(s, vec, id, meta);
+        if (op == 'A') store_add_meta(s, vec, id, meta); else if (op == 'U') store_update(s, vec, id); else store_put(s, vec, id, meta);
     } else if (op == 'D') {
         if (fread(&id, 8, 1, f) != 1) return -1;
         store_delete(s, id);

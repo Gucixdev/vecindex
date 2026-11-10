@@ -28,7 +28,8 @@ Done and tested since 2026-11-10 (`./run`, 28 steps passing on a 2-vCPU Xeon): g
 the best hit of each `id >> shift` group: one chunk a document), a 64-bit number a row with range filters tested in
 the scan (`vi_set_num`, `vi_search_range`, `vi_batch_set_num`; in the file, the journal and the row checks;
 `tests/store_test.c` finds 5-row ranges anywhere in an IVF store, and a mutation of the scan's range test fails it),
-shards (`vi_dir_search`, the hits of one store with every row, from three).
+shards (`vi_dir_search`, the hits of one store with every row, from three), `vi_update` (a new vector, the
+tag, number and text kept, through the journal, a batch and a save).
 
 Open:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a

@@ -292,6 +292,13 @@ VI_API int vi_add(vi_db *db, vi_i64 id, const float *vec)
     return store_put(db->s, vec, (i64)id, 0) == 0 ? 0 : vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
 }
 
+VI_API int vi_update(vi_db *db, vi_i64 id, const float *vec)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (vi_vec_ok_(db, vec, "the vector")) return -1;
+    return store_update(db->s, vec, (i64)id) == 0 ? 0 : vi_norow_(db, id);
+}
+
 VI_API int vi_add_batch(vi_db *db, int n, const vi_i64 *ids, const float *vecs)
 {
     int i, ok = 0, first = 1;
@@ -419,6 +426,15 @@ VI_API int vi_batch_add(vi_batch *b, vi_i64 id, const float *vec)
     t.s = b->w.s;
     if (vi_vec_ok_(&t, vec, "the vector")) { b->w.bad = 1; { char *e = vi_ebuf_(); if (e && strlen(e) + strlen(VI_BADB) < VI_EMAX) strcat(e, VI_BADB); } return -1; }
     return store_batch_put(&b->w, vec, (i64)id, 0) == 0 ? 0 : vi_fail_(-1, "out of memory, or the batch is over 1 GB", VI_BADB, (const char *)0);
+}
+
+VI_API int vi_batch_update(vi_batch *b, vi_i64 id, const float *vec)
+{
+    vi_db t;
+    if (!b) return vi_fail_(-1, VI_NOB, (const char *)0, (const char *)0);
+    t.s = b->w.s;
+    if (vi_vec_ok_(&t, vec, "the vector")) { b->w.bad = 1; { char *e = vi_ebuf_(); if (e && strlen(e) + strlen(VI_BADB) < VI_EMAX) strcat(e, VI_BADB); } return -1; }
+    return store_batch_update(&b->w, vec, (i64)id) == 0 ? 0 : vi_fail_(-1, "out of memory, or the batch is over 1 GB", VI_BADB, (const char *)0);
 }
 
 VI_API int vi_batch_add_text(vi_batch *b, vi_i64 id, const float *vec, const char *text, int len)
