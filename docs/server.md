@@ -50,12 +50,28 @@ range 7340032 8388607                              ok 1 7340032
 words 3 oxidised                                   ok 1 7340032 0.049180
 ```
 
+Grouped search, numbers and updates (see [api.md](api.md)): `group K SHIFT X1 .. XD` gives one hit an `id >> SHIFT`
+group - with ids `doc << 20 | chunk`, `group 10 20 ...` is the best chunk of 10 documents; `num ID N` sets a row's
+number (a time, a price) and `num ID` reads it; `between K LO HI X1 .. XD` searches the rows whose number is in
+`[LO, HI]`; `update ID X1 .. XD` gives a row a new vector and keeps its tag, number and text. In a batch, `num` and
+`update` wait like `add` (`ok queued`).
+
+```
+num 7340032 1731250000                             ok
+between 5 1731000000 1732000000 1 0 0 0            ok 1 7340032 1.000000
+group 3 20 1 0 0 0                                 ok 1 7340032 1.000000
+update 7340032 0.9 0.1 0 0                         ok
+```
+
 **Binary** (`0xB5` first): little-endian frames, nothing to parse - `u8 0xB5, u8 op, u16 k, u32 nbytes, payload`.
 Ops: 1 search, 2 add, 3 delete, 4 build, 5 save, 6 stats, 7 snapshot, 8 get, 9 delete a range of ids, 10 add with a
-text, 11 get a text, 12 the ids in a range, 13 hybrid search.
+text, 11 get a text, 12 the ids in a range, 13 hybrid search, 14 use a tenant, 15 grouped search (`u32 shift`, then
+the vector), 16 a number range (`i64 lo, i64 hi`, then the vector), 17 update (`i64 id`, then the vector), 18 set a
+number (`i64 id, i64 number`), 19 get a number (`i64 id`, reply `i64`).
 
 **HTTP/1.1** (anything else): `GET /health`, `GET /stats`, `GET /get?id=N`, `GET /text?id=N`,
-`GET /range?lo=&hi=&max=`, `POST /search?k=`, `/hybrid?k=`, `/add?id=`, `/delete?id=` or `/delete?lo=&hi=`, `/build`,
+`GET /range?lo=&hi=&max=`, `GET /num?id=`, `POST /search?k=` (with `&group=SHIFT` one hit a group, with `&lo=&hi=`
+the rows whose number is in the range), `/hybrid?k=`, `/update?id=`, `/num?id=&num=`, `/add?id=`, `/delete?id=` or `/delete?lo=&hi=`, `/build`,
 `/save`, `/snapshot`; vectors as a JSON array or raw little-endian f32 (an add's text after the floats), or
 `{"vector": [...], "text": "..."}` for an add with a text and for `/hybrid` (either key); keep-alive, pipelining. The header scan looks for the blank line 16 bytes at a time with SSE2 (the picohttpparser
 idea, cut down to what this server needs).

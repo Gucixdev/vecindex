@@ -168,3 +168,13 @@ i32 store_search_cnf(RagStore *s, const f32 *query, i32 k, i64 *out_doc_ids, f32
     if (!store_finite_(query, s->dim)) return 0;                 /* as store_search */
     return store_search_impl_(s, query, k, out_doc_ids, out_scores, 0, c->n ? (i64)c->any[0] : 0, 1, c);
 }
+
+/* store_search over the rows whose number is in [lo, hi] (every row's is 0 in a store without numbers) */
+i32 store_search_num(RagStore *s, const f32 *query, i32 k, i64 lo, i64 hi, i64 *ids, f32 *scores)
+{
+    StoreCnf c;
+    if (lo > hi) return 0;
+    memset(&c, 0, sizeof(c));
+    c.num = 1; c.lo = lo; c.hi = hi;
+    return store_search_cnf(s, query, k, ids, scores, &c);
+}

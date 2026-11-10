@@ -392,6 +392,106 @@ int main(int argc, char **argv)
         stop(p, SIGTERM);
     }
 
+    /* grouped search, numbers and number ranges, update keeping the rest of the row: line protocol, binary, HTTP,
+     * a batch, and the journal across a kill -9 */
+    {   long d0 = 1L << 20, d1 = 2L << 20, d2 = 3L << 20, id;
+        int c2, ok, m;
+        float v[DIM];
+        unsigned char pay[256];
+        p = start(NULL, NULL, NULL);
+        fd = connect_unix();
+        for (i = 0; i < 30; ++i) { vline(line, "add", (i < 10 ? d0 : (i < 20 ? d1 : d2)) | (i % 10), 9000 + i); ask(fd, line, r, sizeof(r)); }
+        for (i = 0, ok = 1; i < 30; ++i) {
+            sprintf(line, "num %ld %d\n", (i < 10 ? d0 : (i < 20 ? d1 : d2)) | (i % 10), i % 10);
+            ok &= ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok");
+        }
+        check(ok, "num ID N on 30 rows -> ok");
+        sprintf(line, "num %ld\n", d1 | 7);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok 7"), "num ID -> ok N");
+        check(ask(fd, "num 5\n", r, sizeof(r)) > 0 && !strcmp(r, "err no such id") && ask(fd, "num 5 1\n", r, sizeof(r)) > 0
+              && !strcmp(r, "err no such id"), "num of an unknown id, read or set -> err no such id");
+        vline(line, "group 3", 20, 9000 + 13);                   /* the vector of document 2, chunk 3 */
+        sprintf(what, "ok 3 %ld ", d1 | 3);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strncmp(r, what, strlen(what)), "group 3 20 -> 3 hits, the query's own row first");
+        {   long g[3]; char *q = r + 5;
+            for (m = 0; m < 3; ++m) { g[m] = strtol(q, &q, 10) >> 20; strtod(q, &q); }
+            check(g[0] != g[1] && g[0] != g[2] && g[1] != g[2], "group 3 20 -> three different documents"); }
+        vline(line, "group 3", 64, 1);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strncmp(r, "err usage: group", 16), "group with SHIFT 64 -> err usage");
+        vline(line, "between 5 3", 3, 9000 + 13);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strncmp(r, "ok 3 ", 5) && strstr(r, " 1048579 ") && strstr(r, " 2097155 ") && strstr(r, " 3145731 "),
+              "between 5 3 3 -> the 3 rows whose number is 3");
+        vline(line, "between 5 4", 3, 1);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strncmp(r, "err usage: between", 18), "between with LO > HI -> err usage");
+        vline(line, "update", d0 | 4, 77777);                    /* a new vector for document 1 chunk 4: number 4 kept */
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok"), "update ID X1 .. X8 -> ok");
+        vline(line, "update", 4242, 1);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strncmp(r, "err no such id", 14), "update of an unknown id -> err");
+        sprintf(line, "num %ld\n", d0 | 4);
+        vline(what, "between 1 4", 4, 77777); what[strlen(what)] = 0;
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok 4") && ask(fd, what, r, sizeof(r)) > 0 && !strncmp(r, "ok 1 1048580 ", 13),
+              "after update: the number kept, and the new vector found");
+        check(ask(fd, "begin\n", r, sizeof(r)) > 0 && !strcmp(r, "ok"), "begin");
+        sprintf(line, "num %ld 99\n", d2 | 9);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok queued"), "num in a batch -> ok queued");
+        vline(line, "update", d2 | 9, 88888);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok queued"), "update in a batch -> ok queued");
+        check(ask(fd, "commit sync\n", r, sizeof(r)) > 0 && !strcmp(r, "ok 2"), "commit sync -> ok 2");
+        stop(p, SIGKILL);                                         /* the journal carries the numbers and the updates */
+        p = start(NULL, NULL, NULL);
+        close(fd);
+        fd = connect_unix();
+        sprintf(line, "num %ld\n", d2 | 9);
+        vline(what, "between 1 99", 99, 88888);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok 99") && ask(fd, what, r, sizeof(r)) > 0 && !strncmp(r, "ok 1 3145737 ", 13),
+              "kill -9, restart: the batch's number and update are there");
+        id = d1 | 3;                                             /* binary: get its vector, then search with it */
+        check(bin_call(fd, 8, &id, 8, &st, &rnb, rb) == 0 && st == 0 && rnb == DIM * 4, "binary get of a row for the queries");
+        memcpy(v, rb, sizeof(v));
+        {   unsigned sh = 20; memcpy(pay, &sh, 4); memcpy(pay + 4, v, sizeof(v)); }
+        c2 = bin_call(fd, 15, pay, 4 + sizeof(v), &st, &rnb, rb);
+        {   long long h0, g1, g2;
+            memcpy(&h0, rb, 8);                                    /* k 0: 10, and the store holds earlier tests' rows */
+            memcpy(&g1, rb + 12, 8); memcpy(&g2, rb + 24, 8);
+            check(c2 == 0 && st == 0 && rnb >= 3 * 12 && rnb % 12 == 0 && h0 == (long long)(d1 | 3) && (g1 >> 20) != (h0 >> 20)
+                  && (g2 >> 20) != (h0 >> 20) && (g1 >> 20) != (g2 >> 20), "binary grouped search (op 15): its own row first, one hit a document"); }
+        {   long long lh[2]; lh[0] = 3; lh[1] = 3; memcpy(pay, lh, 16); memcpy(pay + 16, v, sizeof(v)); }
+        check(bin_call(fd, 16, pay, 16 + sizeof(v), &st, &rnb, rb) == 0 && st == 0 && rnb == 3 * 12, "binary number range (op 16): the 3 rows numbered 3");
+        {   long long q2[2]; q2[0] = d0 | 1; q2[1] = -5; memcpy(pay, q2, 16); }
+        check(bin_call(fd, 18, pay, 16, &st, &rnb, rb) == 0 && st == 0, "binary set a number (op 18)");
+        id = d0 | 1;
+        {   long long nv = 0;
+            c2 = bin_call(fd, 19, &id, 8, &st, &rnb, rb); memcpy(&nv, rb, 8);
+            check(c2 == 0 && st == 0 && rnb == 8 && nv == -5, "binary get a number (op 19): -5"); }
+        memcpy(pay, &id, 8); memcpy(pay + 8, v, sizeof(v));
+        check(bin_call(fd, 17, pay, 8 + sizeof(v), &st, &rnb, rb) == 0 && st == 0, "binary update (op 17)");
+        id = 4242; memcpy(pay, &id, 8);
+        check(bin_call(fd, 17, pay, 8 + sizeof(v), &st, &rnb, rb) == 0 && st == 1, "binary update of no row -> status 1");
+        {   char body[256], req[512]; int n = sprintf(body, "[");
+            for (m = 0; m < DIM; ++m) n += sprintf(body + n, "%s%.6f", m ? "," : "", (double)v[m]);
+            strcat(body, "]");
+            sprintf(req, "POST /search?k=3&group=20 HTTP/1.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", (int)strlen(body), body);
+            {   char a1[32], a2[32];                             /* d0|1 has this vector now too: both documents lead */
+                sprintf(a1, "%ld", d0 | 1); sprintf(a2, "%ld", d1 | 3);
+                check(http(req, r, sizeof(r)) > 0 && strstr(r, "{\"ids\":[") && strstr(r, a1) && strstr(r, a2), "HTTP /search?k=3&group=20"); }
+            sprintf(req, "POST /search?k=9&lo=-5&hi=-5 HTTP/1.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", (int)strlen(body), body);
+            sprintf(what, "{\"ids\":[%ld],", d0 | 1);
+            check(http(req, r, sizeof(r)) > 0 && strstr(r, what), "HTTP /search?lo=-5&hi=-5: the one row numbered -5");
+            sprintf(req, "POST /search?k=3&group=20&lo=1 HTTP/1.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", (int)strlen(body), body);
+            check(http(req, r, sizeof(r)) > 0 && strstr(r, "400 Bad Request"), "HTTP /search with group and lo -> 400");
+            sprintf(req, "POST /update?id=%ld HTTP/1.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", d2 | 0, (int)strlen(body), body);
+            check(http(req, r, sizeof(r)) > 0 && strstr(r, "{\"ok\":true}"), "HTTP POST /update?id=");
+        }
+        sprintf(line, "POST /num?id=%ld&num=123 HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", d2 | 0);
+        check(http(line, r, sizeof(r)) > 0 && strstr(r, "{\"ok\":true}"), "HTTP POST /num?id=&num=");
+        sprintf(line, "GET /num?id=%ld HTTP/1.1\r\nConnection: close\r\n\r\n", d2 | 0);
+        check(http(line, r, sizeof(r)) > 0 && strstr(r, "{\"num\":123}"), "HTTP GET /num?id= -> 123");
+        check(http("GET /num?id=4242 HTTP/1.1\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0 && strstr(r, "404"), "HTTP GET /num of no row -> 404");
+        close(fd);
+        stop(p, SIGTERM);
+        check(log_has("update id=") && log_has("num id="), "log: the updates and numbers");
+    }
+
     /* a tenant server: a directory, a store per tenant; the line protocol, HTTP and binary choose one; the log names it */
     {
         char tdir[160], tf[200];

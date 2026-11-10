@@ -536,14 +536,10 @@ VI_API int vi_get_num(vi_db *db, vi_i64 id, vi_i64 *num)
 
 VI_API int vi_search_range(vi_db *db, const float *query, int k, vi_i64 lo, vi_i64 hi, vi_i64 *ids, float *scores)
 {
-    StoreCnf c;
     int n;
     if (vi_search_ok_(db, query, k, ids, scores)) return -1;
     if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
-    if (lo > hi) return 0;
-    memset(&c, 0, sizeof(c));
-    c.num = 1; c.lo = (i64)lo; c.hi = (i64)hi;
-    n = store_search_cnf(db->s, query, (i32)k, (i64 *)ids, scores, &c);
+    n = store_search_num(db->s, query, (i32)k, (i64)lo, (i64)hi, (i64 *)ids, scores);
     vi_cos_(db, scores, n);
     return n;
 }
@@ -558,39 +554,16 @@ VI_API int vi_search(vi_db *db, const float *query, int k, vi_i64 *ids, float *s
     return n;
 }
 
-#define VI_GROUP_MAX 65536   /* the most rows a grouped search re-ranks before it gives up on finding k groups */
-
-/* best first from store_search, so the first hit of a group is its best: keep it, skip the rest of the group; too
- * few groups, ask for four times as many rows, up to VI_GROUP_MAX or the whole store */
 VI_API int vi_search_grouped(vi_db *db, const float *query, int k, int shift, vi_i64 *ids, float *scores)
 {
-    i64 total, *ci;
-    f32 *cs;
-    i32 want, n, have, i, j;
+    i32 n;
     if (vi_search_ok_(db, query, k, ids, scores)) return -1;
     if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
     if (shift < 0 || shift > 63) return vi_fail_(-1, "shift must be 0 to 63", (const char *)0, (const char *)0);
-    if (shift == 0) return vi_search(db, query, k, ids, scores);
-    total = store_count(db->s);
-    want = k > VI_GROUP_MAX / 4 ? VI_GROUP_MAX : k * 4;
-    if (want < 64) want = 64;
-    for (;;) {
-        if ((i64)want > total) want = total > 0 ? (i32)total : 1;
-        ci = (i64 *)malloc((size_t)want * sizeof(i64));
-        cs = (f32 *)malloc((size_t)want * sizeof(f32));
-        if (!ci || !cs) { free(ci); free(cs); return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0); }
-        n = store_search(db->s, query, want, ci, cs);
-        for (i = have = 0; i < n && have < k; ++i) {
-            u64 g = (u64)ci[i] >> shift;
-            for (j = 0; j < have && ((u64)ids[j] >> shift) != g; ++j) {}
-            if (j == have) { ids[have] = (vi_i64)ci[i]; scores[have] = cs[i]; ++have; }
-        }
-        free(ci); free(cs);
-        if (have >= k || n < want || (i64)want >= total || want >= VI_GROUP_MAX) break;
-        want = want > VI_GROUP_MAX / 4 ? VI_GROUP_MAX : want * 4;
-    }
-    vi_cos_(db, scores, have);
-    return have;
+    if ((n = store_search_grouped(db->s, query, (i32)k, (i32)shift, (i64 *)ids, scores)) < 0)
+        return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    vi_cos_(db, scores, n);
+    return n;
 }
 
 VI_API int vi_search_tagged(vi_db *db, const float *query, int k, vi_i64 all, vi_i64 any, vi_i64 *ids, float *scores)

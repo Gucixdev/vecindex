@@ -97,6 +97,37 @@ static i32 vs_hybrid_(VsWorker *w, VsConn *c, i32 hv, const char *t, i32 tn, i32
     return store_search_hybrid(c->t->s, hv ? w->vec : (const f32 *)0, t, tn, k, w->ids, w->sc);
 }
 
+/* grouped search (one hit an id >> shift group, shift 1-63) or, with rng, the rows whose number is in [lo, hi], of
+ * the vector in w->vec, into w->ids / w->sc scored as vs_search_ */
+static i32 vs_search_by_(VsWorker *w, VsConn *c, i32 k, i32 shift, i32 rng, i64 lo, i64 hi)
+{
+    i32 n = rng ? store_search_num(c->t->s, w->vec, k, lo, hi, w->ids, w->sc)
+                : store_search_grouped(c->t->s, w->vec, k, shift, w->ids, w->sc), i;
+    if (n < 0) n = 0;
+    for (i = 0; i < n; ++i) w->sc[i] = store_score_out(c->t->s, w->sc[i]);
+    return n;
+}
+
+/* a new vector for id, its tag, number and text kept (store_update); queued in an open batch. 0, or -1: no such row */
+static i32 vs_update_(VsConn *c, const f32 *v, i64 id)
+{
+    i32 r;
+    if (c->wb) return store_batch_update(c->wb, v, id);
+    r = store_update(c->t->s, v, id);
+    if (vs_logging_()) vs_log_(c, r != 0, "update id=%ld %s", (long)id, r == 0 ? "ok" : "refused (no such id, NaN or Inf)");
+    return r;
+}
+
+/* id's number for range searches (store_set_num); queued in an open batch. 0, or -1: no such row */
+static i32 vs_setnum_(VsConn *c, i64 id, i64 num)
+{
+    i32 r;
+    if (c->wb) return store_batch_set_num(c->wb, id, num);
+    r = store_set_num(c->t->s, id, num);
+    if (vs_logging_()) vs_log_(c, r != 0, "num id=%ld num=%ld %s", (long)id, (long)num, r == 0 ? "ok" : "refused (no such id)");
+    return r;
+}
+
 /* ---- binary protocol: little-endian frames, nothing to parse ----
  *   request  u8 0xB5 | u8 op | u16 k | u32 nbytes | payload[nbytes]
  *   response u8 0xB5 | u8 status | u16 count | u32 nbytes | payload[nbytes]
@@ -114,7 +145,15 @@ static i32 vs_hybrid_(VsWorker *w, VsConn *c, i32 hv, const char *t, i32 tn, i32
  *   op 13 hybrid search    payload: u32 1 (a vector follows) or 0, [dim x f32], then the words' bytes
  *                          reply: count x { i64 id, f32 fused score }
  *   op 14 use a tenant     payload: its name (a tenant server; opened or created) - the connection's later requests
- *                          go to its store. status 1 with the reason as the payload when refused */
+ *                          go to its store. status 1 with the reason as the payload when refused
+ *   op 15 grouped search   payload: u32 shift (1-63), dim x f32   reply: count x { i64 id, f32 score }, one hit an
+ *                          id >> shift group (shift 20 and ids doc << 20 | chunk: the best chunk of k documents)
+ *   op 16 number range     payload: i64 lo, i64 hi, dim x f32     reply: count x { i64 id, f32 score }, the rows
+ *                          whose number is in [lo, hi]
+ *   op 17 update           payload: i64 id, dim x f32   a new vector, the row's tag, number and text kept (status 1:
+ *                          no row)
+ *   op 18 set a number     payload: i64 id, i64 number  (status 1: no row)
+ *   op 19 get a number     payload: i64 id              reply: i64 number (status 1: no row) */
 
 /* a reply whose payload sits elsewhere (a text): the header, then the payload as it is */
 static void vs_bin_reply_at_(VsWorker *w, VsConn *c, u8 status, u16 count, const char *payload, u32 nbytes)
@@ -249,6 +288,36 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
             vs_bin_reply_(w, c, 0, (u16)got, w->out + 8, (u32)got * 12u); }
         vs_logsearch_(c, k, got, t0);
         break; }
+    case 15: case 16: {
+        u32 at = op == 15 ? 4u : 16u;
+        double t0 = vs_now_();
+        if (nb != at + (u32)vs_dim * 4 || (op == 15 && (vs_le32_(b) < 1 || vs_le32_(b) > 63))) { vs_bin_reply_(w, c, 2, 0, (const char *)0, 0); break; }
+        vs_getf_(w->vec, b + at, vs_dim);
+        if (k < 1) k = 10;
+        if (k > VS_MAXK) k = VS_MAXK;
+        got = op == 15 ? vs_search_by_(w, c, k, (i32)vs_le32_(b), 0, 0, 0) : vs_search_by_(w, c, k, 0, 1, vs_le64_(b), vs_le64_(b + 8));
+        {   char *o = w->out + 8;
+            for (i = 0; i < got; ++i) { vs_put64_(o, w->ids[i]); vs_put32_(o + 8, vs_fbits_(w->sc[i])); o += 12; }
+            vs_bin_reply_(w, c, 0, (u16)got, w->out + 8, (u32)got * 12u); }
+        vs_logsearch_(c, k, got, t0);
+        break; }
+    case 17:
+        if (nb != 8 + (u32)vs_dim * 4) { vs_bin_reply_(w, c, 2, 0, (const char *)0, 0); break; }
+        vs_getf_(w->vec, b + 8, vs_dim);
+        vs_bin_reply_(w, c, vs_update_(c, w->vec, vs_le64_(b)) == 0 ? 0 : 1, 0, (const char *)0, 0);
+        break;
+    case 18:
+        if (nb != 16) { vs_bin_reply_(w, c, 2, 0, (const char *)0, 0); break; }
+        vs_bin_reply_(w, c, vs_setnum_(c, vs_le64_(b), vs_le64_(b + 8)) == 0 ? 0 : 1, 0, (const char *)0, 0);
+        break;
+    case 19:
+        if (nb != 8) { vs_bin_reply_(w, c, 2, 0, (const char *)0, 0); break; }
+        {   i64 v = 0;
+            char p[8];
+            if (store_get_num(c->t->s, vs_le64_(b), &v) != 0) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); break; }
+            vs_put64_(p, v);
+            vs_bin_reply_(w, c, 0, 0, p, 8); }
+        break;
     default: vs_bin_reply_(w, c, 3, 0, (const char *)0, 0); break;
     }
     return (i32)(8 + nb);
@@ -279,6 +348,11 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
  *   range LO HI [MAX]         ok N ID ...                  (the ids in [LO, HI], ascending, at most MAX = 100)
  *   hybrid K X1 .. XD WORDS   ok N ID SCORE ...            (the vector and the words against the texts, fused)
  *   words K WORDS             ok N ID SCORE ...            (the words alone)
+ *   group K SHIFT X1 .. XD    ok N ID SCORE ...            (one hit an id >> SHIFT group, SHIFT 1-63: with ids
+ *                                                          doc << 20 | chunk, group K 20 is the best chunk of K docs)
+ *   between K LO HI X1 .. XD  ok N ID SCORE ...            (the rows whose number is in [LO, HI])
+ *   num ID [N]                ok N | ok                    (a row's number for between: read it, or set it to N)
+ *   update ID X1 .. XD        ok                           (a new vector, the row's tag, number and text kept)
  *   help                      ok COMMANDS...
  *   quit                      ok bye, and the server closes the connection */
 
@@ -478,8 +552,33 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
             vs_line_hits_(w, c, got);
             vs_logsearch_(c, k, got, t0);
         }
+    } else if (VS_CMD("group") || VS_CMD("between")) {
+        i32 gr = b[0] == 'g', kk;
+        i64 z = 0;
+        double t0 = vs_now_();
+        if (!(a = vs_wint_(a, &x)) || !(a = vs_wint_(a, &y)) || (!gr && !(a = vs_wint_(a, &z))) || vs_wvec_(w, a) != 0
+            || (gr && (y < 1 || y > 63)) || (!gr && z < y))
+            VS_LINE_ERR(gr ? "usage: group K SHIFT X1 .. XD (SHIFT 1 to 63)" : "usage: between K LO HI X1 .. XD (LO <= HI)");
+        else {
+            kk = x < 1 ? 1 : (x > VS_MAXK ? VS_MAXK : (i32)x);
+            got = gr ? vs_search_by_(w, c, kk, (i32)y, 0, 0, 0) : vs_search_by_(w, c, kk, 0, 1, y, z);
+            vs_line_hits_(w, c, got);
+            vs_logsearch_(c, kk, got, t0);
+        }
+    } else if (VS_CMD("num")) {
+        if (!(a = vs_wint_(a, &x))) VS_LINE_ERR("usage: num ID [N]");
+        else if (!*vs_word_(a)) {
+            if (store_get_num(c->t->s, x, &y) != 0) VS_LINE_ERR("no such id");
+            else { p = vs_str_(o, "ok "); p = vs_i64_(p, y); vs_line_reply_(w, c, o, p); }
+        } else if (!(a = vs_wint_(a, &y)) || *vs_word_(a)) VS_LINE_ERR("usage: num ID [N]");
+        else if (vs_setnum_(c, x, y) != 0) VS_LINE_ERR(c->wb ? "out of memory, or the batch is over 1 GB" : "no such id");
+        else vs_line_reply_(w, c, o, vs_str_(o, c->wb ? "ok queued" : "ok"));
+    } else if (VS_CMD("update")) {
+        if (!(a = vs_wint_(a, &x)) || vs_wvec_(w, a) != 0) VS_LINE_ERR("usage: update ID X1 .. XD (D numbers)");
+        else if (vs_update_(c, w->vec, x) != 0) VS_LINE_ERR(c->wb ? "vector has NaN or Inf: the batch will be refused, abort it" : "no such id, or the vector has NaN or Inf");
+        else vs_line_reply_(w, c, o, vs_str_(o, c->wb ? "ok queued" : "ok"));
     } else if (VS_CMD("ping")) vs_line_reply_(w, c, o, vs_str_(o, "ok pong"));
-    else if (VS_CMD("help")) vs_line_reply_(w, c, o, vs_str_(o, "ok ping use stats search add addt get text range hybrid words del begin commit abort build save snapshot help quit"));
+    else if (VS_CMD("help")) vs_line_reply_(w, c, o, vs_str_(o, "ok ping use stats search add addt get text range hybrid words group between num update del begin commit abort build save snapshot help quit"));
     else if (VS_CMD("quit")) { vs_line_reply_(w, c, o, vs_str_(o, "ok bye")); c->closing = 1; }
     else { VS_LINE_ERR("unknown command (help lists them)"); vs_log_(c, 1, "unknown line command"); }
 #undef VS_CMD
@@ -675,14 +774,19 @@ static i32 vs_http_(VsWorker *w, VsConn *c)
     } else if (VS_IS("POST", "/search")) {
         char *p = o;
         double t0 = vs_now_();
-        i64 kq = vs_qparam_(t, tn, "k", 10, &qbad);
+        i64 kq = vs_qparam_(t, tn, "k", 10, &qbad), gs = vs_qparam_(t, tn, "group", 0, &qbad);
+        i64 lo = vs_qparam_(t, tn, "lo", (i64)((u64)1 << 63), &qbad), hi = vs_qparam_(t, tn, "hi", (i64)(((u64)1 << 63) - 1), &qbad);
+        i32 rng = vs_qparam_(t, tn, "lo", 0, &qbad) == vs_qparam_(t, tn, "lo", 1, &qbad)        /* lo= or hi= there */
+               || vs_qparam_(t, tn, "hi", 0, &qbad) == vs_qparam_(t, tn, "hi", 1, &qbad);
         if (qbad) VS_BADQ();
+        else if (gs < 0 || gs > 63 || (gs && rng) || lo > hi)
+            VS_HTTP_LIT(w, c, "400 Bad Request", "{\"error\":\"group is 1 to 63, lo <= hi, and not group with lo/hi\"}", keep);
         else if (raw ? clen != vs_dim * 4 : vs_json_vec_(w, body, clen) != 0) {
             VS_HTTP_LIT(w, c, "400 Bad Request", "{\"error\":\"expected a vector of the store's dimension\"}", keep);
         } else {
             if (raw) vs_getf_(w->vec, (const u8 *)body, vs_dim);
             k = kq < 1 ? 1 : (kq > VS_MAXK ? VS_MAXK : (i32)kq);
-            got = vs_search_(w, c, w->vec, k);
+            got = gs || rng ? vs_search_by_(w, c, k, (i32)gs, rng, lo, hi) : vs_search_(w, c, w->vec, k);
             p = vs_str_(p, "{\"ids\":[");
             for (i = 0; i < got; ++i) { if (i) *p++ = ','; p = vs_i64_(p, w->ids[i]); }
             p = vs_str_(p, "],\"scores\":[");
@@ -761,6 +865,27 @@ static i32 vs_http_(VsWorker *w, VsConn *c)
             p = vs_str_(p, "]}");
             vs_http_reply_(w, c, "200 OK", o, (i32)(p - o), keep);
         }
+    } else if (VS_IS("POST", "/update")) {
+        i64 id = vs_qparam_(t, tn, "id", -1, &qbad);
+        if (qbad) VS_BADQ();
+        else if (raw ? clen != vs_dim * 4 : vs_json_vec_(w, body, clen) != 0)
+            VS_HTTP_LIT(w, c, "400 Bad Request", "{\"error\":\"need ?id=N and a vector of the store's dimension\"}", keep);
+        else {
+            if (raw) vs_getf_(w->vec, (const u8 *)body, vs_dim);
+            if (vs_update_(c, w->vec, id) == 0) VS_HTTP_LIT(w, c, "200 OK", "{\"ok\":true}", keep);
+            else VS_HTTP_LIT(w, c, "404 Not Found", "{\"error\":\"no such id, or the vector has NaN or Inf\"}", keep);
+        }
+    } else if (VS_IS("GET", "/num") || VS_IS("POST", "/num")) {
+        char *p = o;
+        i64 id = vs_qparam_(t, tn, "id", -1, &qbad), nv = vs_qparam_(t, tn, "num", 0, &qbad), v = 0;
+        i32 has = vs_qparam_(t, tn, "num", 0, &qbad) == vs_qparam_(t, tn, "num", 1, &qbad);
+        if (qbad) VS_BADQ();
+        else if (b[0] == 'P' && !has) VS_HTTP_LIT(w, c, "400 Bad Request", "{\"error\":\"need ?id=N&num=V\"}", keep);
+        else if (b[0] == 'P') {
+            if (vs_setnum_(c, id, nv) == 0) VS_HTTP_LIT(w, c, "200 OK", "{\"ok\":true}", keep);
+            else VS_HTTP_LIT(w, c, "404 Not Found", "{\"error\":\"no such id\"}", keep);
+        } else if (store_get_num(c->t->s, id, &v) != 0) VS_HTTP_LIT(w, c, "404 Not Found", "{\"error\":\"no such id\"}", keep);
+        else { p = vs_str_(p, "{\"num\":"); p = vs_i64_(p, v); *p++ = '}'; vs_http_reply_(w, c, "200 OK", o, (i32)(p - o), keep); }
     } else if (VS_IS("POST", "/delete")) {
         char *p = o;
         i64 lo = vs_qparam_(t, tn, "lo", -1, &qbad), hi = vs_qparam_(t, tn, "hi", -1, &qbad), id = vs_qparam_(t, tn, "id", -1, &qbad);

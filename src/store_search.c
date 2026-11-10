@@ -197,3 +197,35 @@ void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, 
     pthread_rwlock_unlock(&s->lock);
     free(qn); free(ql);
 }
+
+#define STORE_GROUP_MAX 65536   /* the most rows a grouped search ranks before it gives up on finding k groups */
+
+/* store_search with at most one hit a group, the group of an id being (u64)id >> shift (0 to 63): best first from
+ * store_search, so a group's first hit is its best - keep it, skip the rest of the group; too few groups, ask for
+ * four times as many rows, up to STORE_GROUP_MAX or the whole store. Returns how many groups, -1 out of memory. */
+i32 store_search_grouped(RagStore *s, const f32 *query, i32 k, i32 shift, i64 *ids, f32 *scores)
+{
+    i64 total, *ci;
+    f32 *cs;
+    i32 want, n, have, i, j;
+    if (shift <= 0) return store_search(s, query, k, ids, scores);
+    total = store_count(s);
+    want = k > STORE_GROUP_MAX / 4 ? STORE_GROUP_MAX : k * 4;
+    if (want < 64) want = 64;
+    for (;;) {
+        if ((i64)want > total) want = total > 0 ? (i32)total : 1;
+        ci = (i64 *)malloc((size_t)want * sizeof(i64));
+        cs = (f32 *)malloc((size_t)want * sizeof(f32));
+        if (!ci || !cs) { free(ci); free(cs); return -1; }
+        n = store_search(s, query, want, ci, cs);
+        for (i = have = 0; i < n && have < k; ++i) {
+            u64 g = (u64)ci[i] >> shift;
+            for (j = 0; j < have && ((u64)ids[j] >> shift) != g; ++j) {}
+            if (j == have) { ids[have] = ci[i]; scores[have] = cs[i]; ++have; }
+        }
+        free(ci); free(cs);
+        if (have >= k || n < want || (i64)want >= total || want >= STORE_GROUP_MAX) break;
+        want = want > STORE_GROUP_MAX / 4 ? STORE_GROUP_MAX : want * 4;
+    }
+    return have;
+}
