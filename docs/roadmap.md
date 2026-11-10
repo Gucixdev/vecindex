@@ -30,7 +30,8 @@ the scan (`vi_set_num`, `vi_search_range`, `vi_batch_set_num`; in the file, the 
 `tests/store_test.c` finds 5-row ranges anywhere in an IVF store, and a mutation of the scan's range test fails it),
 shards (`vi_dir_search`, the hits of one store with every row, from three), `vi_update` (a new vector, the
 tag, number and text kept, through the journal, a batch and a save), `vi_search_where` (labels and a number range
-in one search), all of them in vserv too (line `group`, `between`, `num`, `update`; binary ops 15-19; HTTP).
+in one search), all of them in vserv too (line `group`, `between`, `num`, `update`; binary ops 15-19; HTTP), a cold index (codes past half of RAM stay on the disk at load, a search
+pages in its probed clusters: 0.7 ms against 0.4 ms warm on 2M rows, `bench/cold.c`).
 
 Open:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a

@@ -603,6 +603,37 @@ static i32 sd_nums_(Arena *a)
     print_cstr("/1000 against "); print_i64((i64)(1000 * uhit / (utot ? utot : 1)));
     print_cstr("/1000 unfiltered (4-bit scan and cascade)\n");
     if (!ok || hit * 1000 < (i64)tot * (1000 * uhit / (utot ? utot : 1) - 30)) { print_cstr("  numbers FAILED\n"); ok = 0; }
+    {   /* saved and loaded cold - the codes taken as larger than RAM, so each search asks for its clusters - and warm:
+         * the same hits, for plain, range and tag searches, with the cascade on (pass 1 left it on) */
+        const char *path = "/tmp/store_demo_cold.vxi";
+        RagStore *wm = (RagStore *)0, *cd = (RagStore *)0;
+        i64 i2[10], i3[10];
+        f32 s2[10], s3[10];
+        i32 same = 1, n2, n3;
+        remove(path);
+        if (store_save(s, path) != 0 || !(wm = store_load(a, path))) same = 0;
+        store_cold_min_ = 0;
+        if (same && !(cd = store_load(a, path))) same = 0;
+        store_cold_min_ = -1;
+        if (same && (!cd->tq || !cd->tq->cold || !cd->tq->codes1 || !wm->tq || wm->tq->cold)) same = 0;
+        for (q = 0; same && q < 30; ++q) {
+            const f32 *qv = x + (size_t)(q * 331 + 7) * SDC_DIM;
+            memset(&c, 0, sizeof(c));
+            if (q % 3 == 1) { c.num = 1; c.lo = 1000; c.hi = 9000; }
+            if (q % 3 == 2) { c.n = 1; c.any[0] = 1; }
+            n2 = q % 3 ? store_search_cnf(wm, qv, 10, i2, s2, &c) : store_search(wm, qv, 10, i2, s2);
+            n3 = q % 3 ? store_search_cnf(cd, qv, 10, i3, s3, &c) : store_search(cd, qv, 10, i3, s3);
+            if (n2 != n3 || n2 != 10) same = 0;
+            for (j = 0; same && j < n2; ++j) if (i2[j] != i3[j]) same = 0;
+        }
+        print_cstr(same ? "  cold index: a store loaded as larger than RAM gives the warm one's hits (plain, range, tag; cascade)\n"
+                        : "  cold index FAILED\n");
+        if (!same) ok = 0;
+        if (wm) store_destroy(wm);
+        if (cd) store_destroy(cd);
+        remove(path);
+        {   char jn[64]; sprintf(jn, "%s.j", path); remove(jn); }
+    }
     store_destroy(s);
     store_ivf_min_ = keep;
     free(x);

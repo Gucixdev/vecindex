@@ -834,10 +834,13 @@ static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows)
         return (Tq *)0;
     }
     tq_prepare_(t);
-    if (map) {                    /* what every query scans (the 1-bit codes of a cascade, else the codes): read it now */
+    if (map) {                    /* what every query scans (the 1-bit codes of a cascade, else the codes): read it now -
+                                   * unless it is more than RAM is sure to hold: then a search reads its clusters */
         const u8 *sc = t->codes1 ? t->codes1 : t->codes;
         size_t pg = (size_t)sysconf(_SC_PAGESIZE), a = (size_t)sc & ~(pg - 1);
-        madvise((void *)a, (size_t)sc + (size_t)t->nblk * (size_t)(t->codes1 ? t->vd1 : t->vd) * 16 - a, MADV_WILLNEED);
+        i64 hot = (i64)t->nblk * (t->codes1 ? t->vd1 : t->vd) * 16 + (t->slot_row ? (i64)t->nblk * 128 : 0);
+        if (t->nc > 1 && hot > (store_cold_min_ >= 0 ? store_cold_min_ : store_ram_half_())) t->cold = 1;
+        else madvise((void *)a, (size_t)sc + (size_t)t->nblk * (size_t)(t->codes1 ? t->vd1 : t->vd) * 16 - a, MADV_WILLNEED);
     }
     return t;
 }

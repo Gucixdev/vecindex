@@ -114,6 +114,8 @@ typedef struct {
     i32  *csize;            /* [nc] rows in each cluster, added ones too (NULL: not counted yet - a loaded index) */
     f64   csum, csq;        /* the sum of csize and of its squares */
     f64   skew0;            /* tq_skew when the clusters were made (or first counted) */
+    i32   cold;             /* 1: mapped codes larger than RAM can be counted on to hold, so the load did not read
+                             * them in: a search pages in its probed clusters (measured: bench/cold.c) */
 } Tq;
 
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512F__)

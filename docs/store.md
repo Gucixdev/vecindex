@@ -160,6 +160,14 @@ blocking fault after another - ~190k IOPS batched against ~21k one by one on thi
 order (the usual case) need no id map at all (binary search over the id column); only rows added out of order go
 into an 8-byte-a-slot hash.
 
+A loaded index whose scanned codes are more than half of RAM (the machine's, or a cgroup's cap) is cold: the load no
+longer reads all of them in, and a search pages in only the clusters it probes. Measured with `bench/cold.c` on this
+VM (2M rows, d=96, 97 MB of codes, 301 of 5647 clusters probed, page cache dropped first): 0.7 ms median a query and
+12 major faults, against 0.4 ms warm. Asking for each probed cluster with `MADV_WILLNEED` before the scan was tried
+and dropped: fewer faults, slower here. One catch: the default load checks every block's digest
+(`VECINDEX_VERIFY=2`), which reads the whole file; a store larger than RAM opens with `VECINDEX_VERIFY=1` (the header's
+blocks) and a scrub in the background.
+
 For stores past what RAM and disk allow at f32, two knobs: `store_set_codes(s, 2)` (2-bit codes: half the RAM,
 twice the scan speed, re-score more candidates) and `store_set_vec_bytes(s, 1)` (int8 rows with an f32 scale: d + 4
 bytes on disk instead of 4d, about one recall point on GloVe - the cost of 8 bits, a rotation first does not change

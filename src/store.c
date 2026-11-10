@@ -114,6 +114,31 @@
 #define STORE_IVF_ROWS 256
 #endif
 static i32 store_ivf_min_ = STORE_IVF_MIN;   /* the self-test lowers it to reach the IVF paths on a small store */
+static i64 store_cold_min_ = -1;   /* scanned code bytes past which a loaded index is cold (Tq.cold); -1: half of RAM */
+
+/* half the memory this process can count on: the machine's RAM, or less when a cgroup (a container, a systemd unit)
+ * caps it; read once */
+static i64 store_ram_half_(void)
+{
+    static i64 half;
+    if (!half) {
+        long np = sysconf(_SC_PHYS_PAGES), pz = sysconf(_SC_PAGESIZE);
+        i64 ram = np > 0 && pz > 0 ? (i64)np * pz : ((i64)1 << 40);
+        const char *cg[2];
+        i32 i;
+        cg[0] = "/sys/fs/cgroup/memory.max";                     /* cgroup v2 ("max": no cap) */
+        cg[1] = "/sys/fs/cgroup/memory/memory.limit_in_bytes";   /* cgroup v1 (a huge number: no cap) */
+        for (i = 0; i < 2; ++i) {
+            FILE *f = fopen(cg[i], "r");
+            char b[32];
+            if (!f) continue;
+            if (fgets(b, sizeof(b), f) && b[0] >= '0' && b[0] <= '9') { i64 cap = (i64)strtoll(b, (char **)0, 10); if (cap > 0 && cap < ram) ram = cap; }
+            fclose(f);
+        }
+        half = ram / 2;
+    }
+    return half;
+}
 static i32 store_nclusters_(i32 n)
 {
     i32 a = (i32)(4.0 * eng_sqrt_((f64)n)), b = n / STORE_IVF_ROWS;
