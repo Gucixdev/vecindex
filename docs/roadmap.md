@@ -29,12 +29,12 @@ the best hit of each `id >> shift` group: one chunk a document), a 64-bit number
 the scan (`vi_set_num`, `vi_search_range`, `vi_batch_set_num`; in the file, the journal and the row checks;
 `tests/store_test.c` finds 5-row ranges anywhere in an IVF store, and a mutation of the scan's range test fails it),
 shards (`vi_dir_search`, the hits of one store with every row, from three), `vi_update` (a new vector, the
-tag, number and text kept, through the journal, a batch and a save).
+tag, number and text kept, through the journal, a batch and a save), `vi_search_where` (labels and a number range
+in one search), all of them in vserv too (line `group`, `between`, `num`, `update`; binary ops 15-19; HTTP).
 
 Open:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a
-  hierarchy on the tag's bits, `vi_label*`); relations between rows; a number range together with labels in one search
-  (now: `vi_search_range` and `vi_search_labeled` each alone)
+  hierarchy on the tag's bits, `vi_label*`); relations between rows
 - the file format: zones (parts of a store split by id range, time or tag) and namespaces inside a tenant, one
   format readable on every machine (the journal is written in the host's byte order today)
 - scale at both ends: the smallest boards (fewest bytes a vector, RAM to spare) and past one machine's RAM. Shards as

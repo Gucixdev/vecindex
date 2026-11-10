@@ -62,6 +62,7 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_search_hybrid(db, q, text, tlen, k, ids, scores)` | the vector and the words (BM25 over the texts), fused by rank; either side may be left out |
 | `vi_set_tag`, `vi_get_tag` | a 64-bit tag per row |
 | `vi_set_num(db, id, num)`, `vi_get_num(db, id, &num)`, `vi_search_range(db, q, k, lo, hi, ids, scores)` | a 64-bit number per row (0 until set), and a search over the rows whose number is in `[lo, hi]` |
+| `vi_search_where(db, q, k, all, any, none, lo, hi, ids, scores)` | labels (as `vi_search_labeled`) and a number range in one search, both tested in the scan |
 | `vi_error()` | why the calling thread's last failed call failed, in words |
 | `vi_key(s, len)` | a 64-bit id for a string (a path, a URL), the same everywhere |
 | `vi_label(db, name, parent)`, `vi_label_add(db, id, labels)`, `vi_label_remove(db, id, labels)`, `vi_search_labeled(db, q, k, all, any, none, ids, scores)` | labels in a hierarchy on rows, and a search over every label of `all`, one of `any`, none of `none` |

@@ -576,6 +576,15 @@ static i32 sd_nums_(Arena *a)
             if (n != 5) ok = 0;
             for (j = 0; j < n; ++j) if (ids[j] < c.lo || ids[j] > c.hi) ok = 0;
         }
+        if (pass == 0) for (i = 0; i < SDC_N; i += 2) store_set_meta(s, i, 1);   /* a tag bit on the even rows */
+        c.n = 1; c.any[0] = 1;
+        for (q = 0; q < 20; ++q) {                               /* ten rows, the tag on five: those five */
+            c.lo = 991 * q + 1; c.hi = c.lo + 9;
+            n = store_search_cnf(s, x + (size_t)(q * 17) * SDC_DIM, 10, ids, sc, &c);
+            if (n != 5) ok = 0;
+            for (j = 0; j < n; ++j) if (ids[j] < c.lo || ids[j] > c.hi || (ids[j] & 1)) ok = 0;
+        }
+        c.n = 0; c.any[0] = 0;
         for (q = 0; q < 50; ++q) {                               /* half the rows: recall@10 against the exact answer */
             const f32 *qv = x + (size_t)(q * 211 + 5) * SDC_DIM;
             i32 m;

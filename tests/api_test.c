@@ -481,6 +481,16 @@ int main(void)
         n = db ? vi_search_range(db, v, 10, 30, 49, got, sc) : 0;
         for (j = 0, ok = n == 10; j < n; ++j) ok &= got[j] % 100 >= 80 && got[j] == ri[j];
         check(ok, "vi_search_range [30, 49]: the 10 nearest rows with numbers in it, in order");
+        for (i = 0, ok = 1; db && i < N; i += 3) ok &= vi_label_add(db, i, "legal") == 0;   /* a third of the rows */
+        for (want_n = 0, j = 0; j < na && want_n < 10; ++j) if (all[j] % 100 >= 80 && all[j] % 3 == 0) ri[want_n++] = all[j];
+        n = db ? vi_search_where(db, v, 10, "legal", (const char *)0, (const char *)0, 30, 49, got, sc) : 0;
+        for (j = 0, ok &= n == 10; j < n; ++j) ok &= got[j] == ri[j];
+        check(ok, "vi_search_where legal and [30, 49]: the 10 nearest rows with both, in order");
+        n = db ? vi_search_where(db, v, 10, (const char *)0, (const char *)0, "legal", -16, -16, got, sc) : 0;
+        for (j = 0, ok = n == 10; j < n; ++j) ok &= got[j] % 100 == 34 && got[j] % 3 != 0;
+        check(ok && got[0] == 1234, "vi_search_where none=legal and one number: the query's own row first, no legal one");
+        check(db && vi_search_where(db, v, 10, "nosuch", (const char *)0, (const char *)0, 0, 9, got, sc) == -1,
+              "vi_search_where with a label that does not exist: -1");
         n = db ? vi_search_range(db, v, 10, -16, -16, got, sc) : 0;
         check(n == 10 && got[0] == 1234 && got[1] % 100 == 34, "vi_search_range of one value: the query's own row first");
         check(db && vi_search_range(db, v, 10, 50, 900, got, sc) == 0 && vi_search_range(db, v, 10, 5, 4, got, sc) == 0,

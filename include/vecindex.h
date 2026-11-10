@@ -178,6 +178,12 @@ VI_API int vi_label_remove(vi_db *db, vi_i64 id, const char *labels);
 VI_API int vi_search_labeled(vi_db *db, const float *query, int k, const char *all, const char *any, const char *none,
                              vi_i64 *ids, float *scores);
 
+/* Labels and a number range in one search: vi_search_labeled's all, any and none (NULL or "": no condition), and the
+ * row's number in [lo, hi] (vi_set_num) - "the legal team's documents from this year" in one query. Both are tested
+ * inside the scan, so a narrow combination still finds its rows. Returns as vi_search_labeled. */
+VI_API int vi_search_where(vi_db *db, const float *query, int k, const char *all, const char *any, const char *none,
+                           vi_i64 lo, vi_i64 hi, vi_i64 *ids, float *scores);
+
 /* A number on a row - a time, a price in cents, a version - for range filters; every row's is 0 until set, and a
  * row that vi_add replaces starts again at 0. vi_set_num / vi_get_num: 0, or -1 when there is no such row.
  * vi_search_range is vi_search over the rows whose number is in [lo, hi]; the range is tested inside the scan, so a

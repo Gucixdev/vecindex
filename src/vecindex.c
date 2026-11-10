@@ -734,3 +734,22 @@ VI_API int vi_search_labeled(vi_db *db, const float *query, int k, const char *a
     vi_cos_(db, scores, n);
     return n;
 }
+
+VI_API int vi_search_where(vi_db *db, const float *query, int k, const char *all, const char *any, const char *none,
+                           vi_i64 lo, vi_i64 hi, vi_i64 *ids, float *scores)
+{
+    StoreCnf c;
+    const char *bad = (const char *)0;
+    i32 r;
+    int n;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    r = store_label_cnf(db->s, all, any, none, &c, &bad);
+    if (r == -1) return vi_badlabel_(-1, bad, "\" does not exist (vi_label or vi_label_add makes it)");
+    if (r == -2) return vi_fail_(-1, "at most 15 labels in all", (const char *)0, (const char *)0);
+    if (lo > hi) return 0;
+    c.num = 1; c.lo = (i64)lo; c.hi = (i64)hi;
+    n = store_search_cnf(db->s, query, (i32)k, (i64 *)ids, scores, &c);
+    vi_cos_(db, scores, n);
+    return n;
+}
