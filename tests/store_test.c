@@ -989,6 +989,30 @@ static i32 sd_lens_(Arena *a)
         store_destroy(l);
     }
 
+    sdx_spit_(path, clean, clen);                                /* every block checked at the load, then the disk */
+    store_set_verify(2);                                         /* goes bad under it: the text's CRC catches it on */
+    l = store_load(a, path);                                     /* the read, and the parity rebuilds it */
+    if (l && l->map) {
+        off = sdl_find_(clean, clen, "LENSTEXT-4 ");
+        sdx_flip_(path, (u64)off + 3);
+        if (store_get_text(l, 5004, tb, sizeof(tb)) != 33 || memcmp(tb, "LENSTEXT-4 some words about row 4", 33)) {
+            print_cstr("  texts: a text damaged on the disk after the load FAILED\n"); ok = 0;
+        }
+        {   /* a text damaged in memory (the mapping is private: a write stays in this process) - the file is sound, so
+             * there is nothing to rebuild it from */
+            i32 r2 = -1, q2;
+            for (q2 = 0; q2 < l->count; ++q2) if (STORE_ID(l, q2) == 5002) r2 = q2;
+            if (r2 < 0 || !STORE_TXO(l, r2)) ok = 0;
+            else {
+                u64 v = STORE_TXO(l, r2);
+                u8 *t = l->tx.b[STORE_TXOFF(v) >> STORE_TXSHIFT] + (STORE_TXOFF(v) & (STORE_TXB - 1));
+                t[1] ^= 0x20;
+                if (store_get_text(l, 5002, tb, sizeof(tb)) != -1) { print_cstr("  texts: a text damaged in memory was served\n"); ok = 0; }
+            }
+        }
+    }
+    if (l) store_destroy(l);
+    store_set_verify(3);
     sdx_spit_(path, clean, clen);                                /* a slow lens, closed at once: no wait for it */
     store_lens_ms_ = 1000;
     l = store_load(a, path);

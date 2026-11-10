@@ -299,6 +299,7 @@ i32 store_batch_commit(StoreWb *b, i32 sync)
             u32 n;
             memcpy(&n, r + 17 + vb, 4);
             STORE_TXO(s, s->count - 1) = tv[k++];
+            STORE_TCK(s, s->count - 1) = store_tck_((const char *)r + 21 + vb, (i32)n);
             s->txlive += (i64)n;
             if (s->lex) lex_add(s->lex, id, (const char *)r + 21 + vb, (i32)n);
         }

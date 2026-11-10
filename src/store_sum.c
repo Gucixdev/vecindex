@@ -590,6 +590,63 @@ static i32 store_row_heal_(RagStore *s, i32 r)
     return STORE_RCK(s, r) == store_rck_row_(s, r);
 }
 
+/* The blocks of the loaded file under [p, p + n) rebuilt from the parity and written back (bytes outside the mapping:
+ * nothing to rebuild from). Under heal_mu. How many blocks were rebuilt. */
+static i64 store_bytes_heal_(RagStore *s, const void *p, size_t n)
+{
+    SSum *z = (SSum *)s->msum;
+    const u8 *m0 = (const u8 *)s->map, *q = (const u8 *)p;
+    u64 b, e;
+    u8 *mem;
+    SJob j;
+    if (!z || !z->tab || s->mfd < 0 || !m0 || !n || q < m0 || q + n > m0 + s->map_len) return 0;
+    if (!(mem = (u8 *)malloc(((size_t)1 + 3u * z->m) << z->blog))) return 0;
+    memset(&j, 0, sizeof(j));
+    j.z = z; j.heal = !s->ro; j.gstep = 1; j.ubad = ~(u64)0;
+    for (b = (u64)(q - m0) >> z->blog, e = (u64)(q - m0 + n - 1) >> z->blog; b <= e && b < z->N; ++b)
+        ssum_group_(&j, b % z->G, s->mfd, s->ro ? -1 : s->mfd, mem);
+    if (j.fixed && fdatasync(s->mfd) != 0) j.err = 1;
+    s->sum_bad += j.bad; s->sum_fixed += j.fixed;
+    free(mem);
+    return j.fixed;
+}
+
+/* the CRC-32C of text v as it lies in the heap's blocks */
+static u32 store_tx_crc_(const RagStore *s, u64 v)
+{
+    i64 at = STORE_TXOFF(v), n = STORE_TXLEN(v), done = 0;
+    u32 c = 0xffffffffu;
+    while (done < n) {
+        i64 p = at + done, room = STORE_TXB - (p & (STORE_TXB - 1)), take = n - done < room ? n - done : room;
+        c = store_crc32c_up_(c, s->tx.b[p >> STORE_TXSHIFT] + (p & (STORE_TXB - 1)), (size_t)take);
+        done += take;
+    }
+    c = ~c;
+    return c ? c : 1u;
+}
+
+/* Row r's text, checked against its CRC on every read (a text from an older file, without one: through the lens, when
+ * the store has it); failing, its bytes rebuilt from the parity and checked again. 1 sound (or no text), 0 damaged. */
+static i32 store_tx_ok_(RagStore *s, i32 r)
+{
+    u64 v = s->has_text ? STORE_TXO(s, r) : 0;
+    u32 want = v ? STORE_TCK(s, r) : 0;
+    i64 at, n, done = 0;
+    i32 ok;
+    if (!v) return 1;
+    if (!want) return store_tx_vouch_(s, v) == 0;
+    if (store_tx_crc_(s, v) == want) return 1;
+    pthread_mutex_lock(&s->heal_mu);                             /* one rebuild at a time, as a row's */
+    for (at = STORE_TXOFF(v), n = STORE_TXLEN(v); done < n; ) {
+        i64 p = at + done, room = STORE_TXB - (p & (STORE_TXB - 1)), take = n - done < room ? n - done : room;
+        store_bytes_heal_(s, s->tx.b[p >> STORE_TXSHIFT] + (p & (STORE_TXB - 1)), (size_t)take);
+        done += take;
+    }
+    ok = store_tx_crc_(s, v) == want;
+    pthread_mutex_unlock(&s->heal_mu);
+    return ok;
+}
+
 /* ---- the lens: a file checked block by block when its blocks are needed, and by a thread in order ---- */
 
 static i32 store_lens_ms_ = 4;      /* the thread's pause between two blocks: 64 KiB every 4 ms, 16 MB/s (tests: 0) */

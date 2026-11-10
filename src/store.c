@@ -323,6 +323,8 @@ typedef struct {
      * heap until store_save rewrites it. */
     SCol     txo;
     i32      has_text;      /* the txo column exists (the first text added or loaded) */
+    SCol     tck;           /* a CRC-32C a text (0: none, or from a file older than these checks), checked on every
+                             * read of it: a text that fails is rebuilt from the parity or not served */
     SCol     numc;          /* a caller i64 number a row (a time, a price) for range filters (0 = none set) */
     i32      has_num;       /* the numc column exists (the first number set or loaded) */
     SCol     nsc;           /* the row's namespace, i64 (0 = none): searches in a namespace see only its rows */
@@ -346,6 +348,7 @@ typedef struct {
 #define STORE_DEAD(s, r) ((i32)(((s)->dead[(size_t)(r) >> 6] >> ((u32)(r) & 63u)) & 1u))
 #define STORE_KILL(s, r) ((s)->dead[(size_t)(r) >> 6] |= (u64)1 << ((u32)(r) & 63u))
 #define STORE_TXO(s, r)  (*(u64 *)(void *)SCOL_AT(&(s)->txo, r))     /* text rows only (has_text) */
+#define STORE_TCK(s, r)  (*(u32 *)(void *)SCOL_AT(&(s)->tck, r))     /* text rows only (has_text) */
 #define STORE_NUM(s, r)  (*(i64 *)(void *)SCOL_AT(&(s)->numc, r))    /* numbered stores only (has_num) */
 #define STORE_NS(s, r)   (*(i64 *)(void *)SCOL_AT(&(s)->nsc, r))     /* stores with namespaces only (has_ns) */
 #define STORE_NSOF(s, r) ((s)->has_ns ? STORE_NS(s, r) : 0)
@@ -553,6 +556,7 @@ static i32 store_reserve_(RagStore *s, i64 need)
     while (s->metric && s->nrm.nchunk < nch) if (scol_push_(s, &s->nrm)) return -1;
     while (s->vbytes == 1 && s->vsc.nchunk < nch) if (scol_push_(s, &s->vsc)) return -1;
     while (s->has_text && s->txo.nchunk < nch) if (scol_push_(s, &s->txo)) return -1;
+    while (s->has_text && s->tck.nchunk < nch) if (scol_push_(s, &s->tck)) return -1;
     while (s->has_num && s->numc.nchunk < nch) if (scol_push_(s, &s->numc)) return -1;
     while (s->has_ns && s->nsc.nchunk < nch) if (scol_push_(s, &s->nsc)) return -1;
     ci = (i32)((i64)s->count >> STORE_CSHIFT);                   /* the chunk the next row lands in */
@@ -563,6 +567,7 @@ static i32 store_reserve_(RagStore *s, i64 need)
         || (s->metric && scol_unshare_(s, &s->nrm, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))
         || (s->vbytes == 1 && scol_unshare_(s, &s->vsc, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))
         || (s->has_text && scol_unshare_(s, &s->txo, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))
+        || (s->has_text && scol_unshare_(s, &s->tck, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))
         || (s->has_num && scol_unshare_(s, &s->numc, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))
         || (s->has_ns && scol_unshare_(s, &s->nsc, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))) return -1;
     if (words > s->dead_words) {
@@ -849,6 +854,7 @@ RagStore *store_new(Arena *a, i32 dim)
     s->rck.esz = sizeof(u32); s->rck.elem = sizeof(u32);
     s->nrm.esz = sizeof(f32); s->nrm.elem = sizeof(f32);
     s->txo.esz = sizeof(u64); s->txo.elem = sizeof(u64);
+    s->tck.esz = sizeof(u32); s->tck.elem = sizeof(u32);
     s->numc.esz = sizeof(i64); s->numc.elem = sizeof(i64);
     s->nsc.esz = sizeof(i64); s->nsc.elem = sizeof(i64);
     pthread_mutex_init(&s->lex_mu, (const pthread_mutexattr_t *)0);
@@ -915,6 +921,9 @@ static void store_ns_unlist_(RagStore *s, i64 k, i32 r);        /* store_ns.c */
 static i64 store_ns_keep_(const RagStore *s, i64 doc_id);
 static void store_ns_put_(RagStore *s, i64 ns);
 static i32 store_tx_vouch_(RagStore *s, u64 v);                 /* store_sum.c */
+static i32 store_tx_ok_(RagStore *s, i32 r);                     /* store_sum.c */
+static u32 store_crc32c_(const u8 *p, size_t n);                 /* store_batch.c */
+static u32 store_tck_(const char *t, i32 n) { u32 c = store_crc32c_((const u8 *)t, (size_t)n); return c ? c : 1u; }
 
 void store_destroy(RagStore *s)
 {
@@ -933,7 +942,7 @@ void store_destroy(RagStore *s)
     if (s->jf) fclose(s->jf);
     free(s->jpath); s->jpath = (char *)0;
     arena_free(&s->idx_arena);
-    scol_free_(&s->vec); scol_free_(&s->idc); scol_free_(&s->metac); scol_free_(&s->vsc); scol_free_(&s->txo); scol_free_(&s->rck); scol_free_(&s->nrm); scol_free_(&s->numc); scol_free_(&s->nsc);
+    scol_free_(&s->vec); scol_free_(&s->idc); scol_free_(&s->metac); scol_free_(&s->vsc); scol_free_(&s->txo); scol_free_(&s->tck); scol_free_(&s->rck); scol_free_(&s->nrm); scol_free_(&s->numc); scol_free_(&s->nsc);
     store_ns_free_(s); pthread_mutex_destroy(&s->ns_mu);
     if (s->msum) { store_msum_free_(s->msum); s->msum = (void *)0; }
     free(s->vbits); s->vbits = (u64 *)0; free(s->vmem); s->vmem = (u8 *)0;
@@ -955,10 +964,10 @@ void store_mem(RagStore *s, i64 *ram, i64 *file)
 {
     i64 r = 0, f = 0;
     i32 c;
-    SCol *cols[9];
+    SCol *cols[10];
     pthread_rwlock_rdlock(&s->lock);
-    cols[0] = &s->vec; cols[1] = &s->idc; cols[2] = &s->metac; cols[3] = &s->vsc; cols[4] = &s->txo; cols[5] = &s->rck; cols[6] = &s->nrm; cols[7] = &s->numc; cols[8] = &s->nsc;
-    for (c = 0; c < 9; ++c) {
+    cols[0] = &s->vec; cols[1] = &s->idc; cols[2] = &s->metac; cols[3] = &s->vsc; cols[4] = &s->txo; cols[5] = &s->rck; cols[6] = &s->nrm; cols[7] = &s->numc; cols[8] = &s->nsc; cols[9] = &s->tck;
+    for (c = 0; c < 10; ++c) {
         i32 i;
         for (i = 0; i < cols[c]->nchunk; ++i) {
             i64 rows = (i64)s->count - ((i64)i << STORE_CSHIFT), b;
@@ -991,7 +1000,7 @@ void store_mem(RagStore *s, i64 *ram, i64 *file)
 void store_tiers(RagStore *s, i64 *hot, i64 *cold)
 {
     i64 h = 0, c = 0;
-    const SCol *cols[9];
+    const SCol *cols[10];
     const Tq *t;
     i32 i;
     pthread_rwlock_rdlock(&s->lock);
@@ -1003,8 +1012,8 @@ void store_tiers(RagStore *s, i64 *hot, i64 *cold)
         if (t->nc > 1) h += (i64)t->nc * t->dim * 8 + ((i64)t->nc + 1) * 4;  /* the centroids, and transposed */
     }
     h += (((i64)s->count + 63) >> 6) * 8;                         /* the dead-row bits of the rows there are */
-    cols[0] = &s->vec; cols[1] = &s->vsc; cols[2] = &s->idc; cols[3] = &s->metac; cols[4] = &s->txo; cols[5] = &s->rck; cols[6] = &s->nrm; cols[7] = &s->numc; cols[8] = &s->nsc;
-    for (i = 0; i < 9; ++i) if (cols[i]->nchunk) c += (i64)s->count * (i64)cols[i]->esz;
+    cols[0] = &s->vec; cols[1] = &s->vsc; cols[2] = &s->idc; cols[3] = &s->metac; cols[4] = &s->txo; cols[5] = &s->rck; cols[6] = &s->nrm; cols[7] = &s->numc; cols[8] = &s->nsc; cols[9] = &s->tck;
+    for (i = 0; i < 10; ++i) if (cols[i]->nchunk) c += (i64)s->count * (i64)cols[i]->esz;
     c += s->tx.used;
     pthread_rwlock_unlock(&s->lock);
     if (hot) *hot = h;
@@ -1349,7 +1358,7 @@ static void store_append_locked_(RagStore *s, const f32 *vec, i64 doc_id, i64 me
     if (s->metric) STORE_NRM(s, r) = len;
     STORE_RCK(s, r) = store_rck_row_(s, r);
     if (s->metric) for (d = 0; d < s->dim; ++d) v[d] *= len;     /* the journal gets the row as it came */
-    if (s->has_text) STORE_TXO(s, r) = 0;
+    if (s->has_text) { STORE_TXO(s, r) = 0; STORE_TCK(s, r) = 0; }
     if (s->has_num) STORE_NUM(s, r) = 0;
     if (s->has_ns) STORE_NS(s, r) = 0;
     s->dead[r >> 6] &= ~((u64)1 << (r & 63));
@@ -1444,17 +1453,19 @@ static i32 store_update_locked_(RagStore *s, const f32 *vec, i64 doc_id)
     i32 r = store_live_row_(s, doc_id), q, n;
     i64 meta, num, ns;
     u64 txo;
+    u32 tck;
     if (r < 0 || store_row_bad_(s, r)) return -1;
     meta = STORE_META(s, r);
     num = s->has_num ? STORE_NUM(s, r) : 0;
     ns = STORE_NSOF(s, r);
     txo = s->has_text ? STORE_TXO(s, r) : 0;
+    tck = s->has_text ? STORE_TCK(s, r) : 0;
     if (store_reserve_(s, (i64)s->count + 1) != 0) return -1;   /* before the kill */
     for (q = store_find_(s, doc_id); q >= 0; q = store_prev_(s, q))
         if (!STORE_DEAD(s, q)) { STORE_KILL(s, q); --s->live; ++s->mods; if (q != r) store_tx_drop_(s, q); }
     store_append_locked_(s, vec, doc_id, meta);
     n = s->count - 1;
-    if (txo) STORE_TXO(s, n) = txo;                              /* txlive and the word index: unchanged */
+    if (txo) { STORE_TXO(s, n) = txo; STORE_TCK(s, n) = tck; }   /* txlive and the word index: unchanged */
     if (num) STORE_NUM(s, n) = num;
     if (ns) { STORE_NS(s, n) = ns; store_ns_row_(s, n); }
     if (num || ns) STORE_RCK(s, n) = store_rck_row_(s, n);
@@ -1702,7 +1713,7 @@ static i32 store_compact_(RagStore *s)
             STORE_META(s, w) = STORE_META(s, i);
             STORE_RCK(s, w) = STORE_RCK(s, i);
             if (s->metric) STORE_NRM(s, w) = STORE_NRM(s, i);
-            if (s->has_text) STORE_TXO(s, w) = STORE_TXO(s, i);
+            if (s->has_text) { STORE_TXO(s, w) = STORE_TXO(s, i); STORE_TCK(s, w) = STORE_TCK(s, i); }
             if (s->has_num) STORE_NUM(s, w) = STORE_NUM(s, i);
             if (s->has_ns) STORE_NS(s, w) = STORE_NS(s, i);
         }
