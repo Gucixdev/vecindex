@@ -415,15 +415,18 @@ static i32 ssum_write_file_(FILE *f, const char *path, u64 D, u32 k, u32 m, i32 
 static i32 store_verify_ = -1;
 static char store_lerr_[256];
 
-/* What a load checks: 2 every data block, and the parity of a group with a damaged one (the default; store_scrub reads
- * all the parity), 1 the group of the first block (the header), 0 nothing (to rescue a file whose checksums are gone).
- * For every load after the call, process-wide; $VECINDEX_VERIFY sets the default. */
-void store_set_verify(i32 level) { store_verify_ = level < 0 ? 0 : (level > 2 ? 2 : level); }
+/* What a load checks: 2 every data block, and the parity of a group with a damaged one (store_scrub reads all the
+ * parity); 3 the lens - the header's group, the small index arrays and the label table at the load, the rest when it
+ * is needed and by a thread walking the file one block at a time; 1 the group of the first block (the header); 0
+ * nothing (to rescue a file whose checksums are gone). The default: 2 for a file up to half of RAM, 3 above.
+ * For every load after the call, process-wide; $VECINDEX_VERIFY (0, 1, 2 or lens) sets the default. */
+#define STORE_VERIFY_AUTO 4
+void store_set_verify(i32 level) { store_verify_ = level < 0 ? 0 : (level > 3 ? 3 : level); }
 static i32 store_verify_level_(void)
 {
     if (store_verify_ < 0) {
         const char *e = getenv("VECINDEX_VERIFY");
-        store_verify_ = e && *e >= '0' && *e <= '2' && !e[1] ? *e - '0' : 2;
+        store_verify_ = e && *e >= '0' && *e <= '2' && !e[1] ? *e - '0' : (e && !strcmp(e, "lens") ? 3 : STORE_VERIFY_AUTO);
     }
     return store_verify_;
 }
@@ -523,9 +526,11 @@ i32 store_set_parity(RagStore *s, i32 k, i32 m)
  * when the journal had a damaged record or header (its copy kept as PATH.j.damaged). Any pointer may be NULL. */
 void store_integrity(RagStore *s, i64 *blocks, i64 *bad, i64 *fixed, i64 *rows_bad, i64 *rows_healed, i32 *jdamaged)
 {
+    pthread_mutex_lock(&s->heal_mu);                             /* the lens and row rebuilds count under it */
     if (blocks) *blocks = s->sum_blocks;
     if (bad) *bad = s->sum_bad;
     if (fixed) *fixed = s->sum_fixed;
+    pthread_mutex_unlock(&s->heal_mu);
 #if defined(__GNUC__)
     if (rows_bad) *rows_bad = __atomic_load_n(&s->rot_rows, __ATOMIC_RELAXED);
     if (rows_healed) *rows_healed = __atomic_load_n(&s->rot_healed, __ATOMIC_RELAXED);
@@ -583,3 +588,160 @@ static i32 store_row_heal_(RagStore *s, i32 r)
     free(mem);
     return STORE_RCK(s, r) == store_rck_row_(s, r);
 }
+
+/* ---- the lens: a file checked block by block when its blocks are needed, and by a thread in order ---- */
+
+static i32 store_lens_ms_ = 4;      /* the thread's pause between two blocks: 64 KiB every 4 ms, 16 MB/s (tests: 0) */
+
+/* block b of the file through rfd against its digest; damaged, its group rebuilt from the parity and written back
+ * through wfd (-1: found, not fixed). mem: (1 + 3m) blocks. 0 intact (or rebuilt), -1 damaged beyond repair. */
+static i32 ssum_vouch_blk_(const SSum *z, int rfd, int wfd, u64 b, u8 *mem, i64 *bad, i64 *fixed)
+{
+    size_t B = (size_t)1 << z->blog;
+    u8 h[32];
+    SJob j;
+    if (ssum_read_(rfd, mem, B, b << z->blog) == 0) { b3_hash(mem, B, h); if (!memcmp(h, z->tab + b * 32u, 32)) return 0; }
+    memset(&j, 0, sizeof(j));
+    j.z = z; j.heal = wfd >= 0; j.parity = b >= z->N; j.gstep = 1; j.ubad = ~(u64)0;
+    ssum_group_(&j, b < z->N ? b % z->G : (b - z->N) / z->m, rfd, wfd, mem);
+    *bad += j.bad; *fixed += j.fixed;
+    if (j.fixed && fdatasync(wfd) != 0) return -1;
+    if (ssum_read_(rfd, mem, B, b << z->blog) != 0) return -1;
+    b3_hash(mem, B, h);
+    return memcmp(h, z->tab + b * 32u, 32) == 0 ? 0 : -1;
+}
+
+/* the blocks under file bytes [off, off + n), at a load (no store yet): 0 every one intact or rebuilt, else -1 */
+static i32 ssum_vouch_(const SSum *z, const char *path, i32 ro, u64 off, u64 n)
+{
+    i64 bad = 0, fixed = 0;
+    int rfd, wfd;
+    u64 b, e;
+    u8 *mem;
+    i32 r = 0;
+    if (!z || !z->tab || !n) return 0;
+    if (off + n > z->N << z->blog) return -1;                    /* past the data blocks: not what the table covers */
+    if (!(mem = (u8 *)malloc(((size_t)1 + 3u * z->m) << z->blog))) return -1;
+    rfd = open(path, O_RDONLY);
+    wfd = ro ? -1 : open(path, O_RDWR);
+    if (rfd < 0) r = -1;
+    for (b = off >> z->blog, e = (off + n - 1) >> z->blog; !r && b <= e; ++b) r = ssum_vouch_blk_(z, rfd, wfd, b, mem, &bad, &fixed);
+    if (rfd >= 0) close(rfd);
+    if (wfd >= 0) close(wfd);
+    free(mem);
+    return r;
+}
+
+/* block b of the loaded file, once: under heal_mu, its bit set when it is intact (or was rebuilt); 0, or -1 damaged */
+static i32 store_vouch_b_(RagStore *s, i64 b)
+{
+    const SSum *z = (const SSum *)s->msum;
+    i32 r = 0;
+    u64 w = (u64)1 << (b & 63);
+    if (!s->vbits || b < 0 || b >= s->vblocks) return 0;
+#if defined(__GNUC__)
+    if (__atomic_load_n(&s->vbits[b >> 6], __ATOMIC_ACQUIRE) & w) return 0;
+#endif
+    pthread_mutex_lock(&s->heal_mu);
+    if (!(s->vbits[b >> 6] & w)) {
+        r = ssum_vouch_blk_(z, s->mfd, s->ro ? -1 : s->mfd, (u64)b, s->vmem, &s->sum_bad, &s->sum_fixed);
+#if defined(__GNUC__)
+        if (!r) __atomic_fetch_or(&s->vbits[b >> 6], w, __ATOMIC_RELEASE);
+#else
+        if (!r) s->vbits[b >> 6] |= w;
+#endif
+    }
+    pthread_mutex_unlock(&s->heal_mu);
+    return r;
+}
+
+/* the blocks under [p, p + n) of the loaded file's mapping (bytes elsewhere: nothing to check); 0, or -1 damaged */
+static i32 store_vouch_(RagStore *s, const void *p, size_t n)
+{
+    const SSum *z = (const SSum *)s->msum;
+    const u8 *m0 = (const u8 *)s->map, *q = (const u8 *)p;
+    i64 b, e;
+    i32 r = 0;
+    if (!s->vbits || !n || q < m0 || q + n > m0 + s->map_len) return 0;
+    for (b = (i64)((size_t)(q - m0) >> z->blog), e = (i64)((size_t)(q - m0 + n - 1) >> z->blog); b <= e; ++b) r |= store_vouch_b_(s, b);
+    return r;
+}
+
+/* the bytes of text v (store_tx_copy_'s walk over the heap's blocks) */
+static i32 store_tx_vouch_(RagStore *s, u64 v)
+{
+    i64 at = STORE_TXOFF(v), n = STORE_TXLEN(v), done = 0;
+    i32 r = 0;
+    if (!s->vbits) return 0;
+    while (done < n) {
+        i64 p = at + done, room = STORE_TXB - (p & (STORE_TXB - 1)), take = n - done < room ? n - done : room;
+        r |= store_vouch_(s, s->tx.b[p >> STORE_TXSHIFT] + (p & (STORE_TXB - 1)), (size_t)take);
+        done += take;
+    }
+    return r;
+}
+
+/* every block not checked yet (before a save or a snapshot copies the file's bytes into a new one under fresh digests):
+ * how many stayed damaged */
+static i64 store_lens_finish_(RagStore *s)
+{
+    i64 b, bad = 0;
+    for (b = 0; s->vbits && b < s->vblocks; ++b) bad += store_vouch_b_(s, b) != 0;
+    return bad;
+}
+
+static void *store_lens_(void *arg)
+{
+    RagStore *s = (RagStore *)arg;
+    i64 b;
+    pthread_mutex_lock(&s->lens_mu);
+    for (b = 0; b < s->vblocks && !s->lens_stop; ++b) {
+        pthread_mutex_unlock(&s->lens_mu);
+        store_vouch_b_(s, b);
+        pthread_mutex_lock(&s->lens_mu);
+        s->lens_at = b + 1;
+        if (store_lens_ms_ > 0 && !s->lens_stop) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += (long)store_lens_ms_ * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += ts.tv_nsec / 1000000000L; ts.tv_nsec %= 1000000000L; }
+            pthread_cond_timedwait(&s->lens_cv, &s->lens_mu, &ts);
+        }
+    }
+    pthread_mutex_unlock(&s->lens_mu);
+    return (void *)0;
+}
+
+/* after a load with the lens: the bitmap, the scratch, and the thread. Without memory or a thread: every block now */
+static void store_lens_start_(RagStore *s)
+{
+    const SSum *z = (const SSum *)s->msum;
+    if (!z || !z->tab || s->mfd < 0 || !s->map) return;
+    s->vblocks = (i64)(z->N + z->P);
+    s->vbits = (u64 *)calloc((size_t)((s->vblocks + 63) >> 6), sizeof(u64));
+    s->vmem = (u8 *)malloc(((size_t)1 + 3u * z->m) << z->blog);
+    if (!s->vbits || !s->vmem) { free(s->vbits); s->vbits = (u64 *)0; free(s->vmem); s->vmem = (u8 *)0; return; }
+    s->lens_run = pthread_create(&s->lens_th, (const pthread_attr_t *)0, store_lens_, s) == 0;
+    if (!s->lens_run) store_lens_finish_(s);
+}
+
+static void store_lens_stop_(RagStore *s)
+{
+    if (!s->lens_run) return;
+    pthread_mutex_lock(&s->lens_mu);
+    s->lens_stop = 1;
+    pthread_cond_signal(&s->lens_cv);
+    pthread_mutex_unlock(&s->lens_mu);
+    pthread_join(s->lens_th, (void **)0);
+    s->lens_run = 0;
+}
+
+/* the lens's progress: blocks checked in order so far, and of how many (0 and 0: the load checked every block) */
+void store_lens_info(RagStore *s, i64 *done, i64 *total)
+{
+    pthread_mutex_lock(&s->lens_mu);
+    *done = s->vbits ? (s->lens_run ? s->lens_at : s->vblocks) : 0;
+    *total = s->vbits ? s->vblocks : 0;
+    pthread_mutex_unlock(&s->lens_mu);
+}
+

@@ -353,6 +353,15 @@ VI_API int vi_set_parity(vi_db *db, int data, int parity)
     return store_set_parity(db->s, (i32)data, (i32)parity) == 0 ? 0 : vi_fail_(-1, "data is 1 to 128 blocks and parity 0 to 64", (const char *)0, (const char *)0);
 }
 VI_API void vi_set_verify(int level) { store_set_verify((i32)level); }
+VI_API int vi_lens(vi_db *db, vi_i64 *done, vi_i64 *total)
+{
+    i64 d, t;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    store_lens_info(db->s, &d, &t);
+    if (done) *done = (vi_i64)d;
+    if (total) *total = (vi_i64)t;
+    return 0;
+}
 VI_API void vi_set_check_reads(vi_db *db, int on) { if (db) store_set_check_reads(db->s, (i32)on); }
 VI_API int vi_integrity(vi_db *db, vi_health *h)
 {

@@ -290,6 +290,17 @@ typedef struct {
     void    *msum;          /* the loaded file's layout and digests (an SSum), to rebuild blocks a row comes from */
     int      mfd;           /* that file, open for the rebuilds (-1: none) */
     pthread_mutex_t heal_mu; /* one rebuild at a time */
+    /* the lens (a file larger than RAM, or VECINDEX_VERIFY=lens): the load checked the header, the small index arrays
+     * and the label table; the rest is checked when it is needed - a text before it is read, everything before a save
+     * - and by a thread that walks the file one block at a time, in order. Rows are checked on every read anyway. */
+    u64     *vbits;         /* a bit a block of the file (data, then parity): checked since the load. NULL: no lens */
+    i64      vblocks;       /* blocks vbits covers */
+    u8      *vmem;          /* scratch for a check and a rebuild, under heal_mu */
+    i64      lens_at;       /* the lens thread's next block (under lens_mu) */
+    i32      lens_run, lens_stop;
+    pthread_t lens_th;
+    pthread_mutex_t lens_mu;
+    pthread_cond_t lens_cv;
     i32      vreads;        /* test every row a search uses against its check (store_set_check_reads; default on) */
     i64      rot_rows, rot_healed;   /* rows that failed their check and stayed out, and those rebuilt from parity */
     i32      jdamaged;      /* the journal had a damaged record or header: its copy is PATH.j.damaged */
@@ -846,6 +857,8 @@ RagStore *store_new(Arena *a, i32 dim)
     s->sum_k = STORE_SUM_K; s->sum_m = STORE_SUM_M;
     s->mfd = -1; s->vreads = 1;
     pthread_mutex_init(&s->heal_mu, (const pthread_mutexattr_t *)0);
+    pthread_mutex_init(&s->lens_mu, (const pthread_mutexattr_t *)0);
+    pthread_cond_init(&s->lens_cv, (const pthread_condattr_t *)0);
     s->snap_last = 2;
     s->spill_fd = -1;
     s->spill_min = STORE_SPILL_MIN;
@@ -885,9 +898,12 @@ static void store_live_stop_(RagStore *s);
 static i32 store_snap_reap_(RagStore *s, i32 block);
 
 static void store_msum_free_(void *p);                          /* store_sum.c */
+static void store_lens_stop_(RagStore *s);                       /* store_sum.c */
+static i32 store_tx_vouch_(RagStore *s, u64 v);                 /* store_sum.c */
 
 void store_destroy(RagStore *s)
 {
+    store_lens_stop_(s);
     store_live_stop_(s);
     pthread_mutex_lock(&s->snap_mu);
     store_snap_reap_(s, 1);                                      /* a snapshot still being written finishes first */
@@ -904,6 +920,8 @@ void store_destroy(RagStore *s)
     arena_free(&s->idx_arena);
     scol_free_(&s->vec); scol_free_(&s->idc); scol_free_(&s->metac); scol_free_(&s->vsc); scol_free_(&s->txo); scol_free_(&s->rck); scol_free_(&s->nrm); scol_free_(&s->numc);
     if (s->msum) { store_msum_free_(s->msum); s->msum = (void *)0; }
+    free(s->vbits); s->vbits = (u64 *)0; free(s->vmem); s->vmem = (u8 *)0;
+    pthread_mutex_destroy(&s->lens_mu); pthread_cond_destroy(&s->lens_cv);
     if (s->mfd >= 0) { close(s->mfd); s->mfd = -1; }
     store_tx_free_(s);
     if (s->lex) { lex_free(s->lex); free(s->lex); s->lex = (Lex *)0; }

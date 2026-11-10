@@ -278,11 +278,17 @@ VI_API int vi_snapshot_wait(vi_db *db, int block);
  * on (data 1-128, parity 0-64; 0: digests only): 0, or -1 out of range. */
 VI_API int vi_set_parity(vi_db *db, int data, int parity);
 
-/* What opening checks, for every vi_open after the call (process-wide): 2 every block, the default; 1 only the
- * blocks that hold the header; 0 nothing (to rescue a file whose checksums are gone). $VECINDEX_VERIFY sets the
- * default. Damaged blocks are rebuilt from the parity and written back; when they cannot be, a damaged index is
- * built again from the rows and damaged rows make vi_open fail - vi_error says why. */
+/* What opening checks, for every vi_open after the call (process-wide): 2 every block; 3 the lens - the header,
+ * the index's small arrays and the label table at once, a text before it is read, every block before a save or a
+ * snapshot, and the rest by a thread that walks the file one 64 KiB block at a time (16 MB/s), so a store larger
+ * than RAM opens in a moment; 1 only the blocks that hold the header; 0 nothing (to rescue a file whose checksums
+ * are gone). The default: 2 for a file up to half of RAM, 3 above; $VECINDEX_VERIFY (0, 1, 2 or lens) sets it.
+ * Rows are checked on every read whatever the level. Damaged blocks are rebuilt from the parity and written back;
+ * when they cannot be, a damaged index is built again from the rows and damaged rows make vi_open fail (2) or stay
+ * out of every result (3) - vi_error says why. */
 VI_API void vi_set_verify(int level);
+/* The lens's walk: blocks checked so far and of how many (both 0: the open checked every block). */
+VI_API int vi_lens(vi_db *db, vi_i64 *done, vi_i64 *total);
 VI_API const char *vi_open_error(void);   /* vi_error, under its older name */
 
 /* Every row also carries a 32-bit check of its vector, id and tag, tested whenever a search re-scores it or vi_get

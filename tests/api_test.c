@@ -7,6 +7,7 @@
 #include <math.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define DIM 32
 #define N 3000
@@ -453,6 +454,19 @@ int main(void)
         db = vi_open(fn, 0, 0);
         vi_set_verify(2);
         check(db && vi_count(db) == 3000, "vi_set_verify 1: opens, checking the header's blocks only");
+        if (db) vi_close(db);
+        vi_set_verify(3);
+        db = vi_open(fn, 0, 0);
+        vi_set_verify(2);
+        {   vi_i64 ld = 0, lt = 0;
+            int tries;
+            for (tries = 0; db && tries < 400; ++tries) {          /* 16 MB/s: a small file is walked in a moment */
+                vi_lens(db, &ld, &lt);
+                if (lt > 0 && ld >= lt) break;
+                { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 10000000L; nanosleep(&ts, (struct timespec *)0); }
+            }
+            check(db && vi_count(db) == 3000 && lt > 0 && ld == lt, "vi_set_verify 3 (the lens): opens at once, vi_lens walks every block");
+        }
         if (db) vi_close(db);
         remove(fn); remove(jn);
     }

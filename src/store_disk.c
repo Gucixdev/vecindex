@@ -509,6 +509,7 @@ i32 store_save(RagStore *s, const char *path)
     u64 stamp;
     if (s->ro) return -1;
     stamp = store_stamp_new_();
+    store_lens_finish_(s);                                       /* the lens: every block checked before it is copied */
 
     pthread_mutex_lock(&s->snap_mu);                             /* never beside a snapshot child: it may be reading rows */
     store_snap_reap_(s, 1);                                      /* the compaction below moves, and writing the same file */
@@ -649,6 +650,7 @@ i32 store_snapshot(RagStore *s, const char *path)
     i32 home;
     pid_t pid;
     if (s->ro) return -1;
+    store_lens_finish_(s);                                       /* the lens: every block checked before it is copied */
     if (pthread_mutex_trylock(&s->snap_mu) != 0) return 1;     /* a build or a save holds it: try later */
     if (store_snap_reap_(s, 0) == 1) { pthread_mutex_unlock(&s->snap_mu); return 1; }
     home = !s->jpath || strcmp(s->jpath, path) == 0;
@@ -795,12 +797,16 @@ static i32 store_col_r_(RagStore *s, SCol *c, u8 *map, size_t len, FILE *f, size
     return 0;
 }
 
-static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows)
+/* vz (the lens): the blocks under the index's header and small arrays checked before anything is derived from them -
+ * a damaged cluster table would send a scan outside the codes */
+static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows, const SSum *vz, const char *path, i32 ro)
 {
     i32 h[8];
     Tq *t;
     size_t o = STORE_AL(off);
-    i32 *hp = (i32 *)store_take_(map, len, f, o, 4, 8);
+    i32 *hp;
+    if (vz && ssum_vouch_(vz, path, ro, (u64)o, 32)) return (Tq *)0;
+    hp = (i32 *)store_take_(map, len, f, o, 4, 8);
     if (!hp) return (Tq *)0;
     memcpy(h, hp, sizeof(h));
     if (!map) free(hp);
@@ -820,6 +826,7 @@ static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows)
         t->cstart = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nc + 1);
         o = STORE_AL(o + ((size_t)t->nc + 1) * 4);
     }
+    if (vz && ssum_vouch_(vz, path, ro, (u64)STORE_AL(off), (u64)(o - STORE_AL(off)))) { tq_free(t); return (Tq *)0; }
     if (h[6]) { t->slot_row = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nblk * 32); o = STORE_AL(o + (size_t)t->nblk * 128); }
     t->codes = (u8 *)store_take_(map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd * 16);
     if (h[7] == 5 && t->codes) {                                 /* the cascade's 1-bit codes follow */
@@ -889,7 +896,7 @@ static i32 store_rck_fill_(RagStore *s)
  * pages arrive on first touch, the id lookups are built on first use. dend: where a v9 file's data ends (0: the file's
  * end); ubad: the first byte of a block its checks could not rebuild (~0: none) - before the index the load is refused,
  * inside it the index is built again from the rows. */
-static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *hdr, i32 ro, u64 dend, u64 ubad)
+static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *hdr, i32 ro, u64 dend, u64 ubad, i32 lvl, const SSum *vz)
 {
     RagStore *s;
     i32 live = hdr[3], dim = hdr[2], ext[4], v7 = hdr[1] == STORE_VERSION7 || hdr[1] == STORE_VERSION8 || hdr[1] == STORE_VERSION9,
@@ -942,7 +949,8 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
         s->has_text = 1;
     }
     if (hdr[1] == STORE_VERSION9 && (ext[0] & 4)) {             /* the label table */
-        if (store_labels_r_(s, f, STORE_AL(o_kind), len) != 0) { fclose(f); store_destroy(s); return (RagStore *)0; }
+        if ((vz && ssum_vouch_(vz, path, ro, (u64)STORE_AL(o_kind), (u64)STORE_LABELS * (STORE_LABEL_NAME + 8)))
+            || store_labels_r_(s, f, STORE_AL(o_kind), len) != 0) { fclose(f); store_destroy(s); return (RagStore *)0; }
         o_kind = STORE_AL(o_kind) + (size_t)STORE_LABELS * (STORE_LABEL_NAME + 8);
     }
     if (hdr[1] == STORE_VERSION9 && (ext[0] & 8)) {             /* the rows' numbers */
@@ -978,7 +986,7 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
         }
     }
     if (texts && store_heap_r_(s, map, len, f, o_heap, hlen)) { fclose(f); store_destroy(s); return (RagStore *)0; }
-    if (texts && (!dend || store_verify_level_() < 2)) {        /* nothing vouched for the offsets: each inside the heap */
+    if (texts && (!dend || lvl != 2)) {        /* nothing vouched for the offsets: each inside the heap */
         i32 r;                                                   /* (tests/fuzz_store.c: a v8 file's pointed past it, and
                                                                   * the first save read text from a block that is not there) */
         for (r = 0; r < live; ++r) {
@@ -994,6 +1002,7 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     s->live = live;
     if (!o_rck && live > 0 && store_rck_fill_(s)) { fclose(f); store_destroy(s); return (RagStore *)0; }   /* older file */
     s->idmap_ok = live == 0;
+    if (vz && ssum_vouch_(vz, path, ro, (u64)o_kind, 1)) { fclose(f); store_destroy(s); return (RagStore *)0; }
     if (map) kind = map[o_kind];
     else if (fseeko(f, (off_t)o_kind, SEEK_SET) != 0 || fread(&kind, 1, 1, f) != 1) { fclose(f); store_destroy(s); return (RagStore *)0; }
     if (drop_idx) kind = 0;
@@ -1005,7 +1014,7 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
         if (!s->idx || s->idx->dim != s->dim) { store_destroy(s); return (RagStore *)0; }   /* another dimension: not ours */
         s->built_upto = live;
     } else {
-        if (kind == 2) s->tq = store_tq_r_(map, len, f, o_kind + 1, live);
+        if (kind == 2) s->tq = store_tq_r_(map, len, f, o_kind + 1, live, map ? vz : (const SSum *)0, path, ro);
         fclose(f);
         s->fast = 1; s->fast_target = 0.97f;                     /* fast stores are saved without an engine index */
         if (s->tq) { s->built_upto = live; s->cascade = s->tq->codes1 != (u8 *)0; }   /* saved with the cascade: on */
@@ -1022,6 +1031,7 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
     i32 hdr[4];
     RagStore *s;
     i32 live, i, lvl = store_verify_level_(), sums;
+    struct stat pst;
     u8 has_idx;
     SSum z;
     i64 bad, fixed;
@@ -1029,7 +1039,10 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
     strcpy(store_lerr_, "cannot be read, or not a store file of a version this build knows");
     /* the checks come first, before even the header is trusted: they rebuild a damaged one too */
     memset(&z, 0, sizeof(z));
-    sums = store_sum_load_(path, ro, lvl, &z, &bad, &fixed, &ubad);
+    if (lvl == STORE_VERIFY_AUTO)                                /* every block when the file fits RAM twice, else the lens */
+        lvl = stat(path, &pst) == 0 && (i64)pst.st_size > store_ram_half_() ? 3 : 2;
+    if (lvl == 3 && eng_host_be_()) lvl = 2;                     /* the lens checks the mapping: little-endian hosts only */
+    sums = store_sum_load_(path, ro, lvl == 3 ? 1 : lvl, &z, &bad, &fixed, &ubad);
     if (sums < 0) { strcpy(store_lerr_, "some blocks could not be read to check them"); return (RagStore *)0; }
     if (!(f = fopen(path, "rb"))) { free(z.tab); return (RagStore *)0; }
     if (STORE_R32(f, hdr, 4) || (u32)hdr[0] != STORE_MAGIC
@@ -1042,7 +1055,7 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
     }
     if (sums && hdr[1] == 4) { free(z.tab); z.tab = (u8 *)0; }
     if (hdr[1] != 4) {
-        s = store_load_v5_(a, path, f, hdr, ro, sums ? z.D : 0, lvl > 0 ? ubad : ~(u64)0);
+        s = store_load_v5_(a, path, f, hdr, ro, sums ? z.D : 0, lvl > 0 ? ubad : ~(u64)0, lvl, lvl == 3 && sums && z.tab ? &z : (const SSum *)0);
         if (s) {
             store_lerr_[0] = 0;
             if (sums) { s->sum_blocks = (i64)(z.N + z.P); s->sum_bad = bad; s->sum_fixed = fixed; s->sum_k = (i32)z.k; s->sum_m = (i32)z.m; }
@@ -1050,6 +1063,7 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
                 memcpy(s->msum, &z, sizeof(SSum));
                 z.tab = (u8 *)0;
                 s->mfd = open(path, ro ? O_RDONLY : O_RDWR);
+                if (lvl == 3) store_lens_start_(s);              /* the rest of the file: checked as it is needed */
             }
         }
         if (sums) free(z.tab);

@@ -486,6 +486,9 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
             p = vs_str_(p, " damaged="); p = vs_i64_(p, bad); p = vs_str_(p, " rebuilt="); p = vs_i64_(p, fx);
             p = vs_str_(p, " rows_bad="); p = vs_i64_(p, rb); p = vs_str_(p, " rows_healed="); p = vs_i64_(p, rh);
             p = vs_str_(p, jd ? " journal=damaged" : " journal=ok"); }
+        {   i64 ld, lt;
+            store_lens_info(c->t->s, &ld, &lt);
+            if (lt) { p = vs_str_(p, " lens="); p = vs_i64_(p, ld); *p++ = '/'; p = vs_i64_(p, lt); } }
         vs_line_reply_(w, c, o, p);
     } else if (VS_CMD("build")) { vs_build_(c); vs_line_reply_(w, c, o, vs_str_(o, "ok")); }
     else if (VS_CMD("save")) { if (vs_save_(c) == 0) vs_line_reply_(w, c, o, vs_str_(o, "ok")); else VS_LINE_ERR("save failed"); }

@@ -307,9 +307,14 @@ apart at least. `vi_set_parity(db, data, parity)` changes the group for the file
 group, confirmed by its digest and written back to the file (unless the store was opened read-only). When a group has
 more damage than parity: inside the saved index, the index is built again from the rows; anywhere else (rows, ids,
 tags, texts) `vi_open` fails and `vi_open_error()` says where, rather than serving rows that are not the ones written.
-`vi_integrity` reports what the open found. Checking every block reads the whole file once; `vi_set_verify(1)` (or
-`VECINDEX_VERIFY=1`) checks only the header's blocks, for stores too large to read at every start - then run
-`vi_scrub`, which reads every block, the parity and both copies of the table from the disk, and with `repair` rebuilds
+`vi_integrity` reports what the open found. Checking every block reads the whole file once, so that is what a
+file up to half of RAM gets. A larger one opens with the lens (`vi_set_verify(3)`, `VECINDEX_VERIFY=lens`): the open
+checks the header, the index's small arrays and the label table; a text is checked before it is read; a save or a
+snapshot checks every block not checked yet before it copies them; and a thread walks the file one 64 KiB block at a
+time in order (16 MB/s, `vi_lens` shows how far), rebuilding what it finds. Rows are checked on every read at every
+level - a row that fails is rebuilt or left out of the result - so nothing damaged is served while the walk is under
+way; damage beyond repair in the rows then shows as rows left out instead of a refused open. `vi_set_verify(1)` (or
+`VECINDEX_VERIFY=1`) checks only the header's blocks and nothing after - then run `vi_scrub`, which reads every block, the parity and both copies of the table from the disk, and with `repair` rebuilds
 and rewrites what it can, beside a store that has the file open. `VECINDEX_VERIFY=0` opens a file whose checksums are
 gone.
 

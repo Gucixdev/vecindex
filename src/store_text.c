@@ -50,7 +50,8 @@ i32 store_get_text(RagStore *s, i64 doc_id, char *buf, i32 cap)
     if (r >= 0) {
         u64 v = s->has_text ? STORE_TXO(s, r) : 0;
         n = STORE_TXLEN(v);
-        if (n > 0 && buf && cap > 0) store_tx_copy_(&s->tx, v, buf, n < cap ? n : cap);
+        if (n > 0 && store_tx_vouch_(s, v) != 0) n = -1;       /* the lens: its blocks checked first; damaged: not served */
+        else if (n > 0 && buf && cap > 0) store_tx_copy_(&s->tx, v, buf, n < cap ? n : cap);
     }
     pthread_rwlock_unlock(&s->lock);
     return n;
@@ -130,7 +131,7 @@ static void store_lex_ready_(RagStore *s)
     lex_init(x);
     for (r = 0; r < s->count; ++r) {
         u64 v = STORE_TXO(s, r);
-        if (!v || STORE_DEAD(s, r)) continue;
+        if (!v || STORE_DEAD(s, r) || store_tx_vouch_(s, v) != 0) continue;   /* a damaged text is left out */
         store_tx_copy_(&s->tx, v, buf, STORE_TXLEN(v));
         lex_add(x, STORE_ID(s, r), buf, STORE_TXLEN(v));
     }

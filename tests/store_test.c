@@ -686,6 +686,26 @@ static i32 sdx_same_(RagStore *l, const f32 *ref, i32 nref)          /* rows 0, 
     return 1;
 }
 
+/* the offset of needle in the file's bytes, or -1 */
+static i64 sdl_find_(const u8 *b, size_t n, const char *needle)
+{
+    size_t k = strlen(needle), i;
+    for (i = 0; i + k <= n; ++i) if (b[i] == (u8)needle[0] && !memcmp(b + i, needle, k)) return (i64)i;
+    return -1;
+}
+/* the lens has walked every block (bounded wait) */
+static i32 sdl_wait_(RagStore *l)
+{
+    i64 d = 0, t = 1;
+    i32 i;
+    for (i = 0; i < 2000; ++i) {
+        store_lens_info(l, &d, &t);
+        if (t > 0 && d >= t) return 1;
+        { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 5000000L; nanosleep(&ts, (struct timespec *)0); }
+    }
+    return 0;
+}
+
 #define SDX_N 3000
 #define SDX_DIM 24
 static i32 sd_sums_(Arena *a)
@@ -857,6 +877,107 @@ static i32 sd_sums_(Arena *a)
                        "             a damaged journal frame stops replay with a copy kept, a torn tail does not\n");
     remove(path); remove(jn); remove(jd); remove(bare);
     free(clean); free(x); free(buf); free(jn); free(jd);
+    return ok;
+}
+
+/* the lens (VECINDEX_VERIFY=lens, the default above half of RAM): the load checks only the header's group, the index's
+ * small arrays and the label table - a damaged label table is rebuilt there; a text is checked before it is read -
+ * rebuilt, or not served when it cannot be; a thread walks the rest one block at a time and rebuilds what it finds;
+ * a store being closed stops it at once */
+static i32 sd_lens_(Arena *a)
+{
+    const char *path = "/tmp/store_demo_lens.vxi";
+    char jn[64], tb[64];
+    f32 *x = (f32 *)malloc((size_t)SDX_N * SDX_DIM * sizeof(f32));
+    u8 *clean;
+    size_t clen;
+    u32 st = 99u;
+    RagStore *s, *l;
+    SSum z;
+    StoreCnf c;
+    const char *bad = (const char *)0;
+    i64 nb, bd, fx, rb, rh, d, t, off;
+    i32 i, ok = 1, jdm, keep = store_lens_ms_;
+    sprintf(jn, "%s.j", path);
+    remove(path); remove(jn);
+    for (i = 0; i < SDX_N * SDX_DIM; ++i) x[i] = sd_f_(&st);
+    s = store_new(a, SDX_DIM);
+    store_set_parity(s, 2, 1);
+    for (i = 0; i < SDX_N; ++i) {
+        char txt[48];
+        sprintf(txt, "LENSTEXT-%d some words about row %d", i, i);
+        if (i == 7) {                                            /* 400 kB: blocks that hold nothing but this text */
+            char *big = (char *)malloc(400000);
+            memset(big, 'w', 400000); memcpy(big, "LENSTEXT-7 ", 11); memcpy(big + 200000, "MIDMARK", 7);
+            store_put_text(s, x + (size_t)i * SDX_DIM, 5000 + i, 0, big, 400000);
+            free(big);
+        } else if (i < 10) store_put_text(s, x + (size_t)i * SDX_DIM, 5000 + i, 0, txt, (i32)strlen(txt));
+        else store_add(s, x + (size_t)i * SDX_DIM, 5000 + i);
+    }
+    if (store_label_row(s, 5005, "lenslabel", 1, &bad) != 0) ok = 0;
+    store_build(s);
+    if (store_save(s, path) != 0 || sdx_trailer_(path, &z) != 0) { store_destroy(s); free(x); print_cstr("  lens: save FAILED\n"); return 0; }
+    store_destroy(s);
+    clean = sdx_slurp_(path, &clen);
+    store_lens_ms_ = 0;
+    store_set_verify(3);
+
+    l = store_load(a, path);                                     /* clean: every block walked, nothing found */
+    if (!l || !sdl_wait_(l)) ok = 0;
+    else {
+        store_lens_info(l, &d, &t);
+        store_integrity(l, &nb, &bd, &fx, &rb, &rh, &jdm);
+        if (t != (i64)(z.N + z.P) || bd || fx) { print_cstr("  lens: a clean walk FAILED\n"); ok = 0; }
+    }
+    if (l) store_destroy(l);
+
+    off = sdl_find_(clean, clen, "LENSTEXT-3 ");                 /* a text's block: rebuilt before the text is read */
+    sdx_flip_(path, (u64)off + 2);
+    l = store_load(a, path);
+    if (!l || store_get_text(l, 5003, tb, sizeof(tb)) != 33 || memcmp(tb, "LENSTEXT-3 some words about row 3", 33)) {
+        print_cstr("  lens: a damaged text rebuilt before it is read FAILED\n"); ok = 0;
+    }
+    if (l) { sdl_wait_(l); store_integrity(l, &nb, &bd, &fx, &rb, &rh, &jdm); if (fx < 1) ok = 0; store_destroy(l); }
+    if (store_scrub(path, 0, &fx) != 0) { print_cstr("  lens: the rebuilt text block was not written back\n"); ok = 0; }
+
+    sdx_spit_(path, clean, clen);                                /* the label table: checked, and rebuilt, at the load */
+    off = sdl_find_(clean, clen, "lenslabel");
+    sdx_flip_(path, (u64)off + 1);
+    l = store_load(a, path);
+    if (!l || store_label_cnf(l, "lenslabel", (const char *)0, (const char *)0, &c, &bad) != 0) { print_cstr("  lens: a damaged label table FAILED\n"); ok = 0; }
+    if (l) store_destroy(l);
+    store_lens_ms_ = 1000;                                       /* the thread asleep: the load alone wrote it back */
+    l = store_load(a, path);
+    if (l) store_destroy(l);
+    store_lens_ms_ = 0;
+
+    sdx_spit_(path, clean, clen);                                /* a text's block and its group's other one, in the rows: lost */
+    off = sdl_find_(clean, clen, "MIDMARK");
+    {   u64 b = (u64)off >> 16, p2 = b % z.G, rows_end = 64 + (u64)SDX_N * SDX_DIM * 4;
+        while (p2 == 0 || p2 == b || ((p2 + 1) << 16) > rows_end) { p2 += z.G; if (p2 >= z.N) break; }
+        if (p2 >= z.N || ((p2 + 1) << 16) > rows_end) { print_cstr("  lens: no rows block shares a group with the text's (layout changed?) FAILED\n"); ok = 0; }
+        sdx_flip_(path, (u64)off + 1);
+        sdx_flip_(path, (p2 << 16) + 100); }
+    l = store_load(a, path);
+    if (!l) { print_cstr("  lens: a load with damage beyond repair in a text FAILED\n"); ok = 0; }
+    else {
+        if (store_get_text(l, 5007, (char *)0, 0) != -1 || store_get_text(l, 5003, tb, sizeof(tb)) != 33) { print_cstr("  lens: a text beyond repair was served, or a sound one was not\n"); ok = 0; }
+        if (!sdl_wait_(l)) ok = 0;
+        store_integrity(l, &nb, &bd, &fx, &rb, &rh, &jdm);
+        if (bd < 2) { print_cstr("  lens: the walk did not count the damage\n"); ok = 0; }
+        store_destroy(l);
+    }
+
+    sdx_spit_(path, clean, clen);                                /* a slow lens, closed at once: no wait for it */
+    store_lens_ms_ = 1000;
+    l = store_load(a, path);
+    if (!l) ok = 0; else store_destroy(l);
+    store_lens_ms_ = keep;
+    store_set_verify(2);
+    print_cstr(ok ? "  lens: header, index arrays and labels checked at the load; a text checked before it is read; the walk finds and rebuilds the rest\n"
+                  : "  lens FAILED\n");
+    remove(path); remove(jn);
+    free(clean); free(x);
     return ok;
 }
 
@@ -1543,6 +1664,7 @@ int main(void)
     if (!sd_cascade_(a)) ok = 0;
     if (!sd_nums_(a)) ok = 0;
     if (!sd_sums_(a)) ok = 0;
+    if (!sd_lens_(a)) ok = 0;
     print_cstr(ok ? "  OK\n" : "  FAIL\n");
     print_flush();
     arena_free(a);
