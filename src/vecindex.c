@@ -10,6 +10,7 @@
  * Or compile it into a program like any other part of vecindex: one translation unit, -Isrc -Iinclude. */
 #include "store.c"
 #include "vecindex.h"
+#include <dirent.h>
 
 struct vi_db {
     Arena arena;                /* the store lives in it */
@@ -225,6 +226,49 @@ VI_API vi_db *vi_dir_get(vi_dir *d, const char *name)
     }
     pthread_mutex_unlock(&d->mu);
     return t ? t->db : (vi_db *)0;
+}
+
+/* the k best of every store in the directory: each searched as vi_search, the hits merged by score (smaller first in
+ * an L2 store, bigger first otherwise); stores of another dimension or metric than the first are an error */
+VI_API int vi_dir_search(vi_dir *d, const float *query, int k, vi_i64 *ids, float *scores)
+{
+    DIR *dd;
+    struct dirent *e;
+    vi_i64 *ci;
+    float *cs;
+    int have = 0, n, i, j, metric = -1, dim = -1, r = 0;
+    if (!d) return vi_fail_(-1, "dir is NULL (did vi_dir_open fail? vi_error() said why)", (const char *)0, (const char *)0);
+    if (k < 1) return vi_fail_(-1, "k must be 1 or more", (const char *)0, (const char *)0);
+    if (!query || !ids || !scores) return vi_fail_(-1, "the query is NULL, or ids and scores do not hold k values each", (const char *)0, (const char *)0);
+    if (!(dd = opendir(d->path))) return vi_fail_(-1, d->path, ": cannot list it", (const char *)0);
+    ci = (vi_i64 *)malloc((size_t)k * sizeof(vi_i64));
+    cs = (float *)malloc((size_t)k * sizeof(float));
+    if (!ci || !cs) { free(ci); free(cs); closedir(dd); return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0); }
+    while (r == 0 && (e = readdir(dd)) != (struct dirent *)0) {
+        char name[72];
+        size_t L = strlen(e->d_name);
+        vi_db *db;
+        if (L < 5 || L > 68 || strcmp(e->d_name + L - 4, ".vxi") != 0) continue;   /* PATH.vxi.j and the rest are not stores */
+        memcpy(name, e->d_name, L - 4); name[L - 4] = 0;
+        if (!(db = vi_dir_get(d, name))) { r = -1; break; }      /* vi_error() says why */
+        if (metric < 0) { metric = db->s->metric; dim = db->s->dim; }
+        else if (db->s->metric != metric || db->s->dim != dim) {
+            r = vi_fail_(-1, e->d_name, " has another dimension or metric than the other stores", (const char *)0);
+            break;
+        }
+        if ((n = vi_search(db, query, k, ci, cs)) < 0) { r = -1; break; }
+        for (i = 0; i < n; ++i) {                                /* into the merged top k, best first */
+            float x = cs[i];
+            if (have == k && (metric == 2 ? x >= scores[k - 1] : x <= scores[k - 1])) break;   /* the rest are worse */
+            for (j = have < k ? have++ : k - 1; j > 0 && (metric == 2 ? scores[j - 1] > x : scores[j - 1] < x); --j) {
+                ids[j] = ids[j - 1]; scores[j] = scores[j - 1];
+            }
+            ids[j] = ci[i]; scores[j] = x;
+        }
+    }
+    closedir(dd);
+    free(ci); free(cs);
+    return r ? r : have;
 }
 
 VI_API void vi_dir_close(vi_dir *d)

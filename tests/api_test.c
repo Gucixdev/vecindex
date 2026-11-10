@@ -516,6 +516,46 @@ int main(void)
         remove(fn); remove(jn);
     }
 
+    /* shards: rows split over three stores of a directory, one search over all of them, the same hits as one store */
+    {
+        char dp[64], fp[96];
+        const char *nm[3] = { "s0", "s1", "s2" };
+        vi_dir *dir;
+        vi_db *one = vi_open((const char *)0, DIM, 0), *l2;
+        vi_i64 a[10], b[10];
+        float as[10], bs2[10];
+        int j, na, nb, same = 1, q;
+        sprintf(dp, "/tmp/vecindex_api_shards_%d", (int)getpid());
+        mkdir(dp, 0700);
+        dir = vi_dir_open(dp, DIM, 0);
+        for (i = 0; dir && one && i < N; ++i) { vec_(i, v); vi_add(vi_dir_get(dir, nm[i % 3]), 70000 + i, v); vi_add(one, 70000 + i, v); }
+        sprintf(fp, "%s/notes.txt", dp); f = fopen(fp, "w"); if (f) { fputs("not a store\n", f); fclose(f); }
+        for (q = 0; dir && one && q < 20; ++q) {
+            vec_(q * 149 + 3, v);
+            na = vi_dir_search(dir, v, 10, a, as);
+            nb = vi_search(one, v, 10, b, bs2);
+            same &= na == 10 && nb == 10;
+            for (j = 0; j < na && j < nb; ++j) same &= a[j] == b[j] && (j == 0 || as[j] <= as[j - 1]);
+        }
+        check(dir && one && same, "vi_dir_search over 3 shards: the hits of one store with every row, in order");
+        if (dir) vi_dir_close(dir);
+        sprintf(fp, "%s/l2.vxi", dp);
+        l2 = vi_open(fp, DIM, VI_L2);
+        if (l2) { vec_(1, v); vi_add(l2, 1, v); vi_close(l2); }
+        dir = vi_dir_open(dp, DIM, 0);
+        vec_(3, v);
+        check(dir && vi_dir_search(dir, v, 10, a, as) == -1 && strstr(vi_error(), "another dimension or metric") != 0,
+              "vi_dir_search with a store of another metric: -1, and why");
+        if (dir) vi_dir_close(dir);
+        for (j = 0; j < 4; ++j) {
+            sprintf(fp, "%s/%s.vxi", dp, j < 3 ? nm[j] : "l2"); remove(fp);
+            sprintf(fp, "%s/%s.vxi.j", dp, j < 3 ? nm[j] : "l2"); remove(fp);
+        }
+        sprintf(fp, "%s/notes.txt", dp); remove(fp);
+        rmdir(dp);
+        if (one) vi_close(one);
+    }
+
     free(qs); free(bi); free(bs);
     printf("C API: %s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;

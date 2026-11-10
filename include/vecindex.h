@@ -88,6 +88,13 @@ VI_API vi_dir *vi_dir_open(const char *path, int dim, int flags);
 VI_API vi_db *vi_dir_get(vi_dir *d, const char *name);
 VI_API void vi_dir_close(vi_dir *d);
 
+/* Shards: every store in the directory (each NAME.vxi, opened as vi_dir_get opens it) searched, and the k best hits of
+ * all of them, best first. A store holds at most 2^31 - 1 rows; past that, or past one disk, rows go into several
+ * stores - by id range, by time, by source: the caller picks the store a row goes to - and one search covers them all.
+ * Ids are the caller's, so they should not repeat across stores. Returns how many hits, or -1: a store that cannot be
+ * opened, or one of another dimension or metric than the others (vi_error() names it). */
+VI_API int vi_dir_search(vi_dir *d, const float *query, int k, vi_i64 *ids, float *scores);
+
 /* Dimensions; live rows (added and not deleted). */
 VI_API int vi_dim(const vi_db *db);
 VI_API vi_i64 vi_count(vi_db *db);

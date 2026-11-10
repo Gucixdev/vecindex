@@ -27,7 +27,8 @@ the rotation and the top-k insertion are also proved in Lean 4 and the C code is
 Done and tested since 2026-11-10 (`./run`, 28 steps passing on a 2-vCPU Xeon): grouped search (`vi_search_grouped`,
 the best hit of each `id >> shift` group: one chunk a document), a 64-bit number a row with range filters tested in
 the scan (`vi_set_num`, `vi_search_range`, `vi_batch_set_num`; in the file, the journal and the row checks;
-`tests/store_test.c` finds 5-row ranges anywhere in an IVF store, and a mutation of the scan's range test fails it).
+`tests/store_test.c` finds 5-row ranges anywhere in an IVF store, and a mutation of the scan's range test fails it),
+shards (`vi_dir_search`, the hits of one store with every row, from three).
 
 Open:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a
@@ -35,8 +36,13 @@ Open:
   (now: `vi_search_range` and `vi_search_labeled` each alone)
 - the file format: zones (parts of a store split by id range, time or tag) and namespaces inside a tenant, one
   format readable on every machine (the journal is written in the host's byte order today)
-- scale at both ends: the smallest boards (fewest bytes a vector, RAM to spare) and past one machine's RAM
-  (hierarchical clustering - IVF over IVF - and shards as files, no ceiling)
+- scale at both ends: the smallest boards (fewest bytes a vector, RAM to spare) and past one machine's RAM. Shards as
+  files are in (`vi_dir_search`: one search over every store of a directory); a store holds at most 2^31 - 1 rows
+  (i32 row numbers). The plan for 10^9 rows on one machine, at ~25 bytes a row hot (2-bit codes at d=96, or the
+  1-bit cascade) = 25 GB: the codes read by cluster from the disk instead of mapped whole (the probed clusters only,
+  read ahead in one request), the build streamed in passes over the rows instead of holding them, the shards searched
+  on threads. 10^12 rows is 25 TB: a few disks, still shards as files on one machine - no object store, no cluster.
+  10^15 (25 PB) is out of scope
 - p99 under a steady write load: a burst faster than one core indexes waits in the exact-scan tail, and a rebuild
   holds two indexes; index bursts on more cores and bound the tail
 - the cascade's benchmark, and its shortlist tuned rather than fixed at 8 x R
