@@ -24,7 +24,7 @@
  * coded exactly like a built one; only the clusters age, and tq_add_put keeps the numbers that say when to rebuild.
  *
  *   Tq *tq_build(rows, n, dim, seed, nc, nthreads)   rows: n x dim f32 (unit length), possibly in chunks
- *   tq_search(tq, q, R, rows, filter..., nthreads)    the R best rows by approximate inner product
+ *   tq_search(tq, q, R, rows, dead, filt, nthreads)      the R best rows by approximate inner product
  *   tq_search_many(tq, Q, nq, R, ...)                 the same for a batch, cluster by cluster
  *   tq_add_prep / tq_add_put                          rows n, n+1, ... into the index (prep reads only: no lock)
  *   tq_free
@@ -48,6 +48,9 @@
 /* Rows of a column in chunks of 2^shift rows (one chunk with a large shift = a plain array). A vector column holds
  * f32 rows, or int8 rows (i8 = 1) whose f32 scale sits in a second column. */
 typedef struct TqCol { u8 *const *chunk; i32 shift; size_t esz; i32 i8, dim; const struct TqCol *scale; } TqCol;
+/* what a scan keeps: rows whose i64 tag (meta) has every bit of all and one of any (any 0: no condition), and whose
+ * i64 number (num) lies in [lo, hi]; either column NULL: no such condition */
+typedef struct { const TqCol *meta; i64 all, any; const TqCol *num; i64 lo, hi; } TqFilt;
 #define TQ_AT(c, r) ((c)->chunk[(size_t)(r) >> (c)->shift] + ((size_t)(r) & (((size_t)1 << (c)->shift) - 1u)) * (c)->esz)
 #define TQ_ROW(c, r) ((const f32 *)(const void *)TQ_AT(c, r))
 

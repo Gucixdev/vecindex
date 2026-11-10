@@ -256,7 +256,7 @@ typedef struct {
     const Tq *t; const u8 *lut;
     i32 b0, b1, R;
     const i32 *blks;                 /* IVF: the blocks to scan (b0..b1 index into this list); NULL = blocks b0..b1 */
-    const u64 *dead; const TqCol *meta; i64 all, any; i32 filtered;
+    const u64 *dead; const TqFilt *f;   /* NULL: every live row */
     i32 slots;                       /* keep slot numbers (block * 32 + lane) instead of rows: the cascade's first stage */
     TqRes res;
 } TqJob;
@@ -281,10 +281,16 @@ static void *tq_job_(void *arg)
             row = tq_srow_(t, blk, k);
             if (row < 0 || row >= t->n) continue;                /* padding */
             if (j->dead && ((j->dead[(u32)row >> 6] >> (row & 63)) & 1u)) continue;
-            if (j->filtered) {
-                i64 tag = *(const i64 *)(const void *)TQ_AT(j->meta, row);
-                if ((tag & j->all) != j->all) continue;
-                if (j->any && !(tag & j->any)) continue;
+            if (j->f) {
+                if (j->f->meta) {
+                    i64 tag = *(const i64 *)(const void *)TQ_AT(j->f->meta, row);
+                    if ((tag & j->f->all) != j->f->all) continue;
+                    if (j->f->any && !(tag & j->f->any)) continue;
+                }
+                if (j->f->num) {
+                    i64 v = *(const i64 *)(const void *)TQ_AT(j->f->num, row);
+                    if (v < j->f->lo || v > j->f->hi) continue;
+                }
             }
             tq_res_push_(&j->res, ((u64)sc[k] << 32) | (u64)(u32)(j->slots ? blk * 32 + k : row));
         }
@@ -505,10 +511,10 @@ static void tq_probe_(const Tq *t, const f32 *q, i32 np, u8 *scr, i32 *out)
     tq_pick_(key, nk, np, tmp, out, 1);
 }
 
-/* The R best rows (by the quantised inner product) that are alive and pass the meta filter; returns how
- * many were found, rows[] best first. dead (a bitset) / meta may be NULL. nthreads > 1 splits the blocks.
+/* The R best rows (by the quantised inner product) that are alive and pass filt (NULL: no filter); returns how
+ * many were found, rows[] best first. dead (a bitset) may be NULL. nthreads > 1 splits the blocks.
  * probe: IVF clusters to scan (0 = the index default, >= nc = all). slots: their slot numbers instead of rows. */
-static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, const TqCol *meta, i64 all, i64 any, i32 filtered, i32 nthreads, i32 probe, i32 slots)
+static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, const TqFilt *filt, i32 nthreads, i32 probe, i32 slots)
 {
     i32 *blks = (i32 *)0, nblk_scan, i, nj, per, tot;
     f32 *rot, *tmp, *lf;
@@ -543,7 +549,7 @@ static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *de
     for (i = 0; i < nj; ++i) {
         jobs[i].t = t; jobs[i].lut = lut; jobs[i].blks = blks; jobs[i].b0 = i * per; jobs[i].b1 = (i + 1) * per < nblk_scan ? (i + 1) * per : nblk_scan;
         if (jobs[i].b0 > jobs[i].b1) jobs[i].b0 = jobs[i].b1;
-        jobs[i].R = R; jobs[i].dead = dead; jobs[i].meta = meta; jobs[i].all = all; jobs[i].any = any; jobs[i].filtered = filtered && meta;
+        jobs[i].R = R; jobs[i].dead = dead; jobs[i].f = filt && (filt->meta || filt->num) ? filt : (const TqFilt *)0;
         jobs[i].slots = slots;
         tq_res_init_(&jobs[i].res, buf + (size_t)i * 2 * (size_t)R, R);
     }
@@ -561,9 +567,9 @@ static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *de
     return tot;
 }
 
-i32 tq_search(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, const TqCol *meta, i64 all, i64 any, i32 filtered, i32 nthreads, i32 probe)
+i32 tq_search(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, const TqFilt *filt, i32 nthreads, i32 probe)
 {
-    return tq_search_(t, q, R, rows, dead, meta, all, any, filtered, nthreads, probe, 0);
+    return tq_search_(t, q, R, rows, dead, filt, nthreads, probe, 0);
 }
 
 static int tq_key_desc_(const void *a, const void *b)
@@ -575,13 +581,13 @@ static int tq_key_desc_(const void *a, const void *b)
 /* The cascade, on an index with 1-bit codes beside its 4-bit ones (tq_cascade_on): the S best slots by the 1-bit
  * codes (a quarter of the bytes of the 4-bit scan), those S re-scored with their 4-bit codes, and the R best of them
  * as rows, best first. Arguments and result as tq_search; an index without 1-bit codes is searched as by tq_search. */
-i32 tq_search_cascade(const Tq *t, const f32 *q, i32 S, i32 R, i32 *rows, const u64 *dead, const TqCol *meta, i64 all, i64 any, i32 filtered, i32 nthreads, i32 probe)
+i32 tq_search_cascade(const Tq *t, const f32 *q, i32 S, i32 R, i32 *rows, const u64 *dead, const TqFilt *filt, i32 nthreads, i32 probe)
 {
     Tq v;
     i32 *sl, ns, i, d, n;
     f32 *rot, *tmp;
     u64 *key;
-    if (!t->codes1) return tq_search_(t, q, R, rows, dead, meta, all, any, filtered, nthreads, probe, 0);
+    if (!t->codes1) return tq_search_(t, q, R, rows, dead, filt, nthreads, probe, 0);
     if (t->n == 0 || R <= 0) return 0;
     if (S < R) S = R;
     v = *t;                                                      /* the 1-bit view: same slots, clusters and rotation */
@@ -590,7 +596,7 @@ i32 tq_search_cascade(const Tq *t, const f32 *q, i32 S, i32 R, i32 *rows, const 
     key = (u64 *)malloc((size_t)S * sizeof(u64));
     rot = (f32 *)malloc((size_t)t->dpad * sizeof(f32)); tmp = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
     if (!sl || !key || !rot || !tmp) { free(sl); free(key); free(rot); free(tmp); return 0; }
-    ns = tq_search_(&v, q, S, sl, dead, meta, all, any, filtered, nthreads, probe, 1);
+    ns = tq_search_(&v, q, S, sl, dead, filt, nthreads, probe, 1);
     tq_rot_(t, q, rot, tmp);
     for (i = 0; i < ns; ++i) {                                   /* the inner product with each one's 4-bit codes */
         i32 b = sl[i] >> 5, k = sl[i] & 31;
@@ -617,7 +623,7 @@ static void tq_cas_many_(void *p, i64 a, i64 b, i32 tid)
     (void)tid;
     for (i = a; i < b; ++i)
         m->cnt[i] = tq_search_cascade(m->t, m->Q + (size_t)i * (size_t)m->t->dim, m->S, m->R, m->rows + (size_t)i * (size_t)m->R,
-                                      m->dead, (const TqCol *)0, 0, 0, 0, 1, m->probe);
+                                      m->dead, (const TqFilt *)0, 1, m->probe);
 }
 void tq_search_many_cascade(const Tq *t, const f32 *Q, i32 nq, i32 S, i32 R, i32 *rows, i32 *cnt, const u64 *dead, i32 nthreads, i32 probe)
 {

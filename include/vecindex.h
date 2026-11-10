@@ -137,6 +137,7 @@ VI_API int vi_batch_add(vi_batch *b, vi_i64 id, const float *vec);
 VI_API int vi_batch_add_text(vi_batch *b, vi_i64 id, const float *vec, const char *text, int len);
 VI_API int vi_batch_delete(vi_batch *b, vi_i64 id);
 VI_API int vi_batch_delete_range(vi_batch *b, vi_i64 lo, vi_i64 hi);
+VI_API int vi_batch_set_num(vi_batch *b, vi_i64 id, vi_i64 num);   /* on the row the batch added or the store has */
 
 /* Applies the batch as one change and frees it. sync 1: also on the disk when this returns (a store opened from a
  * file; commits arriving during an fsync share the next one). Returns how many changes it held; -1 refused, nothing
@@ -163,6 +164,14 @@ VI_API int vi_label_add(vi_db *db, vi_i64 id, const char *labels);
 VI_API int vi_label_remove(vi_db *db, vi_i64 id, const char *labels);
 VI_API int vi_search_labeled(vi_db *db, const float *query, int k, const char *all, const char *any, const char *none,
                              vi_i64 *ids, float *scores);
+
+/* A number on a row - a time, a price in cents, a version - for range filters; every row's is 0 until set, and a
+ * row that vi_add replaces starts again at 0. vi_set_num / vi_get_num: 0, or -1 when there is no such row.
+ * vi_search_range is vi_search over the rows whose number is in [lo, hi]; the range is tested inside the scan, so a
+ * narrow one costs no more than a wide one. The numbers are saved in the file, journaled and under the row checks. */
+VI_API int vi_set_num(vi_db *db, vi_i64 id, vi_i64 num);
+VI_API int vi_get_num(vi_db *db, vi_i64 id, vi_i64 *num);
+VI_API int vi_search_range(vi_db *db, const float *query, int k, vi_i64 lo, vi_i64 hi, vi_i64 *ids, float *scores);
 
 /* A 64-bit tag on a row, for filtered search: 0, or -1 when there is no such row. */
 VI_API int vi_set_tag(vi_db *db, vi_i64 id, vi_i64 tag);

@@ -457,6 +457,65 @@ int main(void)
         remove(fn); remove(jn);
     }
 
+    /* numbers on rows and range filters: in the scan, the file, the journal and batches */
+    {
+        char fn[64], jn[72];
+        vi_i64 ri[10], all[N], num = -1;
+        float rs[10], as[N];
+        int j, na, ok, want_n, bad;
+        vi_batch *b;
+        vi_health hh;
+        sprintf(fn, "/tmp/vecindex_api_num_%d.vxi", (int)getpid());
+        sprintf(jn, "%s.j", fn);
+        db = vi_open(fn, DIM, 0);
+        for (i = 0; db && i < N; ++i) { vec_(i, v); vi_add(db, i, v); }
+        vec_(1234, v);
+        check(db && vi_search_range(db, v, 5, 0, 0, ri, rs) == 5 && vi_search_range(db, v, 5, 1, 9, ri, rs) == 0,
+              "vi_search_range before any number: every row's is 0");
+        for (i = 0, ok = 1; db && i < N; ++i) ok &= vi_set_num(db, i, (vi_i64)(i % 100) - 50) == 0;
+        check(db && ok && vi_set_num(db, N + 5, 1) == -1 && vi_get_num(db, 1234, &num) == 0 && num == 34 - 50,
+              "vi_set_num on every row, a missing row refused, vi_get_num back");
+        if (db) vi_build(db);
+        na = db ? vi_search(db, v, N, all, as) : 0;              /* every row ranked: the expected answer in order */
+        for (want_n = 0, j = 0; j < na && want_n < 10; ++j) if (all[j] % 100 >= 80) ri[want_n++] = all[j];
+        n = db ? vi_search_range(db, v, 10, 30, 49, got, sc) : 0;
+        for (j = 0, ok = n == 10; j < n; ++j) ok &= got[j] % 100 >= 80 && got[j] == ri[j];
+        check(ok, "vi_search_range [30, 49]: the 10 nearest rows with numbers in it, in order");
+        n = db ? vi_search_range(db, v, 10, -16, -16, got, sc) : 0;
+        check(n == 10 && got[0] == 1234 && got[1] % 100 == 34, "vi_search_range of one value: the query's own row first");
+        check(db && vi_search_range(db, v, 10, 50, 900, got, sc) == 0 && vi_search_range(db, v, 10, 5, 4, got, sc) == 0,
+              "vi_search_range of no rows, and lo > hi: no hits");
+        if (db) { vec_(7, w); vi_add(db, 7, w); }                /* a replaced row starts again at 0 */
+        check(db && vi_get_num(db, 7, &num) == 0 && num == 0, "vi_add over a numbered row: its number is 0 again");
+        if (db) vi_set_num(db, 7, -43);
+        b = db ? vi_batch_begin(db) : (vi_batch *)0;
+        vec_(N + 1, w);
+        check(b && vi_batch_add(b, N + 1, w) == 0 && vi_batch_set_num(b, N + 1, 777) == 0 && vi_batch_set_num(b, 99, 778) == 0
+              && vi_batch_set_num(b, N + 9, 1) == 0 && vi_batch_commit(b, 1) == 4,
+              "vi_batch_set_num: on a row the batch adds, a row the store has, a missing id");
+        check(db && vi_get_num(db, N + 1, &num) == 0 && num == 777 && vi_get_num(db, 99, &num) == 0 && num == 778
+              && vi_search_range(db, w, 3, 777, 777, got, sc) == 1 && got[0] == N + 1, "the batch's numbers are in, and searched");
+        if (db) vi_close(db);                                    /* no save: the journal carries every number */
+        db = vi_open(fn, 0, 0);
+        for (i = 0, ok = db != (vi_db *)0; db && i < N; ++i)
+            ok &= vi_get_num(db, i, &num) == 0 && num == (i == 7 ? -43 : (i == 99 ? 778 : (vi_i64)(i % 100) - 50));
+        check(ok && vi_get_num(db, N + 1, &num) == 0 && num == 777, "the journal replayed: every number back");
+        check(db && vi_save(db, (const char *)0) == 0, "vi_save with numbers");
+        if (db) vi_close(db);
+        db = vi_open(fn, 0, 0);
+        for (i = 0, ok = db != (vi_db *)0; db && i < N; ++i)
+            ok &= vi_get_num(db, i, &num) == 0 && num == (i == 7 ? -43 : (i == 99 ? 778 : (vi_i64)(i % 100) - 50));
+        bad = db && vi_integrity(db, &hh) == 0 ? (int)(hh.bad + hh.rows_bad) : -1;
+        n = db ? vi_search_range(db, v, 10, -16, -16, got, sc) : 0;
+        check(ok && bad == 0 && n == 10 && got[0] == 1234, "the saved file: numbers back, checks intact, searched");
+        if (db) { vi_set_num(db, 1234, 5); vi_close(db); }       /* a number set on a row of the mapped file */
+        db = vi_open(fn, 0, 0);
+        check(db && vi_get_num(db, 1234, &num) == 0 && num == 5 && vi_search_range(db, v, 1, 5, 5, got, sc) == 1 && got[0] == 1234,
+              "a number changed after the load: journaled, back after a reopen");
+        if (db) vi_close(db);
+        remove(fn); remove(jn);
+    }
+
     free(qs); free(bi); free(bs);
     printf("C API: %s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;

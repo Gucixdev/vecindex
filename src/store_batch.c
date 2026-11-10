@@ -17,10 +17,10 @@
 
 typedef struct {
     RagStore *s;
-    u8 *buf;                /* the records, as in the journal: 'P' id meta row, 'Q' id meta row len text, 'D' id, 'R' lo hi */
+    u8 *buf;                /* the records, as in the journal: 'P' id meta row, 'Q' id meta row len text, 'D' id, 'R' lo hi, 'N' id number */
     size_t len, cap;
     f32 *tmp;               /* [dim] scratch: a row normalised, or copied out of buf aligned */
-    i32 n, nput, ntext;     /* changes, rows they add, texts among them */
+    i32 n, nput, ntext, nnum;   /* changes, rows they add, texts among them, numbers set */
     i32 bad;                /* a refused change (non-finite vector, bad text, no memory): commit refuses the batch */
 } StoreWb;
 
@@ -139,13 +139,24 @@ i32 store_batch_delete_range(StoreWb *b, i64 lo, i64 hi)
     return 0;
 }
 
+/* a row's number (store_set_num), set when the batch reaches it: on the row the batch added before it, or on the row
+ * the store has; an id with neither by then is left alone */
+i32 store_batch_set_num(StoreWb *b, i64 id, i64 num)
+{
+    u8 op = 'N';
+    if (store_batch_room_(b, 17) != 0) return -1;
+    store_batch_w_(b, &op, 1); store_batch_w_(b, &id, 8); store_batch_w_(b, &num, 8);
+    ++b->n; ++b->nnum;
+    return 0;
+}
+
 /* bytes of the record at r */
 static size_t store_batch_reclen_(const RagStore *s, const u8 *r)
 {
     size_t vb = (size_t)s->dim * sizeof(f32);
     u32 n;
     if (r[0] == 'D') return 9;
-    if (r[0] == 'R') return 17;
+    if (r[0] == 'R' || r[0] == 'N') return 17;
     if (r[0] == 'P') return 17 + vb;
     memcpy(&n, r + 17 + vb, 4);                                  /* 'Q' */
     return 21 + vb + n;
@@ -220,7 +231,7 @@ i32 store_batch_commit(StoreWb *b, i32 sync)
     size_t vb = (size_t)s->dim * sizeof(f32), at, rl;
     u64 *tv = (u64 *)0, seq;
     u32 crc;
-    i32 k, i;
+    i32 k, i, had_num;
     if (b->bad || s->ro) return -1;
     if (b->n == 0) return 0;
     if (b->ntext && !(tv = (u64 *)malloc((size_t)b->ntext * sizeof(u64)))) return -1;
@@ -228,7 +239,9 @@ i32 store_batch_commit(StoreWb *b, i32 sync)
     pthread_rwlock_wrlock(&s->lock);
     store_idmap_locked_(s);
     if (b->ntext) s->has_text = 1;                               /* from now on the column has a slot for every row */
-    if (store_reserve_(s, (i64)s->count + b->nput) != 0) { pthread_rwlock_unlock(&s->lock); free(tv); return -1; }
+    had_num = s->has_num;
+    if (b->nnum) s->has_num = 1;                                 /* the same for numbers */
+    if (store_reserve_(s, (i64)s->count + b->nput) != 0) { s->has_num = had_num; pthread_rwlock_unlock(&s->lock); free(tv); return -1; }
     /* the texts first, the other thing that can run out; what a refused batch left in the heap is garbage that the
      * next save drops */
     for (at = 0, k = 0; at < b->len; at += store_batch_reclen_(s, b->buf + at))
@@ -249,6 +262,7 @@ i32 store_batch_commit(StoreWb *b, i32 sync)
         memcpy(&id, r + 1, 8);
         if (r[0] == 'D') { store_kill_id_locked_(s, id); continue; }
         memcpy(&meta, r + 9, 8);
+        if (r[0] == 'N') { store_set_num_locked_(s, id, meta); continue; }
         if (r[0] == 'R') {
             for (i = 0; i < s->count; ++i)
                 if (!STORE_DEAD(s, i) && STORE_ID(s, i) >= id && STORE_ID(s, i) <= meta) {

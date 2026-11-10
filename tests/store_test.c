@@ -535,6 +535,71 @@ static i32 sd_cascade_(Arena *a)
 }
 
 /* ---- integrity: BLAKE3, the block digests and Reed-Solomon parity of the file, the journal's frames ---- */
+/* numbers on rows: a range filter tested inside the IVF scan finds the few rows of a narrow range far from the
+ * query (a filter applied only after the scan would see none of them among its candidates), a wide range keeps the
+ * recall of an exact search over the rows in it, and the cascade does the same */
+static i32 sdn_exact_(const f32 *x, const f32 *q, i64 lo, i64 hi, i32 k, i32 *top)   /* the k best rows with i in [lo, hi] */
+{
+    f32 best[16];
+    i32 i, j, d, n = 0;
+    for (i = (i32)lo; i <= (i32)hi && i < SDC_N; ++i) {
+        f32 dp = 0.0f;
+        for (d = 0; d < SDC_DIM; ++d) dp += x[(size_t)i * SDC_DIM + d] * q[d];
+        if (n == k && dp <= best[k - 1]) continue;
+        for (j = n < k ? n++ : k - 1; j > 0 && best[j - 1] < dp; --j) { best[j] = best[j - 1]; top[j] = top[j - 1]; }
+        best[j] = dp; top[j] = i;
+    }
+    return n;
+}
+static i32 sd_nums_(Arena *a)
+{
+    f32 *x = (f32 *)malloc((size_t)SDC_N * SDC_DIM * sizeof(f32));
+    RagStore *s;
+    StoreCnf c;
+    i64 ids[16];
+    f32 sc[16];
+    i32 i, q, j, n, ok = 1, pass, hit = 0, tot = 0, uhit = 0, utot = 0, keep = store_ivf_min_, top[16];
+    u32 st = 4242u;
+    for (i = 0; i < SDC_N; ++i) sdc_unit_(x + (size_t)i * SDC_DIM, &st);
+    store_ivf_min_ = 1000;
+    s = store_new(a, SDC_DIM);
+    for (i = 0; i < SDC_N; ++i) store_add(s, x + (size_t)i * SDC_DIM, i);
+    store_build(s);
+    for (i = 0; i < SDC_N; ++i) if (store_set_num(s, i, i) != 0) ok = 0;
+    if (!s->tq || s->tq->nc < 2 || !s->has_num) { print_cstr("  numbers: no IVF scan index to test FAILED\n"); ok = 0; }
+    for (pass = 0; ok && pass < 2; ++pass) {
+        if (pass == 1 && store_set_cascade(s, 1) != 0) { ok = 0; break; }
+        memset(&c, 0, sizeof(c)); c.num = 1;
+        for (q = 0; q < 20; ++q) {                               /* five rows, anywhere: all five, and only they */
+            c.lo = 977 * q + 3; c.hi = c.lo + 4;
+            n = store_search_cnf(s, x + (size_t)(q * 13) * SDC_DIM, 10, ids, sc, &c);
+            if (n != 5) ok = 0;
+            for (j = 0; j < n; ++j) if (ids[j] < c.lo || ids[j] > c.hi) ok = 0;
+        }
+        for (q = 0; q < 50; ++q) {                               /* half the rows: recall@10 against the exact answer */
+            const f32 *qv = x + (size_t)(q * 211 + 5) * SDC_DIM;
+            i32 m;
+            c.lo = 10000; c.hi = SDC_N - 1;
+            n = store_search_cnf(s, qv, 10, ids, sc, &c);
+            m = sdn_exact_(x, qv, c.lo, c.hi, 10, top);
+            for (j = 0; j < n; ++j) { i32 z; if (ids[j] < c.lo) ok = 0; for (z = 0; z < m; ++z) if (top[z] == ids[j]) { ++hit; break; } }
+            tot += m;
+            n = store_search(s, qv, 10, ids, sc);                /* the same query unfiltered, for the baseline */
+            m = sdn_exact_(x, qv, 0, SDC_N - 1, 10, top);
+            for (j = 0; j < n; ++j) { i32 z; for (z = 0; z < m; ++z) if (top[z] == ids[j]) { ++uhit; break; } }
+            utot += m;
+        }
+    }
+    print_cstr("  numbers: narrow ranges found whole, wide-range recall@10 "); print_i64((i64)(1000 * hit / (tot ? tot : 1)));
+    print_cstr("/1000 against "); print_i64((i64)(1000 * uhit / (utot ? utot : 1)));
+    print_cstr("/1000 unfiltered (4-bit scan and cascade)\n");
+    if (!ok || hit * 1000 < (i64)tot * (1000 * uhit / (utot ? utot : 1) - 30)) { print_cstr("  numbers FAILED\n"); ok = 0; }
+    store_destroy(s);
+    store_ivf_min_ = keep;
+    free(x);
+    return ok;
+}
+
 static void sdx_flip_(const char *path, u64 off)
 {
     FILE *f = fopen(path, "r+b");
@@ -922,13 +987,13 @@ int main(void)
             for (q = 0; q < nq; ++q) {
                 i32 rf[256], ri[256], rn[256], nf, ni, nn2;
                 const f32 *qv = un + (size_t)((q * 97) % n) * dim;
-                nf = tq_search(flat, qv, 256, rf, dead, &mcol, 0, 0, 0, 1, 0);
-                ni = tq_search(ivf, qv, 256, ri, dead, &mcol, 0, 0, 0, 1, 0);           /* the default probe */
-                nn2 = tq_search(ivf, qv, 256, rn, dead, &mcol, 0, 0, 0, 1, 60);         /* every cluster = the same rows as flat */
+                nf = tq_search(flat, qv, 256, rf, dead, (const TqFilt *)0, 1, 0);
+                ni = tq_search(ivf, qv, 256, ri, dead, (const TqFilt *)0, 1, 0);           /* the default probe */
+                nn2 = tq_search(ivf, qv, 256, rn, dead, (const TqFilt *)0, 1, 60);         /* every cluster = the same rows as flat */
                 for (j = 0; j < 10 && j < nf; ++j) { i32 k, f = 0; for (k = 0; k < ni; ++k) if (ri[k] == rf[j]) { f = 1; break; } hit += f; ++tot; }
                 { i32 k, same = nf == nn2; for (k = 0; k < nf && k < 200 && same; ++k) { i32 z, f = 0; for (z = 0; z < nn2; ++z) if (rn[z] == rf[k]) { f = 1; break; } if (!f) same = 0; } if (!same) all_ok = 0; }
                 for (j = 0; j < ni; ++j) if ((dead[ri[j] >> 6] >> (ri[j] & 63)) & 1u) all_ok = 0;   /* tombstones never come back */
-                ni = tq_search(ivf, qv, 64, ri, dead, &mcol, 1, 0, 1, 1, 60);            /* meta filter: only rows with bit 1 */
+                { TqFilt tf; memset(&tf, 0, sizeof(tf)); tf.meta = &mcol; tf.all = 1; ni = tq_search(ivf, qv, 64, ri, dead, &tf, 1, 60); }   /* meta filter: only rows with bit 1 */
                 for (j = 0; j < ni; ++j) if (!(meta[ri[j]] & 1)) filt_ok = 0;
             }
             print_cstr("  IVF scan: top-10 of the flat scan found "); print_i64((i64)(100L * hit / tot)); print_cstr("%; all clusters == flat: ");
@@ -1065,8 +1130,8 @@ int main(void)
         for (q = 0; q < 40; ++q) {
             i32 rf[200], rn[200], nf, nn2, k;
             const f32 *qv = un + (size_t)((q * 131) % n) * dim;
-            nf = tq_search(flat, qv, 200, rf, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 0);
-            nn2 = tq_search(ivf, qv, 200, rn, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 60);
+            nf = tq_search(flat, qv, 200, rf, (const u64 *)0, (const TqFilt *)0, 1, 0);
+            nn2 = tq_search(ivf, qv, 200, rn, (const u64 *)0, (const TqFilt *)0, 1, 60);
             if (nf != nn2) all_ok = 0;
             for (k = 0; k < nf && k < 150 && all_ok; ++k) { i32 z, f = 0; for (z = 0; z < nn2; ++z) if (rn[z] == rf[k]) { f = 1; break; } if (!f) all_ok = 0; }
         }
@@ -1076,7 +1141,7 @@ int main(void)
                 Tq *tt = pass ? flat : ivf;
                 tq_search_many(tt, un, nq2, R2, mr, mc, (const u64 *)0, 2, 12);
                 for (q = 0; q < nq2; ++q) {
-                    i32 one[100], no = tq_search(tt, un + (size_t)q * dim, R2, one, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 12), eq = no == mc[q];
+                    i32 one[100], no = tq_search(tt, un + (size_t)q * dim, R2, one, (const u64 *)0, (const TqFilt *)0, 1, 12), eq = no == mc[q];
                     for (z = 0; z < no && eq; ++z) if (one[z] != mr[(size_t)q * R2 + z]) eq = 0;
                     same2 += eq;
                 }
@@ -1119,15 +1184,15 @@ int main(void)
         for (q = 0; q < 30; ++q) {
             i32 rf[100], rn[100], nf, nn2, k;
             const f32 *qv = x2 + (size_t)(q * 797) * d2;
-            nf = tq_search(flat, qv, 100, rf, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 0);
-            nn2 = tq_search(ivf, qv, 100, rn, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, ivf->nc);
+            nf = tq_search(flat, qv, 100, rf, (const u64 *)0, (const TqFilt *)0, 1, 0);
+            nn2 = tq_search(ivf, qv, 100, rn, (const u64 *)0, (const TqFilt *)0, 1, ivf->nc);
             if (nf != nn2) all_ok = 0;
             for (k = 0; k < nf && all_ok; ++k) if (rf[k] != rn[k]) all_ok = 0;
         }
         mr = (i32 *)malloc((size_t)32 * 100 * sizeof(i32));
         tq_search_many(ivf, x2, 32, 100, mr, mc, (const u64 *)0, 2, 40);
         for (q = 0; q < 32; ++q) {
-            i32 one[100], no = tq_search(ivf, x2 + (size_t)q * d2, 100, one, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 40), eq = no == mc[q], z;
+            i32 one[100], no = tq_search(ivf, x2 + (size_t)q * d2, 100, one, (const u64 *)0, (const TqFilt *)0, 1, 40), eq = no == mc[q], z;
             for (z = 0; z < no && eq; ++z) if (one[z] != mr[(size_t)q * 100 + z]) eq = 0;
             same += eq;
         }
@@ -1241,16 +1306,16 @@ int main(void)
             for (q = 0; q < 30; ++q) {
                 i32 ra[100], ri[100], rf[100], na, ni, nf, k, eq;
                 const f32 *qv = x4 + (size_t)(q * 797) * d4;
-                na = tq_search(all, qv, 100, ra, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 0);
-                ni = tq_search(ivf, qv, 100, ri, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, ivf->nc);
-                nf = tq_search(fl, qv, 100, rf, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 2, 0);
+                na = tq_search(all, qv, 100, ra, (const u64 *)0, (const TqFilt *)0, 1, 0);
+                ni = tq_search(ivf, qv, 100, ri, (const u64 *)0, (const TqFilt *)0, 1, ivf->nc);
+                nf = tq_search(fl, qv, 100, rf, (const u64 *)0, (const TqFilt *)0, 2, 0);
                 eq = na == ni && na == nf;
                 for (k = 0; k < na && eq; ++k) if (ra[k] != ri[k] || ra[k] != rf[k]) eq = 0;
                 same += eq; ++tot;
             }
             tq_search_many(ivf, x4 + (size_t)n40 * d4, 32, 100, mr, mc, (const u64 *)0, 2, 12);   /* queries: added rows */
             for (q = 0; q < 32; ++q) {
-                i32 one[100], no = tq_search(ivf, x4 + (size_t)(n40 + q) * d4, 100, one, (const u64 *)0, (const TqCol *)0, 0, 0, 0, 1, 12), eq = no == mc[q], z;
+                i32 one[100], no = tq_search(ivf, x4 + (size_t)(n40 + q) * d4, 100, one, (const u64 *)0, (const TqFilt *)0, 1, 12), eq = no == mc[q], z;
                 for (z = 0; z < no && eq; ++z) if (one[z] != mr[(size_t)q * 100 + z]) eq = 0;
                 sameb += eq;
             }
@@ -1436,6 +1501,7 @@ int main(void)
     if (!sd_tiers_(a)) ok = 0;
     if (!sd_batches_(a)) ok = 0;
     if (!sd_cascade_(a)) ok = 0;
+    if (!sd_nums_(a)) ok = 0;
     if (!sd_sums_(a)) ok = 0;
     print_cstr(ok ? "  OK\n" : "  FAIL\n");
     print_flush();

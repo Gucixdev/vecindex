@@ -5,10 +5,10 @@
 
 /* the scan's R best rows: through the cascade when the index has one (1-bit codes first, a shortlist of
  * STORE_CAS_SHORT x R re-scored with the 4-bit codes) */
-static i32 store_scan_(const RagStore *s, const f32 *qn, i32 R, i32 *rows, const TqCol *mcol, i64 all, i64 any, i32 filtered, i32 nth, i32 probe)
+static i32 store_scan_(const RagStore *s, const f32 *qn, i32 R, i32 *rows, const TqFilt *f, i32 nth, i32 probe)
 {
-    if (s->tq->codes1) return tq_search_cascade(s->tq, qn, STORE_CAS_SHORT * R, R, rows, s->dead, mcol, all, any, filtered, nth, probe);
-    return tq_search(s->tq, qn, R, rows, s->dead, mcol, all, any, filtered, nth, probe);
+    if (s->tq->codes1) return tq_search_cascade(s->tq, qn, STORE_CAS_SHORT * R, R, rows, s->dead, f, nth, probe);
+    return tq_search(s->tq, qn, R, rows, s->dead, f, nth, probe);
 }
 
 static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
@@ -22,7 +22,8 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
     EngScratch sc;
     f32 *slut = (f32 *)0;
     i32 have = 0, i, got, tail;
-    TqCol mcol;
+    TqCol mcol, ncol;
+    TqFilt tf;
     f32 qlen;
 
     memcpy(qn, query, (size_t)dim * sizeof(f32));
@@ -32,20 +33,24 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
     pthread_rwlock_rdlock(&s->lock);
     if (s->tune_target > 0.0f) store_qlog_(s, qn);
     mcol = store_tqcol_(&s->metac);
+    memset(&tf, 0, sizeof(tf));
+    if (filtered) { tf.meta = &mcol; tf.all = all_bits; tf.any = any_bits; }
+    if (cnf && cnf->num && s->has_num) { ncol = store_tqcol_(&s->numc); tf.num = &ncol; tf.lo = cnf->lo; tf.hi = cnf->hi; }
 
-    if (s->tq) {
+    if (cnf && cnf->num && !s->has_num && (cnf->lo > 0 || cnf->hi < 0)) {}   /* no numbers yet: every row's is 0 */
+    else if (s->tq) {
         /* candidates re-scored exactly: 20 k, at least 256 - four times that with 1-bit codes, which rank coarsely */
         i32 R = filtered ? k * 40 + 256
                          : (s->tq_rerank > 0 ? s->tq_rerank : (k * 20 > 256 ? k * 20 : 256) * (s->tq->bits == 1 ? 4 : 1) * (s->metric ? 4 : 1)), m, nth = 1;
         i32 *rows = (i32 *)malloc((size_t)R * sizeof(i32));
         if (s->tq_threads > 0) nth = s->tq_threads;
         else if (s->tq->n >= 150000) { i32 c = store_ncpu_(s); nth = c > 4 ? 4 : c; }   /* the scan is memory-bound: 4 threads already saturate the bus */
-        m = store_scan_(s, qn, R, rows, &mcol, all_bits, any_bits, filtered, nth, s->tq_probe);
+        m = store_scan_(s, qn, R, rows, &tf, nth, s->tq_probe);
         store_rescore_(s, qn, qlen, cnf, rows, m, k, out_doc_ids, out_scores, &have);
         /* a selective filter can leave the probed clusters short of k matches: then scan every cluster's codes
          * (RAM, 4 bits a row) for matches, never every f32 row */
         if (filtered && have < k && s->tq->nc > 1) {
-            i32 j, z, n2 = store_scan_(s, qn, R, rows, &mcol, all_bits, any_bits, filtered, nth, s->tq->nc);
+            i32 j, z, n2 = store_scan_(s, qn, R, rows, &tf, nth, s->tq->nc);
             for (j = z = 0; j < n2; ++j) {
                 i32 x, dup = 0;
                 for (x = 0; x < have; ++x) if (out_doc_ids[x] == rows[j]) { dup = 1; break; }
@@ -67,7 +72,7 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
             i32 row = (i32)rid[i];
             if (row < 0 || row >= s->built_upto || STORE_DEAD(s, row)) continue;
             if (filtered && !store_meta_ok_(STORE_META(s, row), all_bits, any_bits)) continue;
-            if (cnf && !store_cnf_ok_(cnf, STORE_META(s, row))) continue;
+            if (cnf && !store_cnf_ok_(s, cnf, row)) continue;
             eng_topk_(out_doc_ids, out_scores, k, &have, (i64)row, s->metric ? store_score_(s, qn, qlen, row) : rsc[i]);
         }
         free(sc.lids); free(sc.lsc); free(sc.probe);
@@ -76,7 +81,7 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
             for (i = 0; i < s->built_upto; ++i) {
                 i32 j, dup = 0;
                 if (STORE_DEAD(s, i) || !store_meta_ok_(STORE_META(s, i), all_bits, any_bits)) continue;
-                if (cnf && !store_cnf_ok_(cnf, STORE_META(s, i))) continue;
+                if (cnf && !store_cnf_ok_(s, cnf, i)) continue;
                 for (j = 0; j < have; ++j) if (out_doc_ids[j] == i) { dup = 1; break; }
                 if (dup || store_row_bad_(s, i)) continue;
                 eng_topk_(out_doc_ids, out_scores, k, &have, (i64)i, store_score_(s, qn, qlen, i));
@@ -84,11 +89,11 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
         }
     }
 
-    tail = s->count;
+    tail = cnf && cnf->num && !s->has_num && (cnf->lo > 0 || cnf->hi < 0) ? 0 : s->count;
     for (i = s->built_upto; i < tail; ++i) {                    /* the pending tail: exact */
         if (STORE_DEAD(s, i)) continue;
         if (filtered && !store_meta_ok_(STORE_META(s, i), all_bits, any_bits)) continue;
-        if (cnf && !store_cnf_ok_(cnf, STORE_META(s, i))) continue;
+        if (cnf && !store_cnf_ok_(s, cnf, i)) continue;
         if (store_row_bad_(s, i)) continue;
         eng_topk_(out_doc_ids, out_scores, k, &have, (i64)i, store_score_(s, qn, qlen, i));
     }

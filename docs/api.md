@@ -28,6 +28,12 @@ row labelled dog or cat (or anything else under animal) that is not big. A label
 worked out when the search runs, so putting a new label over existing ones (`vi_label(db, "dog", "pet")`) changes no
 row. 64 labels a store; the table is saved in the file and every change is journaled.
 
+A row also carries one 64-bit number for range filters - a time, a price in cents, a version: `vi_set_num(db, id,
+t)`, then `vi_search_range(db, q, 10, from, to, ids, scores)` is the nearest rows with a number in `[from, to]`. The
+range is tested inside the scan, before the candidates are picked, so a range that holds a handful of rows far from
+the query still finds them all. Every row's number is 0 until set; `vi_add` over a row starts it again at 0, and
+`vi_batch_set_num` sets it in the same batch as the row, so a crash never leaves the row without it.
+
 A store compares by cosine unless it is made with `VI_DOT` (the inner product of the vectors as they came: scores
 bigger is better) or `VI_L2` (the Euclidean distance: scores are the distance, smaller is better, still best first).
 Such a store keeps each row's length beside its direction (4 bytes a row); the index finds candidates by direction
@@ -49,10 +55,11 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_get_text(db, id, buf, cap)` | the row's text: its length, the first `cap` bytes copied into `buf` |
 | `vi_range(db, lo, hi, ids, max)` | the ids in `[lo, hi]` that have a row, ascending: the chunks of a document |
 | `vi_dir_open(path, dim, flags)`, `vi_dir_get(dir, name)`, `vi_dir_close(dir)` | tenants without a server: a directory with a store per tenant (`path/NAME.vxi`), each opened - or created - on its first `vi_dir_get` and handed back after; names are 1 to 64 of `A-Z a-z 0-9 _ -` |
-| `vi_batch_begin(db)`, `vi_batch_add(b, id, vec)`, `vi_batch_add_text(b, id, vec, text, len)`, `vi_batch_delete(b, id)`, `vi_batch_delete_range(b, lo, hi)` | a write batch: its changes are copied in as they are added and wait |
+| `vi_batch_begin(db)`, `vi_batch_add(b, id, vec)`, `vi_batch_add_text(b, id, vec, text, len)`, `vi_batch_delete(b, id)`, `vi_batch_delete_range(b, lo, hi)`, `vi_batch_set_num(b, id, num)` | a write batch: its changes are copied in as they are added and wait |
 | `vi_batch_commit(b, sync)`, `vi_batch_abort(b)` | applies the batch as one change - searches see none of it before and all of it after, and a crash leaves all or none of it (one journal record with a CRC-32C) - and frees it; `sync` 1: on the disk before it returns. The number of changes, -1 refused with nothing applied (a NaN, a bad text, no memory), -2 applied but the fsync failed |
 | `vi_search_hybrid(db, q, text, tlen, k, ids, scores)` | the vector and the words (BM25 over the texts), fused by rank; either side may be left out |
 | `vi_set_tag`, `vi_get_tag` | a 64-bit tag per row |
+| `vi_set_num(db, id, num)`, `vi_get_num(db, id, &num)`, `vi_search_range(db, q, k, lo, hi, ids, scores)` | a 64-bit number per row (0 until set), and a search over the rows whose number is in `[lo, hi]` |
 | `vi_error()` | why the calling thread's last failed call failed, in words |
 | `vi_key(s, len)` | a 64-bit id for a string (a path, a URL), the same everywhere |
 | `vi_label(db, name, parent)`, `vi_label_add(db, id, labels)`, `vi_label_remove(db, id, labels)`, `vi_search_labeled(db, q, k, all, any, none, ids, scores)` | labels in a hierarchy on rows, and a search over every label of `all`, one of `any`, none of `none` |

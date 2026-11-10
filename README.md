@@ -2,7 +2,8 @@
 
 A vector database in C89 for approximate nearest-neighbour search: a TurboQuant-style rotated 4-bit (or 2-bit, or
 1-bit in front of the 4-bit) fast-scan with exact re-scoring, IVF clustering, bit-packed 1-8 bit quantizers and BM25
-hybrid search; cosine, inner product or Euclidean distance; string keys and labels in a hierarchy. It runs inside a program in any language through its C API (`include/vecindex.h`, one shared or
+hybrid search; cosine, inner product or Euclidean distance; string keys, labels in a hierarchy, a number a row for
+range filters and grouped search (one hit a document). It runs inside a program in any language through its C API (`include/vecindex.h`, one shared or
 static library), or as `vserv`, a small epoll server (Unix and TCP sockets, a binary protocol and HTTP/1.1, TLS 1.2
 through the vendored BearSSL). Nothing beyond libc, libm and pthreads (and BearSSL for TLS).
 

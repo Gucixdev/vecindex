@@ -53,7 +53,7 @@ static void store_rescore_(RagStore *s, const f32 *qn, f32 qlen, const StoreCnf 
         i32 row = rows[i];
         if (i + STORE_PF_AHEAD < m && rows[i + STORE_PF_AHEAD] >= 0 && rows[i + STORE_PF_AHEAD] < s->built_upto)
             store_prefetch_row_((const f32 *)(const void *)SCOL_AT(&s->vec, rows[i + STORE_PF_AHEAD]), (i32)(s->vec.esz / 4));
-        if (row < 0 || row >= s->built_upto || (cnf && !store_cnf_ok_(cnf, STORE_META(s, row))) || store_row_bad_(s, row)) continue;   /* a damaged row is never served */
+        if (row < 0 || row >= s->built_upto || (cnf && !store_cnf_ok_(s, cnf, row)) || store_row_bad_(s, row)) continue;   /* a damaged row is never served */
         eng_topk_(out_rows, out_scores, k, have, (i64)row, store_score_(s, qn, qlen, row));
     }
     if (!pf && store_vec_filed_(s)) {

@@ -24,9 +24,15 @@ store self-test under ASan and UBSan in `./run`. The integrity math, CRC-32C, th
 the rotation and the top-k insertion are also proved in Lean 4 and the C code is tested against the proved model:
 [`lean4`](../lean4).
 
+Done and tested since 2026-11-10 (`./run`, 28 steps passing on a 2-vCPU Xeon): grouped search (`vi_search_grouped`,
+the best hit of each `id >> shift` group: one chunk a document), a 64-bit number a row with range filters tested in
+the scan (`vi_set_num`, `vi_search_range`, `vi_batch_set_num`; in the file, the journal and the row checks;
+`tests/store_test.c` finds 5-row ranges anywhere in an IVF store, and a mutation of the scan's range test fails it).
+
 Open:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a
-  hierarchy on the tag's bits, `vi_label*`); relations between rows; numeric ranges in a filter
+  hierarchy on the tag's bits, `vi_label*`); relations between rows; a number range together with labels in one search
+  (now: `vi_search_range` and `vi_search_labeled` each alone)
 - the file format: zones (parts of a store split by id range, time or tag) and namespaces inside a tenant, one
   format readable on every machine (the journal is written in the host's byte order today)
 - scale at both ends: the smallest boards (fewest bytes a vector, RAM to spare) and past one machine's RAM

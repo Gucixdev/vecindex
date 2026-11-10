@@ -397,6 +397,8 @@ VI_API int vi_batch_delete_range(vi_batch *b, vi_i64 lo, vi_i64 hi)
     return store_batch_delete_range(&b->w, (i64)lo, (i64)hi);
 }
 
+VI_API int vi_batch_set_num(vi_batch *b, vi_i64 id, vi_i64 num) { return b ? store_batch_set_num(&b->w, (i64)id, (i64)num) : vi_fail_(-1, VI_NOB, (const char *)0, (const char *)0); }
+
 VI_API int vi_batch_commit(vi_batch *b, int sync)
 {
     i32 r;
@@ -455,6 +457,35 @@ VI_API int vi_get_tag(vi_db *db, vi_i64 id, vi_i64 *tag)
     if (store_get_meta(db->s, (i64)id, &m) != 0) return vi_norow_(db, id);
     if (tag) *tag = (vi_i64)m;
     return 0;
+}
+
+VI_API int vi_set_num(vi_db *db, vi_i64 id, vi_i64 num)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    return store_set_num(db->s, (i64)id, (i64)num) == 0 ? 0 : vi_norow_(db, id);
+}
+
+VI_API int vi_get_num(vi_db *db, vi_i64 id, vi_i64 *num)
+{
+    i64 v = 0;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (store_get_num(db->s, (i64)id, &v) != 0) return vi_norow_(db, id);
+    if (num) *num = (vi_i64)v;
+    return 0;
+}
+
+VI_API int vi_search_range(vi_db *db, const float *query, int k, vi_i64 lo, vi_i64 hi, vi_i64 *ids, float *scores)
+{
+    StoreCnf c;
+    int n;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    if (lo > hi) return 0;
+    memset(&c, 0, sizeof(c));
+    c.num = 1; c.lo = (i64)lo; c.hi = (i64)hi;
+    n = store_search_cnf(db->s, query, (i32)k, (i64 *)ids, scores, &c);
+    vi_cos_(db, scores, n);
+    return n;
 }
 
 VI_API int vi_search(vi_db *db, const float *query, int k, vi_i64 *ids, float *scores)
