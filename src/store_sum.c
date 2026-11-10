@@ -553,8 +553,8 @@ static void store_msum_free_(void *p) { SSum *z = (SSum *)p; if (z) { free(z->ta
 static i32 store_row_heal_(RagStore *s, i32 r)
 {
     SSum *z = (SSum *)s->msum;
-    const u8 *part[7], *m0 = (const u8 *)s->map;
-    size_t n[7];
+    const u8 *part[8], *m0 = (const u8 *)s->map;
+    size_t n[8];
     u64 done[16], off, b, e, g;
     i32 np = 0, nd = 0, i, k;
     u8 *mem;
@@ -567,6 +567,7 @@ static i32 store_row_heal_(RagStore *s, i32 r)
     part[np] = SCOL_AT(&s->rck, r); n[np++] = 4;
     if (s->metric) { part[np] = SCOL_AT(&s->nrm, r); n[np++] = 4; }
     if (s->has_num) { part[np] = SCOL_AT(&s->numc, r); n[np++] = 8; }
+    if (s->has_ns) { part[np] = SCOL_AT(&s->nsc, r); n[np++] = 8; }
     if (!(mem = (u8 *)malloc(((size_t)1 + 3u * z->m) << z->blog))) return 0;
     memset(&j, 0, sizeof(j));
     j.z = z; j.heal = 1; j.gstep = 1; j.ubad = ~(u64)0;

@@ -603,6 +603,27 @@ static i32 sd_nums_(Arena *a)
     print_cstr("/1000 against "); print_i64((i64)(1000 * uhit / (utot ? utot : 1)));
     print_cstr("/1000 unfiltered (4-bit scan and cascade)\n");
     if (!ok || hit * 1000 < (i64)tot * (1000 * uhit / (utot ? utot : 1) - 30)) { print_cstr("  numbers FAILED\n"); ok = 0; }
+    {   /* a namespace too big for its list: searched through the IVF scan with the namespace tested inside it - 50 rows
+         * spread over 20000, so only the test inside the scan finds 10 of them; none of another namespace; a namespace
+         * and a number range together find their one row */
+        i32 keepx = store_ns_exact_max_, iso = 1, okr = 1, nn;
+        StoreCnf cn;
+        store_ns_exact_max_ = 10;
+        store_set_cascade(s, 0);
+        for (i = 0; i < SDC_N; i += 400) if (store_set_ns(s, i, 9) != 0) iso = 0;
+        for (q = 0; q < 30; ++q) {
+            nn = store_search_ns(s, 9, x + (size_t)(q * 101 + 2) * SDC_DIM, 10, ids, sc);
+            if (nn != 10) iso = 0;
+            for (j = 0; j < nn; ++j) if (ids[j] % 400) iso = 0;
+            memset(&cn, 0, sizeof(cn)); cn.ns_on = 1; cn.ns = 9; cn.num = 1; cn.lo = 400 * q; cn.hi = cn.lo + 399;
+            nn = store_search_cnf(s, x + (size_t)(q * 13) * SDC_DIM, 10, ids, sc, &cn);
+            if (nn != 1 || ids[0] != 400 * q) okr = 0;
+        }
+        print_cstr(iso && okr ? "  namespaces: a big one through the IVF scan - 10 of its 50 rows in 20000, none of another; with a range its one row\n" : "  namespaces in the scan FAILED\n");
+        if (!iso || !okr) ok = 0;
+        store_ns_exact_max_ = keepx;
+        store_set_cascade(s, 1);
+    }
     {   /* saved and loaded cold - the codes taken as larger than RAM, so each search asks for its clusters - and warm:
          * the same hits, for plain, range and tag searches, with the cascade on (pass 1 left it on) */
         const char *path = "/tmp/store_demo_cold.vxi";

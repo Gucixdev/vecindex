@@ -466,6 +466,7 @@ VI_API int vi_batch_delete_range(vi_batch *b, vi_i64 lo, vi_i64 hi)
     return store_batch_delete_range(&b->w, (i64)lo, (i64)hi);
 }
 
+VI_API int vi_batch_set_ns(vi_batch *b, vi_i64 id, vi_i64 ns) { return b ? store_batch_set_ns(&b->w, (i64)id, (i64)ns) : vi_fail_(-1, VI_NOB, (const char *)0, (const char *)0); }
 VI_API int vi_batch_set_num(vi_batch *b, vi_i64 id, vi_i64 num) { return b ? store_batch_set_num(&b->w, (i64)id, (i64)num) : vi_fail_(-1, VI_NOB, (const char *)0, (const char *)0); }
 
 VI_API int vi_batch_commit(vi_batch *b, int sync)
@@ -551,6 +552,60 @@ VI_API int vi_search_range(vi_db *db, const float *query, int k, vi_i64 lo, vi_i
     n = store_search_num(db->s, query, (i32)k, (i64)lo, (i64)hi, (i64 *)ids, scores);
     vi_cos_(db, scores, n);
     return n;
+}
+
+VI_API int vi_add_ns(vi_db *db, vi_i64 ns, vi_i64 id, const float *vec, const char *text, int len)
+{
+    StoreWb b;
+    i32 r, n;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (vi_vec_ok_(db, vec, "the vector")) return -1;
+    n = text ? vi_len_(text, len) : 0;
+    if (n < 0 || n > STORE_TXMAX) return vi_fail_(-1, "the text is longer than 16 MB - 1 bytes", (const char *)0, (const char *)0);
+    store_batch_init(&b, db->s);                                 /* the row and its namespace: one journal record */
+    if (n > 0) store_batch_put_text(&b, vec, (i64)id, 0, text, n); else store_batch_put(&b, vec, (i64)id, 0);
+    store_batch_set_ns(&b, (i64)id, (i64)ns);
+    r = store_batch_commit(&b, 0);
+    store_batch_free(&b);
+    return r >= 0 ? 0 : vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+}
+
+VI_API int vi_set_ns(vi_db *db, vi_i64 id, vi_i64 ns)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    return store_set_ns(db->s, (i64)id, (i64)ns) == 0 ? 0 : vi_norow_(db, id);
+}
+
+VI_API int vi_get_ns(vi_db *db, vi_i64 id, vi_i64 *ns)
+{
+    i64 v = 0;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (store_get_ns(db->s, (i64)id, &v) != 0) return vi_norow_(db, id);
+    if (ns) *ns = (vi_i64)v;
+    return 0;
+}
+
+VI_API int vi_search_ns(vi_db *db, vi_i64 ns, const float *query, int k, vi_i64 *ids, float *scores)
+{
+    int n;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    n = store_search_ns(db->s, (i64)ns, query, (i32)k, (i64 *)ids, scores);
+    vi_cos_(db, scores, n);
+    return n;
+}
+
+VI_API vi_i64 vi_delete_ns(vi_db *db, vi_i64 ns)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (!ns) return vi_fail_(-1, "namespace 0 is the rows in none: delete those by id", (const char *)0, (const char *)0);
+    return (vi_i64)store_delete_ns(db->s, (i64)ns);
+}
+
+VI_API vi_i64 vi_count_ns(vi_db *db, vi_i64 ns)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    return (vi_i64)store_count_ns(db->s, (i64)ns);
 }
 
 VI_API int vi_search(vi_db *db, const float *query, int k, vi_i64 *ids, float *scores)

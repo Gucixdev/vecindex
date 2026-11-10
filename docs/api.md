@@ -28,6 +28,15 @@ row labelled dog or cat (or anything else under animal) that is not big. A label
 worked out when the search runs, so putting a new label over existing ones (`vi_label(db, "dog", "pet")`) changes no
 row. 64 labels a store; the table is saved in the file and every change is journaled.
 
+Namespaces put many tenants in one store: `vi_add_ns(db, user, id, vec, text, -1)` adds a row with its namespace (any
+i64 - a user id, or `vi_key("acme", -1)` for a name) and `vi_search_ns(db, user, q, 10, ids, scores)` searches only
+that namespace. Most tenants are small, and a namespace up to 20000 rows is searched exactly over a list of its own
+rows - its few rows lie in every cluster of the index, so a filtered scan would read them all; a bigger one goes
+through the scan with the namespace tested inside it. Replacing a row (`vi_add`, `vi_update`, a batch) keeps its
+namespace, so a write never moves a row into another tenant's searches; `vi_set_ns` moves one on purpose, and
+`vi_delete_ns` removes a whole tenant as one journal record. A directory of stores (`vi_dir`) stays for tenants that
+need a file of their own.
+
 A row also carries one 64-bit number for range filters - a time, a price in cents, a version: `vi_set_num(db, id,
 t)`, then `vi_search_range(db, q, 10, from, to, ids, scores)` is the nearest rows with a number in `[from, to]`. The
 range is tested inside the scan, before the candidates are picked, so a range that holds a handful of rows far from
@@ -63,6 +72,7 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_set_tag`, `vi_get_tag` | a 64-bit tag per row |
 | `vi_set_num(db, id, num)`, `vi_get_num(db, id, &num)`, `vi_search_range(db, q, k, lo, hi, ids, scores)` | a 64-bit number per row (0 until set), and a search over the rows whose number is in `[lo, hi]` |
 | `vi_search_where(db, q, k, all, any, none, lo, hi, ids, scores)` | labels (as `vi_search_labeled`) and a number range in one search, both tested in the scan |
+| `vi_add_ns(db, ns, id, vec, text, len)`, `vi_search_ns(db, ns, q, k, ids, scores)`, `vi_set_ns`, `vi_get_ns`, `vi_delete_ns(db, ns)`, `vi_count_ns(db, ns)`, `vi_batch_set_ns` | namespaces: many tenants in one store; a search in a namespace sees only its rows (a small one searched exactly over its own rows, a big one through the scan with the namespace inside it); `vi_add` over a row keeps its namespace; `vi_delete_ns` drops a tenant in one journal record |
 | `vi_error()` | why the calling thread's last failed call failed, in words |
 | `vi_key(s, len)` | a 64-bit id for a string (a path, a URL), the same everywhere |
 | `vi_label(db, name, parent)`, `vi_label_add(db, id, labels)`, `vi_label_remove(db, id, labels)`, `vi_search_labeled(db, q, k, all, any, none, ids, scores)` | labels in a hierarchy on rows, and a search over every label of `all`, one of `any`, none of `none` |

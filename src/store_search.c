@@ -22,8 +22,9 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
     EngScratch sc;
     f32 *slut = (f32 *)0;
     i32 have = 0, i, got, tail;
-    TqCol mcol, ncol;
+    TqCol mcol, ncol, scol;
     TqFilt tf;
+    i32 exact;
     f32 qlen;
 
     memcpy(qn, query, (size_t)dim * sizeof(f32));
@@ -36,8 +37,11 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
     memset(&tf, 0, sizeof(tf));
     if (filtered) { tf.meta = &mcol; tf.all = all_bits; tf.any = any_bits; }
     if (cnf && cnf->num && s->has_num) { ncol = store_tqcol_(&s->numc); tf.num = &ncol; tf.lo = cnf->lo; tf.hi = cnf->hi; }
+    if (cnf && cnf->ns_on && s->has_ns) { scol = store_tqcol_(&s->nsc); tf.ns = &scol; tf.nsv = cnf->ns; }
 
-    if (cnf && cnf->num && !s->has_num && (cnf->lo > 0 || cnf->hi < 0)) {}   /* no numbers yet: every row's is 0 */
+    exact = store_ns_exact_(s, cnf, qn, qlen, k, out_doc_ids, out_scores, &have);   /* a small namespace: its own rows */
+    if (exact) {}
+    else if (cnf && cnf->num && !s->has_num && (cnf->lo > 0 || cnf->hi < 0)) {}   /* no numbers yet: every row's is 0 */
     else if (s->tq) {
         /* candidates re-scored exactly: 20 k, at least 256 - four times that with 1-bit codes, which rank coarsely */
         i32 R = filtered ? k * 40 + 256
@@ -89,7 +93,7 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
         }
     }
 
-    tail = cnf && cnf->num && !s->has_num && (cnf->lo > 0 || cnf->hi < 0) ? 0 : s->count;
+    tail = exact || (cnf && cnf->num && !s->has_num && (cnf->lo > 0 || cnf->hi < 0)) ? 0 : s->count;
     for (i = s->built_upto; i < tail; ++i) {                    /* the pending tail: exact */
         if (STORE_DEAD(s, i)) continue;
         if (filtered && !store_meta_ok_(STORE_META(s, i), all_bits, any_bits)) continue;

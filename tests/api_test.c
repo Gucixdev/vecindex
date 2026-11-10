@@ -584,6 +584,76 @@ int main(void)
         remove(fn); remove(jn);
     }
 
+    /* namespaces: tenants in one store - a small one searched over its own rows, a big one through the scan with the
+     * namespace inside it; nothing of another namespace ever comes back; moves, replacements, deletes, batches; the
+     * journal and the file keep them */
+    {
+        char fn[64], jn[72];
+        vi_i64 got2[64], all[33000];
+        float sc2[64], as[33000];
+        int pass, j, ok, iso, n1, na, want, hit, tot;
+        vi_batch *b;
+        sprintf(fn, "/tmp/vecindex_api_ns_%d.vxi", (int)getpid());
+        sprintf(jn, "%s.j", fn);
+        db = vi_open(fn, DIM, 0);
+        for (i = 0; db && i < 50; ++i) { vec_(100000 + i, v); vi_add_ns(db, 1, 100000 + i, v, (const char *)0, 0); }
+        for (i = 0; db && i < 30000; ++i) { vec_(200000 + i, v); vi_add_ns(db, 2, 200000 + i, v, i < 3 ? "a text of tenant two" : (const char *)0, -1); }
+        for (i = 0; db && i < 10; ++i) { vec_(300000 + i, v); vi_add_ns(db, 3, 300000 + i, v, (const char *)0, 0); }
+        for (i = 0; db && i < 100; ++i) { vec_(400000 + i, v); vi_add(db, 400000 + i, v); }
+        check(db && vi_count_ns(db, 1) == 50 && vi_count_ns(db, 2) == 30000 && vi_count_ns(db, 3) == 10 && vi_count_ns(db, 0) == 100
+              && vi_count_ns(db, 9) == 0, "vi_add_ns: three namespaces and the rows in none, counted");
+        if (db) vi_build(db);
+        for (pass = 0; pass < 3; ++pass) {                       /* live, after a reopen (journal), after save + reopen */
+            for (j = 0, iso = 1, ok = 1, hit = tot = 0; db && j < 40; ++j) {
+                int q, m;
+                vec_(500000 + j, v);
+                n1 = vi_search_ns(db, 1, v, 10, got2, sc2);
+                for (q = 0; q < n1; ++q) iso &= got2[q] >= 100000 && got2[q] < 100050 && (pass == 0 || got2[q] != 100008);
+                na = vi_search(db, v, 33000, all, as);           /* every row ranked: the exact answer inside each */
+                for (q = want = 0; q < na && want < 10; ++q) if (all[q] >= 100000 && all[q] < 100050 && (pass == 0 || all[q] != 100008)) ok &= all[q] == got2[want++];
+                ok &= n1 == 10 && want == 10;
+                m = vi_search_ns(db, 2, v, 10, got2, sc2);
+                for (q = 0; q < m; ++q) iso &= got2[q] >= 200000 && got2[q] < 230000;
+                for (q = want = 0; q < na && want < 10; ++q) if (all[q] >= 200000 && all[q] < 230000) {
+                    int z; ++want; ++tot;
+                    for (z = 0; z < m; ++z) if (got2[z] == all[q]) { ++hit; break; }
+                }
+                m = vi_search_ns(db, 0, v, 10, got2, sc2);
+                for (q = 0; q < m; ++q) iso &= got2[q] >= 400000;
+            }
+            check(iso, pass == 0 ? "vi_search_ns: never a row of another namespace (40 queries, namespaces 1, 2 and none)"
+                       : (pass == 1 ? "vi_search_ns after a reopen: still none from another" : "vi_search_ns after a save: still none from another"));
+            check(ok, "vi_search_ns, a namespace of 50: the exact 10 nearest of its own rows, in order");
+            check(hit * 10 >= tot * 8, "vi_search_ns, a namespace of 30000: recall@10 against its own rows at least 0.8");
+            vec_(300004, v);
+            check(db && vi_search_ns(db, 3, v, 3, got2, sc2) == 3 && got2[0] == 300004, "vi_search_ns, a namespace of 10: the query's own row first");
+            if (pass == 0) {
+                vec_(100007, w); w[0] += 0.01f;
+                check(db && vi_add(db, 100007, w) == 0 && vi_get_ns(db, 100007, &tag) == 0 && tag == 1 && vi_count_ns(db, 1) == 50,
+                      "vi_add over a row of namespace 1: it stays in namespace 1");
+                check(db && vi_set_ns(db, 100008, 3) == 0 && vi_count_ns(db, 1) == 49 && vi_count_ns(db, 3) == 11, "vi_set_ns: a row moves from 1 to 3");
+                vec_(100008, v);
+                check(db && vi_search_ns(db, 3, v, 1, got2, sc2) == 1 && got2[0] == 100008 && vi_search_ns(db, 1, v, 1, got2, sc2) == 1 && got2[0] != 100008,
+                      "after the move: found in 3, not in 1");
+                b = db ? vi_batch_begin(db) : (vi_batch *)0;
+                vec_(600000, v);
+                check(b && vi_batch_add(b, 600000, v) == 0 && vi_batch_set_ns(b, 600000, 4) == 0 && vi_batch_commit(b, 1) == 2
+                      && vi_count_ns(db, 4) == 1 && vi_search_ns(db, 4, v, 5, got2, sc2) == 1 && got2[0] == 600000, "vi_batch_set_ns: a fourth namespace");
+                check(db && vi_get_text(db, 200001, (char *)got2, 64) == 20, "vi_add_ns with a text");
+            }
+            if (db) { if (pass == 1) vi_save(db, (const char *)0); vi_close(db); }
+            db = vi_open(fn, 0, 0);
+            check(db && vi_count_ns(db, 1) == 49 && vi_count_ns(db, 3) == 11 && vi_count_ns(db, 4) == 1, "after the reopen: the namespaces counted the same");
+        }
+        check(db && vi_delete_ns(db, 3) == 11 && vi_count_ns(db, 3) == 0 && vi_search_ns(db, 3, v, 5, got2, sc2) == 0
+              && vi_count_ns(db, 1) == 49 && vi_delete_ns(db, 0) == -1, "vi_delete_ns: all 11 rows of namespace 3, the rest stay; namespace 0 refused");
+        if (db) vi_close(db);
+        db = vi_open(fn, 0, 0);
+        check(db && vi_count_ns(db, 3) == 0 && vi_count_ns(db, 2) == 30000, "vi_delete_ns replayed from the journal");
+        if (db) vi_close(db);
+        remove(fn); remove(jn);
+    }
+
     /* shards: rows split over three stores of a directory, one search over all of them, the same hits as one store */
     {
         char dp[64], fp[96];

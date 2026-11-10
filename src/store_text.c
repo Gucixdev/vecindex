@@ -20,6 +20,7 @@ static void store_jrec_text_(RagStore *s, i64 id, i64 meta, const f32 *vec, cons
 i32 store_put_text(RagStore *s, const f32 *vec, i64 doc_id, i64 meta, const char *text, i32 len)
 {
     u64 v;
+    i64 ns;
     if (len == 0) return store_put(s, vec, doc_id, meta);
     if (!store_finite_(vec, s->dim) || len < 0 || len > STORE_TXMAX || !text) return -1;
     pthread_rwlock_wrlock(&s->lock);
@@ -29,8 +30,10 @@ i32 store_put_text(RagStore *s, const f32 *vec, i64 doc_id, i64 meta, const char
         pthread_rwlock_unlock(&s->lock);
         return -1;
     }
+    ns = store_ns_keep_(s, doc_id);
     store_kill_id_locked_(s, doc_id);
     store_append_locked_(s, vec, doc_id, meta);
+    if (ns) store_ns_put_(s, ns);
     STORE_TXO(s, s->count - 1) = v;
     s->txlive += len;
     if (s->lex) lex_add(s->lex, doc_id, text, len);

@@ -150,7 +150,8 @@ VI_API int vi_batch_update(vi_batch *b, vi_i64 id, const float *vec);   /* vi_up
 VI_API int vi_batch_add_text(vi_batch *b, vi_i64 id, const float *vec, const char *text, int len);
 VI_API int vi_batch_delete(vi_batch *b, vi_i64 id);
 VI_API int vi_batch_delete_range(vi_batch *b, vi_i64 lo, vi_i64 hi);
-VI_API int vi_batch_set_num(vi_batch *b, vi_i64 id, vi_i64 num);   /* on the row the batch added or the store has */
+VI_API int vi_batch_set_num(vi_batch *b, vi_i64 id, vi_i64 num);
+VI_API int vi_batch_set_ns(vi_batch *b, vi_i64 id, vi_i64 ns);     /* as vi_set_ns, when the batch reaches it */   /* on the row the batch added or the store has */
 
 /* Applies the batch as one change and frees it. sync 1: also on the disk when this returns (a store opened from a
  * file; commits arriving during an fsync share the next one). Returns how many changes it held; -1 refused, nothing
@@ -191,6 +192,22 @@ VI_API int vi_search_where(vi_db *db, const float *query, int k, const char *all
 VI_API int vi_set_num(vi_db *db, vi_i64 id, vi_i64 num);
 VI_API int vi_get_num(vi_db *db, vi_i64 id, vi_i64 *num);
 VI_API int vi_search_range(vi_db *db, const float *query, int k, vi_i64 lo, vi_i64 hi, vi_i64 *ids, float *scores);
+
+/* Namespaces: many tenants in one store. A row is in one namespace (an i64 the caller picks - a user id, or
+ * vi_key("acme", -1) for a name; 0: none), and vi_search_ns sees only the rows of its namespace. A small namespace
+ * (up to 20000 rows) is searched exactly over its own rows, a big one through the index with the namespace tested
+ * inside the scan, so a tenant's search costs about its own size. Ids are still the store's: one id, one row, in
+ * one namespace. vi_add_ns adds (or replaces) a row with its namespace and an optional text (NULL: none; len -1: a
+ * C string) as one change, so a crash never leaves the row outside it; vi_add over a row keeps its namespace -
+ * replacing a row never moves it into another tenant's searches; vi_set_ns moves a row. vi_delete_ns removes every
+ * row of a namespace (one journal record) and returns how many; vi_count_ns counts them. Saved in the file,
+ * journaled, under the row checks. 0 (a count for the last two), or -1 (vi_error()). */
+VI_API int vi_add_ns(vi_db *db, vi_i64 ns, vi_i64 id, const float *vec, const char *text, int len);
+VI_API int vi_set_ns(vi_db *db, vi_i64 id, vi_i64 ns);
+VI_API int vi_get_ns(vi_db *db, vi_i64 id, vi_i64 *ns);
+VI_API int vi_search_ns(vi_db *db, vi_i64 ns, const float *query, int k, vi_i64 *ids, float *scores);
+VI_API vi_i64 vi_delete_ns(vi_db *db, vi_i64 ns);
+VI_API vi_i64 vi_count_ns(vi_db *db, vi_i64 ns);
 
 /* A 64-bit tag on a row, for filtered search: 0, or -1 when there is no such row. */
 VI_API int vi_set_tag(vi_db *db, vi_i64 id, vi_i64 tag);

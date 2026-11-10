@@ -178,3 +178,13 @@ i32 store_search_num(RagStore *s, const f32 *query, i32 k, i64 lo, i64 hi, i64 *
     c.num = 1; c.lo = lo; c.hi = hi;
     return store_search_cnf(s, query, k, ids, scores, &c);
 }
+
+/* store_search inside namespace ns (0: the rows in none) */
+i32 store_search_ns(RagStore *s, i64 ns, const f32 *query, i32 k, i64 *ids, f32 *scores)
+{
+    StoreCnf c;
+    memset(&c, 0, sizeof(c));
+    c.ns_on = 1; c.ns = ns;
+    return store_search_cnf(s, query, k, ids, scores, &c);
+}
+

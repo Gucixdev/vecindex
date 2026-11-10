@@ -32,7 +32,8 @@ shards (`vi_dir_search`, the hits of one store with every row, from three), `vi_
 tag, number and text kept, through the journal, a batch and a save), `vi_search_where` (labels and a number range
 in one search), all of them in vserv too (line `group`, `between`, `num`, `update`; binary ops 15-19; HTTP), a cold index (codes past half of RAM stay on the disk at load, a search
 pages in its probed clusters: 0.7 ms against 0.4 ms warm on 2M rows, `bench/cold.c`), the lens (a file past half of RAM opens without reading every block:
-the small parts at once, texts when read, everything before a save, the rest walked one block at a time).
+the small parts at once, texts when read, everything before a save, the rest walked one block at a time), namespaces (tenants in one store: small ones searched over their own rows, big
+ones through the scan with the namespace inside it; `vi_add_ns`, `vi_search_ns`, `vi_delete_ns`).
 
 Open:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a
