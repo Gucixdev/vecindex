@@ -722,6 +722,33 @@ int main(void)
     }
 
     free(qs); free(bi); free(bs);
+    {   /* a row added after a save that dropped deleted rows, in a store with numbers and namespaces: its slot still
+         * held a dropped row's number when its check was computed, so the row read as damaged and refused vi_set_tag
+         * (found by tests/compat_test.c; this fails on the code before the fix) */
+        char fn2[128];
+        float v2[DIM];
+        vi_i64 t2 = 0, n2 = 0;
+        int i2, okp = 1;
+        vi_db *d2;
+        sprintf(fn2, "/tmp/vecindex_api_slot_%d.vxi", (int)getpid());
+        remove(fn2);
+        d2 = vi_open(fn2, DIM, 0);
+        for (i2 = 1; d2 && i2 <= 50; ++i2) { vec_(i2, v2); vi_add(d2, i2, v2); vi_set_num(d2, i2, 1000 + i2); vi_set_ns(d2, i2, 5); }
+        for (i2 = 1; d2 && i2 <= 50; i2 += 10) vi_delete(d2, i2);
+        if (!d2 || vi_save(d2, fn2) != 0) okp = 0;
+        for (i2 = 51; d2 && i2 <= 60; ++i2) {
+            vec_(i2, v2);
+            if (vi_add(d2, i2, v2) != 0 || vi_set_tag(d2, i2, 0x700) != 0 || vi_set_num(d2, i2, 7) != 0) okp = 0;
+        }
+        if (d2) vi_close(d2);
+        d2 = vi_open(fn2, DIM, 0);
+        for (i2 = 51; d2 && i2 <= 60; ++i2)
+            if (vi_get_tag(d2, i2, &t2) != 0 || t2 != 0x700 || vi_get_num(d2, i2, &n2) != 0 || n2 != 7) okp = 0;
+        check(okp && d2, "rows added after a save that dropped rows: their tags and numbers set, kept after a reopen");
+        if (d2) vi_close(d2);
+        remove(fn2);
+        sprintf(fn2 + strlen(fn2), ".j"); remove(fn2);
+    }
     printf("C API: %s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
 }

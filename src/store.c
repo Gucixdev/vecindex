@@ -1358,11 +1358,11 @@ static void store_append_locked_(RagStore *s, const f32 *vec, i64 doc_id, i64 me
     STORE_ID(s, r) = doc_id;
     STORE_META(s, r) = meta;
     if (s->metric) STORE_NRM(s, r) = len;
+    if (s->has_text) { STORE_TXO(s, r) = 0; STORE_TCK(s, r) = 0; }
+    if (s->has_num) STORE_NUM(s, r) = 0;                         /* before the check, which mixes them in: the slot may */
+    if (s->has_ns) STORE_NS(s, r) = 0;                           /* still hold a row's from before a compaction */
     STORE_RCK(s, r) = store_rck_row_(s, r);
     if (s->metric) for (d = 0; d < s->dim; ++d) v[d] *= len;     /* the journal gets the row as it came */
-    if (s->has_text) { STORE_TXO(s, r) = 0; STORE_TCK(s, r) = 0; }
-    if (s->has_num) STORE_NUM(s, r) = 0;
-    if (s->has_ns) STORE_NS(s, r) = 0;
     s->dead[r >> 6] &= ~((u64)1 << (r & 63));
     store_note_row_(s, r);
     s->live += 1;
