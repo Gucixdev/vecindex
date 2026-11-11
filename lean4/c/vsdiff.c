@@ -104,7 +104,7 @@ static void parse_c_(const char *tok)
     f = fopen(path, "w");
     fprintf(f, "k_parse_0123456789abcd %s\n", tok);
     fclose(f);
-    for (i = 0; i < vs_nkeys; ++i) pthread_mutex_destroy(&vs_kst[i].mu);
+    if (vs_kst) for (i = 0; i < vs_nkeys; ++i) pthread_mutex_destroy(&vs_kst[i].mu);   /* after a refused file: none */
     free(vs_keys); free(vs_kst); vs_keys = (VsKey *)0; vs_kst = (VsKeySt *)0; vs_nkeys = 0;
     r = vs_keys_load_(path);
     if (r == 0) put_i64_(vs_keys[0].tn); else fputs("none", stdout);

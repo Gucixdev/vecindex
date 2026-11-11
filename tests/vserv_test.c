@@ -773,6 +773,70 @@ int main(int argc, char **argv)
         close(fd);
         stop(p, SIGTERM);
 
+        /* the replica killed with kill -9 at random moments - in the middle of a 4 MB chunk of the file, of a journal
+         * append, of a re-download after a snapshot: every time, what is on its disk loads (vserv starts on a copy
+         * of it) with no more rows than the primary has, and a restarted replica catches up */
+        {
+            char cp[400], cpj[420], rj[420], big[2200], *txt = (char *)malloc(300001);
+            unsigned seed = (unsigned)getpid();
+            int round, loads = 0, bounded = 0, maxc = 0, cur;
+            sprintf(pa, "%s/kp.vxi", dir); sprintf(ra, "%s/kr.vxi", rdir); sprintf(cp, "%s/kc.vxi", dir);
+            sprintf(cpj, "%s.j", cp); sprintf(rj, "%s.j", ra);
+            serve_path = pa;
+            p = start(NULL, NULL, NULL);
+            fd = connect_unix();
+            memset(txt, 'a', 300000); txt[300000] = 0;
+            for (i = 1; i <= 40; ++i) {                          /* 40 rows of 300 kB: a 12 MB file, three chunks */
+                char *l = (char *)malloc(300200);
+                vline(l, "addt", i, i);
+                sprintf(l + strlen(l) - 1, " %s\n", txt);
+                ask(fd, l, r, sizeof(r));
+                free(l);
+            }
+            check(ask(fd, "save\n", r, sizeof(r)) > 0 && !strcmp(r, "ok"), "kill -9 of the replica: a 12 MB primary, saved");
+            for (round = 0; round < 8; ++round) {
+                pid_t f;
+                if (round % 2 == 0) {                            /* a new file to fetch: killed in the middle of it */
+                    ask(fd, "snapshot\n", r, sizeof(r));
+                    for (i = 0; i < 400; ++i) { if (ask(fd, "stats\n", r, sizeof(r)) > 0 && strstr(r, "snapshot=idle")) break; msleep(10); }
+                }
+                f = follow(sock_path, ra, NULL);
+                seed = seed * 1103515245u + 12345u;
+                msleep(round % 2 == 0 ? 1 + (int)(seed % 30u) : 20 + (int)(seed % 300u));   /* a 12 MB copy takes ~20 ms */
+                kill(f, SIGKILL); waitpid(f, NULL, 0);
+                add_rows(fd, 1000 + round * 10, 1010 + round * 10);   /* journal for the next round to copy */
+                sprintf(big, "cp %s %s 2>/dev/null; rm -f %s; cp %s %s 2>/dev/null", ra, cp, cpj, rj, cpj);
+                if (system(big) != 0) {}
+                if (access(cp, F_OK) == 0) {
+                    pid_t q;
+                    serve_path = cp;
+                    {   char s2[160]; strcpy(s2, sock_path); sprintf(sock_path, "%s/kc.sock", dir);
+                        port += 100;                     /* the primary holds the port */
+                        q = start(NULL, NULL, NULL);
+                        port -= 100;
+                        cur = -1;
+                        {   int fc = connect_unix();
+                            if (fc >= 0) { cur = count_of(fc); close(fc); } }
+                        stop(q, SIGTERM);
+                        strcpy(sock_path, s2); }
+                    serve_path = pa;
+                    if (cur >= 0) ++loads;
+                    if (cur >= 0 && cur <= count_of(fd)) ++bounded;
+                    if (cur > maxc) maxc = cur;
+                } else { ++loads; ++bounded; }                   /* killed before the first file was in: nothing yet */
+            }
+            if (loads != 8 || bounded != 8) printf("  (loaded %d of 8, not ahead %d of 8)\n", loads, bounded);
+            check(loads == 8 && bounded == 8, "kill -9 of the replica 8 times: its files load every time, never ahead of the primary");
+            msleep(1200);
+            {   pid_t f = follow(sock_path, ra, NULL);
+                check(wait_same(pa, ra, 20000), "... and a restarted replica catches up");
+                stop(f, SIGTERM); }
+            free(txt);
+            close(fd);
+            stop(p, SIGTERM);
+            (void)maxc;
+        }
+
         /* over TCP with -K: a tenant's key may not follow, the operator's may */
         sprintf(kp, "%s/rkeys.tsv", dir);
         if ((kf = fopen(kp, "w")) != (FILE *)0) { fprintf(kf, "op_key_0123456789abcdef *\nt_key_0123456789abcdef 3\n"); fclose(kf); }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # fuzz - coverage-guided fuzzing of what vecindex reads from outside, with clang's libFuzzer under ASan and UBSan:
 # tests/fuzz_proto.c (vserv's binary, line and HTTP protocols, a store behind them, the replies checked for framing)
-# and tests/fuzz_store.c (a store file and its journal as store_load reads, repairs and replays them).
+# tests/fuzz_store.c (a store file and its journal as store_load reads, repairs and replays them) and tests/fuzz_cfg.c
+# (the key file, a replica's journal walk, a certificate's DER as a replica reads it).
 #
 #   tools/fuzz                 every target, 60 s each
 #   tools/fuzz proto 600       one target for 10 minutes (proto, store)
@@ -16,7 +17,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 
-targets=(proto store)
+targets=(proto store cfg)
 [[ ${1:-} ]] && targets=("$1")
 secs=${2:-60}
 mkdir -p .build/fuzz
@@ -26,7 +27,8 @@ for t in "${targets[@]}"; do
     case $t in
         proto) extra=(-DVSERV_NO_TLS); opts=(-dict=tests/fuzz/proto.dict -max_len=4096) ;;
         store) extra=(); opts=(-max_len=262144) ;;
-        *) echo "fuzz: no target $t (proto, store)" >&2; exit 2 ;;
+        cfg) extra=(-DVSERV_NO_TLS); opts=(-max_len=4096) ;;
+        *) echo "fuzz: no target $t (proto, store, cfg)" >&2; exit 2 ;;
     esac
     bin=.build/fuzz_$t
     stale=0

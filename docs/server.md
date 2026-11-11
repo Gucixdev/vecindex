@@ -318,6 +318,8 @@ socket and no build call) and `py/vserv_tls_test.py` (22 checks: resumption on e
 plaintext refused, untrusted CA, mTLS accept/reject, RSA key, curl, TLS on the Unix socket), and `tests/vserv_test.c`
 (the line protocol and its errors, the binary and HTTP snapshot, get and range-delete calls, replace-on-add, the log
 and its peers, kill -9 against the journal, timed snapshots, API keys and their limits, /metrics and /prometheus, a
-replica (`-F`) through a snapshot, a kill -9 of the primary and a failover, over TCP with the operator's key, on a
-tenant directory and past a torn tail, and the certificate name of a curl client under mutual TLS in the log) run in
+replica (`-F`) through a snapshot, a kill -9 of the primary and a failover, the replica itself killed with kill -9 at
+random moments of its copy (its files load every time, never ahead of the primary), over TCP with the operator's key, on a
+tenant directory and past a torn tail, automatic TLS (openssl strict, Python's ssl, curl with the pin, the replica
+refusing a changed key), and the certificate name of a curl client under mutual TLS in the log) run in
 `./run`.

@@ -215,8 +215,8 @@ fi
 # ---- tools/fuzz does the fuzzing itself, with clang's libFuzzer ----
 echo "fuzz regressions (tests/fuzz)"
 fzn=0; fzs=ok
-for t in proto store; do
-    extra=(); [[ $t == proto ]] && extra=(-DVSERV_NO_TLS)
+for t in proto store cfg; do
+    extra=(); [[ $t == proto || $t == cfg ]] && extra=(-DVSERV_NO_TLS)
     if ! "$CC" -std=gnu99 -g -O1 "${UBS[@]}" -march=native -DFUZZ_MAIN \
             "${extra[@]}" -Isrc "tests/fuzz_$t.c" -lm -lpthread -o "$OUT/fuzz_${t}_replay" 2>/dev/null; then [[ $fzs == ok ]] && fzs=skip; continue; fi
     rm -rf "$OUT/fuzz_seeds/$t"; mkdir -p "$OUT/fuzz_seeds/$t"          # .gz seeds unpacked, the rest as they are

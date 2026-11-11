@@ -9,7 +9,7 @@
  * replica (vserv -F) remembers it on its first connection, the way ssh remembers a host key, and refuses a server that
  * shows another one. */
 
-#ifdef VSERV_TLS
+#if defined(VSERV_TLS) || defined(VSERV_FUZZ)                  /* the DER reading also for tests/fuzz_cfg.c */
 
 /* ---- DER, the few shapes a certificate needs ---- */
 
@@ -65,6 +65,9 @@ static i32 vs_spki_(const unsigned char *der, size_t n, const unsigned char **sp
     }
     return -1;
 }
+
+#endif
+#ifdef VSERV_TLS
 
 static void vs_b64_(char *o, const unsigned char *p, size_t n)
 {
