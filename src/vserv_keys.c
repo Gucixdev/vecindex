@@ -1,0 +1,139 @@
+/* vserv_keys.c - API keys (-K FILE): many users of one server, each seeing only its own data, with nothing to set
+ * up but a file of keys. A line of the file is KEY TENANT (a tab or spaces between; # starts a comment):
+ *
+ *   k_9f2c41d07e3a4b55a1f0   7        one store: tenant 7 - a namespace of the store (store_ns.c), ids 0 to 2^44 - 1
+ *   k_1b7e0c9da2f84c3e8d61   acme     a tenant directory: the tenant acme, DIR/acme.vxi
+ *
+ * A connection on the TCP port shows its key before anything else (line: auth KEY; binary: op 20; HTTP: an
+ * Authorization: Bearer KEY header on every request), and from then on reaches only its tenant: in one store, the
+ * server puts its rows in the tenant's namespace and gives them ids of the tenant's own (tenant << 44 | id), so two
+ * tenants may both have an id 1 and neither can name the other's rows; searches see only the namespace. Building,
+ * saving, snapshots and scrubs stay with whoever runs the server. The Unix socket needs no key (who may connect to it
+ * is the socket file's mode): there, auth is optional and the rest is the whole store.
+ * Part of vserv.c, which includes it at this point; not compiled on its own. */
+
+#define VS_KEYMIN  16                             /* a key: 16 to 128 printable characters, no spaces */
+#define VS_KEYMAX  128
+#define VS_TSHIFT  44                             /* a tenant's ids are [0, 2^44): 17.6 trillion, doc << 20 | chunk fits */
+#define VS_TMASK   (((i64)1 << VS_TSHIFT) - 1)
+#define VS_TMAXN   (((i64)1 << (63 - VS_TSHIFT)) - 1)   /* tenants 1 to 524287 in one store */
+
+typedef struct VsKey VsKey;                       /* key, klen, tn, name[VS_TNAME + 1]: defined in vserv.c, before vs_use_ */
+static VsKey *vs_keys;
+static i32 vs_nkeys;
+
+/* the key file at path: 0, or -1 with the line that is wrong on stderr */
+static i32 vs_keys_load_(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    char line[512];
+    i32 ln = 0, cap = 0;
+    if (!f) { fprintf(stderr, "vserv: cannot open the key file %s: %s\n", path, strerror(errno)); return -1; }
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line, *k, *t;
+        size_t kl, tl, i;
+        VsKey *e;
+        ++ln;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p || *p == '\n' || *p == '#') continue;
+        for (k = p; *p && *p != ' ' && *p != '\t' && *p != '\n'; ++p) {}
+        kl = (size_t)(p - k);
+        while (*p == ' ' || *p == '\t') ++p;
+        for (t = p; *p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '#'; ++p) {}
+        tl = (size_t)(p - t);
+        while (*p == ' ' || *p == '\t') ++p;
+        if (kl < VS_KEYMIN || kl > VS_KEYMAX || !tl || (*p && *p != '\n' && *p != '#')) {
+            fprintf(stderr, "vserv: %s:%d: a line is KEY TENANT, the key 16 to 128 characters without spaces\n", path, (int)ln);
+            fclose(f); return -1;
+        }
+        for (i = 0; i < kl; ++i) if ((unsigned char)k[i] < 0x21 || (unsigned char)k[i] > 0x7e) break;
+        if (i < kl) { fprintf(stderr, "vserv: %s:%d: a key is printable ASCII\n", path, (int)ln); fclose(f); return -1; }
+        if (vs_nkeys == cap) {
+            VsKey *nk = (VsKey *)realloc(vs_keys, (size_t)(cap = cap ? cap * 2 : 16) * sizeof(VsKey));
+            if (!nk) { fclose(f); return -1; }
+            vs_keys = nk;
+        }
+        e = &vs_keys[vs_nkeys];
+        memset(e, 0, sizeof(*e));
+        memcpy(e->key, k, kl); e->klen = (i32)kl;
+        if (vs_dir) {                                            /* a tenant directory: the tenant's name */
+            for (i = 0; i < tl && vs_tname_ok_(t[i]); ++i) {}
+            if (tl > VS_TNAME || i < tl) { fprintf(stderr, "vserv: %s:%d: a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -\n", path, (int)ln); fclose(f); return -1; }
+            memcpy(e->name, t, tl);
+        } else {                                                 /* one store: the tenant's number, its namespace */
+            i64 n = 0;
+            for (i = 0; i < tl && t[i] >= '0' && t[i] <= '9' && n <= VS_TMAXN; ++i) n = n * 10 + (t[i] - '0');
+            if (i < tl || n < 1 || n > VS_TMAXN) {
+                fprintf(stderr, "vserv: %s:%d: with one store a tenant is a number, 1 to 524287\n", path, (int)ln);
+                fclose(f); return -1;
+            }
+            e->tn = n;
+        }
+        for (i = 0; i < (size_t)vs_nkeys; ++i)
+            if (vs_keys[i].klen == e->klen && !memcmp(vs_keys[i].key, e->key, kl)) {
+                fprintf(stderr, "vserv: %s:%d: the same key twice\n", path, (int)ln); fclose(f); return -1;
+            }
+        ++vs_nkeys;
+    }
+    fclose(f);
+    if (!vs_nkeys) { fprintf(stderr, "vserv: %s holds no keys\n", path); return -1; }
+    return 0;
+}
+
+/* the key k[0, n) is - compared against every key the same way, so the time says nothing of how close a guess came */
+static const VsKey *vs_key_find_(const char *k, i32 n)
+{
+    const VsKey *hit = (const VsKey *)0;
+    i32 i, j;
+    for (i = 0; i < vs_nkeys; ++i) {
+        u32 d = (u32)(vs_keys[i].klen ^ n);
+        for (j = 0; j < VS_KEYMAX; ++j) d |= (u32)(u8)((j < n ? k[j] : 0) ^ vs_keys[i].key[j]);
+        if (!d) hit = &vs_keys[i];
+    }
+    return hit;
+}
+
+/* the connection shows key k[0, n): NULL, or why not (for the client) */
+static const char *vs_auth_(VsConn *c, const char *k, i32 n)
+{
+    const VsKey *e = n >= VS_KEYMIN && n <= VS_KEYMAX ? vs_key_find_(k, n) : (const VsKey *)0;
+    if (!vs_nkeys) return "this server has no keys (-K)";
+    if (!e) { vs_log_(c, 1, "auth refused: an unknown key"); return "unknown key"; }
+    if (c->key == e) return (const char *)0;                     /* the same key again (HTTP shows it every request) */
+    if (c->wb && c->key != e) return "a batch is open: commit or abort it first";
+    c->key = e;
+    if (vs_dir) {
+        const char *why;
+        c->tn = 0;
+        if ((why = vs_use_(c, e->name, (i32)strlen(e->name))) != (const char *)0) { c->key = (const VsKey *)0; return why; }
+    } else c->tn = e->tn;
+    vs_log_(c, 0, "auth tenant=%s%.0f", e->name, vs_dir ? 0.0 : (double)e->tn);
+    return (const char *)0;
+}
+
+/* a TCP connection to a server with keys that has not shown one: only ping, help, quit and auth answer */
+static i32 vs_need_key_(const VsConn *c) { return vs_nkeys > 0 && c->tcp && !c->key; }
+
+/* a keyed connection may not do the server's housekeeping (build, save, snapshot, scrub) */
+static i32 vs_admin_(const VsConn *c) { return !c->key; }
+
+/* ids on the wire <-> in the store: a tenant's id gains its tenant above bit 44 coming in, loses it going out. 0, or
+ * -1 for an id outside [0, 2^44) */
+static i32 vs_in_(const VsConn *c, i64 *id)
+{
+    if (!c->tn) return 0;
+    if (*id < 0 || *id > VS_TMASK) return -1;
+    *id |= c->tn << VS_TSHIFT;
+    return 0;
+}
+static void vs_out_(const VsConn *c, i64 *ids, i32 n) { i32 i; if (c->tn) for (i = 0; i < n; ++i) ids[i] &= VS_TMASK; }
+/* a range of ids [lo, hi] as the tenant's: clipped to [0, 2^44) and moved up; -1 when nothing of it is left */
+static i32 vs_rin_(const VsConn *c, i64 *lo, i64 *hi)
+{
+    if (!c->tn) return 0;
+    if (*hi < 0 || *lo > VS_TMASK || *lo > *hi) return -1;
+    if (*lo < 0) *lo = 0;
+    if (*hi > VS_TMASK) *hi = VS_TMASK;
+    *lo |= c->tn << VS_TSHIFT; *hi |= c->tn << VS_TSHIFT;
+    return 0;
+}

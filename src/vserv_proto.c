@@ -6,11 +6,25 @@
 
 /* The replace-or-add every protocol's add means (one row per id). While the connection has a batch open (the line
  * protocol's begin), adds and deletes from any protocol wait in it: logged when the batch commits, not one by one. */
+/* a tenant's row (keys, one store) and its namespace, as one change: one batch */
+static i32 vs_put_ns_(VsConn *c, const f32 *v, i64 id, const char *t, i32 n)
+{
+    StoreWb b;
+    i32 r;
+    store_batch_init(&b, c->t->s);
+    if (n > 0) store_batch_put_text(&b, v, id, 0, t, n); else store_batch_put(&b, v, id, 0);
+    store_batch_set_ns(&b, id, c->tn);
+    r = store_batch_commit(&b, 0);
+    store_batch_free(&b);
+    return r >= 0 ? 0 : -1;
+}
+
 static i32 vs_put_(VsConn *c, const f32 *v, i64 id)
 {
     i32 r;
-    if (c->wb) return store_batch_put(c->wb, v, id, 0);
-    r = store_put(c->t->s, v, id, 0);
+    if (vs_in_(c, &id)) return -2;                               /* a tenant's id: 0 to 2^44 - 1 */
+    if (c->wb) { r = store_batch_put(c->wb, v, id, 0); return r || !c->tn ? r : store_batch_set_ns(c->wb, id, c->tn); }
+    r = c->tn ? vs_put_ns_(c, v, id, (const char *)0, 0) : store_put(c->t->s, v, id, 0);
     if (vs_logging_()) vs_log_(c, r != 0, "add id=%ld %s", (long)id, r == 0 ? "ok" : "refused (NaN or Inf)");
     return r;
 }
@@ -19,6 +33,7 @@ static i32 vs_put_(VsConn *c, const f32 *v, i64 id)
 static i32 vs_del_(VsConn *c, i64 lo, i64 hi)
 {
     i32 n;
+    if (vs_rin_(c, &lo, &hi)) return 0;                          /* a tenant's ids only */
     if (c->wb) { if (lo == hi) store_batch_delete(c->wb, lo); else store_batch_delete_range(c->wb, lo, hi); return 0; }
     n = lo == hi ? store_delete(c->t->s, lo) : store_delete_range(c->t->s, lo, hi);
     if (vs_logging_()) {
@@ -85,7 +100,9 @@ static void vs_logsearch_(VsConn *c, i32 k, i32 got, double t0)
 /* the text of id into the worker's buffer: its length (0: none), -1 no such row, -2 out of memory */
 static i32 vs_get_text_(VsWorker *w, VsConn *c, i64 id, char **t)
 {
-    i32 n = store_get_text(c->t->s, id, (char *)0, 0);
+    i32 n;
+    if (vs_in_(c, &id)) return -1;
+    n = store_get_text(c->t->s, id, (char *)0, 0);
     if (n <= 0) { *t = w->txt; return n; }
     if (!(*t = vs_txt_(w, n))) return -2;
     return store_get_text(c->t->s, id, *t, n) == n ? n : -1;   /* replaced in between: -1, ask again */
@@ -94,17 +111,41 @@ static i32 vs_get_text_(VsWorker *w, VsConn *c, i64 id, char **t)
 /* hybrid search into w->ids / w->sc: the vector when hv, the words t[0, tn) when tn > 0 */
 static i32 vs_hybrid_(VsWorker *w, VsConn *c, i32 hv, const char *t, i32 tn, i32 k)
 {
-    return store_search_hybrid(c->t->s, hv ? w->vec : (const f32 *)0, t, tn, k, w->ids, w->sc);
+    i32 n, i, m;
+    if (!c->tn) return store_search_hybrid(c->t->s, hv ? w->vec : (const f32 *)0, t, tn, k, w->ids, w->sc);
+    n = store_search_hybrid(c->t->s, hv ? w->vec : (const f32 *)0, t, tn, k * 4 > VS_MAXK ? VS_MAXK : k * 4, w->ids, w->sc);
+    for (i = m = 0; i < n && m < k; ++i)                         /* a tenant: its own rows of 4 k, the rest dropped */
+        if ((w->ids[i] >> VS_TSHIFT) == c->tn) { w->ids[m] = w->ids[i] & VS_TMASK; w->sc[m] = w->sc[i]; ++m; }
+    return m;
+}
+
+/* the stored vector of id, the value of its number, the ids in [lo, hi] - a tenant's own */
+static i32 vs_getvec_(VsConn *c, i64 id, f32 *out) { return vs_in_(c, &id) ? -1 : store_get_vec(c->t->s, id, out); }
+static i32 vs_getnum_(VsConn *c, i64 id, i64 *v) { return vs_in_(c, &id) ? -1 : store_get_num(c->t->s, id, v); }
+static i32 vs_range_(VsConn *c, i64 lo, i64 hi, i64 *ids, i32 max)
+{
+    i32 n;
+    if (vs_rin_(c, &lo, &hi)) return 0;
+    n = store_range(c->t->s, lo, hi, ids, max);
+    if (n > 0) vs_out_(c, ids, n);
+    return n;
 }
 
 /* grouped search (one hit an id >> shift group, shift 1-63) or, with rng, the rows whose number is in [lo, hi], of
  * the vector in w->vec, into w->ids / w->sc scored as vs_search_ */
 static i32 vs_search_by_(VsWorker *w, VsConn *c, i32 k, i32 shift, i32 rng, i64 lo, i64 hi)
 {
-    i32 n = rng ? store_search_num(c->t->s, w->vec, k, lo, hi, w->ids, w->sc)
-                : store_search_grouped(c->t->s, w->vec, k, shift, w->ids, w->sc), i;
+    StoreCnf cn;
+    i32 n, i;
+    memset(&cn, 0, sizeof(cn));
+    if (rng) { cn.num = 1; cn.lo = lo; cn.hi = hi; }
+    if (c->tn) { cn.ns_on = 1; cn.ns = c->tn; }                   /* a tenant: its namespace */
+    if (rng && lo > hi) n = 0;
+    else if (shift > 0) n = store_search_grouped(c->t->s, w->vec, k, shift, rng || c->tn ? &cn : (const StoreCnf *)0, w->ids, w->sc);
+    else n = rng || c->tn ? store_search_cnf(c->t->s, w->vec, k, w->ids, w->sc, &cn) : store_search(c->t->s, w->vec, k, w->ids, w->sc);
     if (n < 0) n = 0;
     for (i = 0; i < n; ++i) w->sc[i] = store_score_out(c->t->s, w->sc[i]);
+    vs_out_(c, w->ids, n);
     return n;
 }
 
@@ -112,6 +153,7 @@ static i32 vs_search_by_(VsWorker *w, VsConn *c, i32 k, i32 shift, i32 rng, i64 
 static i32 vs_update_(VsConn *c, const f32 *v, i64 id)
 {
     i32 r;
+    if (vs_in_(c, &id)) return -2;
     if (c->wb) return store_batch_update(c->wb, v, id);
     r = store_update(c->t->s, v, id);
     if (vs_logging_()) vs_log_(c, r != 0, "update id=%ld %s", (long)id, r == 0 ? "ok" : "refused (no such id, NaN or Inf)");
@@ -122,6 +164,7 @@ static i32 vs_update_(VsConn *c, const f32 *v, i64 id)
 static i32 vs_setnum_(VsConn *c, i64 id, i64 num)
 {
     i32 r;
+    if (vs_in_(c, &id)) return -2;
     if (c->wb) return store_batch_set_num(c->wb, id, num);
     r = store_set_num(c->t->s, id, num);
     if (vs_logging_()) vs_log_(c, r != 0, "num id=%ld num=%ld %s", (long)id, (long)num, r == 0 ? "ok" : "refused (no such id)");
@@ -153,7 +196,10 @@ static i32 vs_setnum_(VsConn *c, i64 id, i64 num)
  *   op 17 update           payload: i64 id, dim x f32   a new vector, the row's tag, number and text kept (status 1:
  *                          no row)
  *   op 18 set a number     payload: i64 id, i64 number  (status 1: no row)
- *   op 19 get a number     payload: i64 id              reply: i64 number (status 1: no row) */
+ *   op 19 get a number     payload: i64 id              reply: i64 number (status 1: no row)
+ *   op 20 auth             payload: an API key (-K); status 1 with the reason when refused. Until a TCP connection to
+ *                          a server with keys shows one, every other op answers status 6. A keyed connection gets
+ *                          status 1 for build, save and snapshot (the server's housekeeping) */
 
 /* a reply whose payload sits elsewhere (a text): the header, then the payload as it is */
 static void vs_bin_reply_at_(VsWorker *w, VsConn *c, u8 status, u16 count, const char *payload, u32 nbytes)
@@ -200,6 +246,14 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
     if (nb > (u32)vs_reqmax - 8) { vs_log_(c, 1, "binary frame of %lu bytes refused", (unsigned long)nb); return -1; }
     if ((u32)c->len < 8 + nb) return 0;
     b += 8;
+    if (op == 20) {                                              /* an API key: the payload is the key */
+        const char *why = vs_auth_(c, (const char *)b, (i32)nb);
+        if (why) vs_bin_reply_(w, c, 1, 0, why, (u32)strlen(why));
+        else vs_bin_reply_(w, c, 0, 0, (const char *)0, 0);
+        return (i32)(8 + nb);
+    }
+    if (vs_need_key_(c)) { vs_bin_reply_(w, c, 6, 0, (const char *)0, 0); return (i32)(8 + nb); }   /* no key shown yet */
+    if (!vs_admin_(c) && (op == 4 || op == 5 || op == 7)) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); return (i32)(8 + nb); }
     if (op == 14) {                                              /* use a tenant: the payload is its name */
         const char *why = nb <= VS_TNAME ? vs_use_(c, (const char *)b, (i32)nb) : "a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -";
         if (why) vs_bin_reply_(w, c, 1, 0, why, (u32)strlen(why));
@@ -241,7 +295,7 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
     case 7: { i32 r = vs_snapshot_(c); vs_bin_reply_(w, c, (u8)(r == 0 ? 0 : (r == 1 ? 4 : 1)), 0, (const char *)0, 0); } break;
     case 8:
         if (nb != 8) { vs_bin_reply_(w, c, 2, 0, (const char *)0, 0); break; }
-        if (store_get_vec(c->t->s, vs_le64_(b), w->vec) != 0) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); break; }
+        if (vs_getvec_(c, vs_le64_(b), w->vec) != 0) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); break; }
         {   char *o = w->out + 8;
             for (i = 0; i < vs_dim; ++i) vs_put32_(o + 4 * i, vs_fbits_(w->vec[i]));
             vs_bin_reply_(w, c, 0, 0, o, (u32)vs_dim * 4u); }
@@ -269,7 +323,7 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
         if (nb != 16) { vs_bin_reply_(w, c, 2, 0, (const char *)0, 0); break; }
         if (k < 1) k = 100;
         if (k > VS_MAXK) k = VS_MAXK;
-        got = store_range(c->t->s, vs_le64_(b), vs_le64_(b + 8), w->ids, k);
+        got = vs_range_(c, vs_le64_(b), vs_le64_(b + 8), w->ids, k);
         if (got < 0) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); break; }
         {   char *o = w->out + 8;
             for (i = 0; i < got; ++i) vs_put64_(o + 8 * i, w->ids[i]);
@@ -314,7 +368,7 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
         if (nb != 8) { vs_bin_reply_(w, c, 2, 0, (const char *)0, 0); break; }
         {   i64 v = 0;
             char p[8];
-            if (store_get_num(c->t->s, vs_le64_(b), &v) != 0) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); break; }
+            if (vs_getnum_(c, vs_le64_(b), &v) != 0) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); break; }
             vs_put64_(p, v);
             vs_bin_reply_(w, c, 0, 0, p, 8); }
         break;
@@ -427,7 +481,15 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
 #define VS_CMD(word) (!strncmp(b, word, sizeof(word) - 1) && (b[sizeof(word) - 1] == 0 || b[sizeof(word) - 1] == ' ' || b[sizeof(word) - 1] == '\t'))
     a = b;
     while (*a && *a != ' ' && *a != '\t') ++a;                   /* a: just past the command */
-    if (VS_CMD("use")) {                                         /* a tenant server: the store later lines go to */
+    if (VS_CMD("auth")) {                                        /* an API key: the tenant this connection may reach */
+        const char *e, *why;
+        while (*a == ' ' || *a == '\t') ++a;
+        for (e = a; *e && *e != ' ' && *e != '\t'; ++e) {}
+        why = e == a || *vs_word_(e) ? "usage: auth KEY" : vs_auth_(c, a, (i32)(e - a));
+        if (why) VS_LINE_ERR(why);
+        else vs_line_reply_(w, c, o, vs_str_(o, "ok"));
+    } else if (vs_need_key_(c) && !VS_CMD("ping") && !VS_CMD("help") && !VS_CMD("quit")) VS_LINE_ERR("auth KEY first");
+    else if (VS_CMD("use")) {                                    /* a tenant server: the store later lines go to */
         const char *e, *f, *why;
         while (*a == ' ' || *a == '\t') ++a;
         for (e = a; *e && *e != ' ' && *e != '\t'; ++e) {}
@@ -453,7 +515,7 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
         else vs_line_reply_(w, c, o, vs_str_(o, c->wb ? "ok queued" : "ok"));
     } else if (VS_CMD("get")) {
         if (!(a = vs_wint_(a, &x)) || *vs_word_(a)) VS_LINE_ERR("usage: get ID");
-        else if (store_get_vec(c->t->s, x, w->vec) != 0) VS_LINE_ERR("no such id");
+        else if (vs_getvec_(c, x, w->vec) != 0) VS_LINE_ERR("no such id");
         else {
             p = vs_str_(o, "ok");
             for (i = 0; i < vs_dim; ++i) { *p++ = ' '; p = vs_f32_(p, w->vec[i]); }
@@ -467,6 +529,11 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
             else if (c->wb) { vs_del_(c, x, y); vs_line_reply_(w, c, o, vs_str_(o, "ok queued")); }
             else { p = vs_str_(o, "ok "); p = vs_i64_(p, vs_del_(c, x, y)); vs_line_reply_(w, c, o, p); }
         }
+    } else if (VS_CMD("stats") && c->key) {                       /* a tenant: its own rows, nothing of the server's */
+        i64 v[4];
+        vs_stats_(c, v);
+        p = vs_str_(o, "ok count="); p = vs_i64_(p, v[0]); p = vs_str_(p, " dim="); p = vs_i64_(p, v[1]);
+        vs_line_reply_(w, c, o, p);
     } else if (VS_CMD("stats")) {
         i64 v[4], us;
         i32 run, last;
@@ -490,7 +557,9 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
             store_lens_info(c->t->s, &ld, &lt);
             if (lt) { p = vs_str_(p, " lens="); p = vs_i64_(p, ld); *p++ = '/'; p = vs_i64_(p, lt); } }
         vs_line_reply_(w, c, o, p);
-    } else if (VS_CMD("build")) { vs_build_(c); vs_line_reply_(w, c, o, vs_str_(o, "ok")); }
+    } else if (!vs_admin_(c) && (VS_CMD("build") || VS_CMD("save") || VS_CMD("snapshot") || VS_CMD("scrub")))
+        VS_LINE_ERR("the server's housekeeping is not for a key");
+    else if (VS_CMD("build")) { vs_build_(c); vs_line_reply_(w, c, o, vs_str_(o, "ok")); }
     else if (VS_CMD("save")) { if (vs_save_(c) == 0) vs_line_reply_(w, c, o, vs_str_(o, "ok")); else VS_LINE_ERR("save failed"); }
     else if (VS_CMD("snapshot")) {
         i32 r = vs_snapshot_(c);
@@ -537,7 +606,7 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
         i64 mx = 100;
         if (!(a = vs_wint_(a, &x)) || !(a = vs_wint_(a, &y)) || y < x || (*vs_word_(a) && (!(a = vs_wint_(a, &mx)) || *vs_word_(a) || mx < 1)))
             VS_LINE_ERR("usage: range LO HI [MAX]");
-        else if ((got = store_range(c->t->s, x, y, w->ids, (i32)(mx > VS_MAXK ? VS_MAXK : mx))) < 0) VS_LINE_ERR("out of memory");
+        else if ((got = vs_range_(c, x, y, w->ids, (i32)(mx > VS_MAXK ? VS_MAXK : mx))) < 0) VS_LINE_ERR("out of memory");
         else {
             p = vs_str_(o, "ok "); p = vs_i64_(p, got);
             for (i = 0; i < got; ++i) { *p++ = ' '; p = vs_i64_(p, w->ids[i]); }
@@ -571,7 +640,7 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
     } else if (VS_CMD("num")) {
         if (!(a = vs_wint_(a, &x))) VS_LINE_ERR("usage: num ID [N]");
         else if (!*vs_word_(a)) {
-            if (store_get_num(c->t->s, x, &y) != 0) VS_LINE_ERR("no such id");
+            if (vs_getnum_(c, x, &y) != 0) VS_LINE_ERR("no such id");
             else { p = vs_str_(o, "ok "); p = vs_i64_(p, y); vs_line_reply_(w, c, o, p); }
         } else if (!(a = vs_wint_(a, &y)) || *vs_word_(a)) VS_LINE_ERR("usage: num ID [N]");
         else if (vs_setnum_(c, x, y) != 0) VS_LINE_ERR(c->wb ? "out of memory, or the batch is over 1 GB" : "no such id");
@@ -581,7 +650,7 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
         else if (vs_update_(c, w->vec, x) != 0) VS_LINE_ERR(c->wb ? "vector has NaN or Inf: the batch will be refused, abort it" : "no such id, or the vector has NaN or Inf");
         else vs_line_reply_(w, c, o, vs_str_(o, c->wb ? "ok queued" : "ok"));
     } else if (VS_CMD("ping")) vs_line_reply_(w, c, o, vs_str_(o, "ok pong"));
-    else if (VS_CMD("help")) vs_line_reply_(w, c, o, vs_str_(o, "ok ping use stats search add addt get text range hybrid words group between num update del begin commit abort build save snapshot help quit"));
+    else if (VS_CMD("help")) vs_line_reply_(w, c, o, vs_str_(o, "ok ping auth use stats search add addt get text range hybrid words group between num update del begin commit abort build save snapshot help quit"));
     else if (VS_CMD("quit")) { vs_line_reply_(w, c, o, vs_str_(o, "ok bye")); c->closing = 1; }
     else { VS_LINE_ERR("unknown command (help lists them)"); vs_log_(c, 1, "unknown line command"); }
 #undef VS_CMD
@@ -700,7 +769,8 @@ static void vs_http_reply_(VsWorker *w, VsConn *c, const char *status, const cha
 static i32 vs_http_(VsWorker *w, VsConn *c)
 {
     const char *b = c->buf, *line, *t, *body;
-    i32 he = vs_head_end_(b, c->len), i, mlen, tn, clen = 0, keep = 1, raw = 0, got, k, qbad = 0;
+    i32 he = vs_head_end_(b, c->len), i, mlen, tn, clen = 0, keep = 1, raw = 0, got, k, qbad = 0, kn = 0;
+    const char *kp = (const char *)0;
     char *o;
     if (he < 0) {
         if (c->len >= vs_reqcap) { VS_HTTP_LIT(w, c, "431 Request Header Fields Too Large", "{\"error\":\"headers too large\"}", 0); return -1; }
@@ -726,6 +796,13 @@ static i32 vs_http_(VsWorker *w, VsConn *c)
             const char *v = line + 13;
             while (*v == ' ') ++v;
             if (b + he - v > 24 && vs_ieq_(v, "application/octet-stream", 24)) raw = 1;
+        } else if (b + he - line > 14 && vs_ieq_(line, "authorization:", 14)) {
+            const char *v = line + 14;
+            while (*v == ' ') ++v;
+            if (b + he - v > 7 && vs_ieq_(v, "bearer ", 7)) {
+                for (kp = v + 7; *kp == ' '; ++kp) {}
+                for (kn = 0; kp + kn < b + he && kp[kn] != '\r' && kp[kn] != '\n' && kp[kn] != ' '; ++kn) {}
+            }
         } else if (b + he - line > 11 && vs_ieq_(line, "connection:", 11)) {
             const char *v = line + 11;
             while (*v == ' ') ++v;
@@ -745,7 +822,20 @@ static i32 vs_http_(VsWorker *w, VsConn *c)
 #define VS_IS(m, path) (mlen == (i32)strlen(m) && !memcmp(b, m, (size_t)mlen) && tn >= (i32)strlen(path) \
                         && !memcmp(t, path, strlen(path)) && (tn == (i32)strlen(path) || t[strlen(path)] == '?'))
 #define VS_BADQ() VS_HTTP_LIT(w, c, "400 Bad Request", "{\"error\":\"a query parameter is not a 64-bit integer\"}", keep)
-    if (vs_dir && !VS_IS("GET", "/health")) {                    /* a tenant server: /t/NAME/search?k=10 and so on */
+    if (vs_nkeys && (kn > 0 || c->tcp) && !VS_IS("GET", "/health")) {   /* keys: every request shows one */
+        const char *why = kn > 0 ? vs_auth_(c, kp, kn) : "need an Authorization: Bearer KEY header";
+        if (why) {
+            char *p = vs_str_(o, "{\"error\":\""); p = vs_str_(p, why); p = vs_str_(p, "\"}");
+            vs_http_reply_(w, c, "401 Unauthorized", o, (i32)(p - o), keep);
+            return he + clen;
+        }
+    }
+    if (c->key && (VS_IS("POST", "/build") || VS_IS("POST", "/save") || VS_IS("POST", "/snapshot"))) {
+        VS_HTTP_LIT(w, c, "403 Forbidden", "{\"error\":\"the server's housekeeping is not for a key\"}", keep);
+        return he + clen;
+    }
+    if (vs_dir && c->key && !(tn > 3 && !memcmp(t, "/t/", 3))) {}   /* a key's tenant: chosen already, /t/NAME/ optional */
+    else if (vs_dir && !VS_IS("GET", "/health")) {               /* a tenant server: /t/NAME/search?k=10 and so on */
         const char *why = "no tenant: the path starts /t/NAME/";
         i32 e = 3;
         if (tn > 3 && !memcmp(t, "/t/", 3)) {
@@ -761,6 +851,11 @@ static i32 vs_http_(VsWorker *w, VsConn *c)
     }
     if (VS_IS("GET", "/health")) {
         VS_HTTP_LIT(w, c, "200 OK", "{\"ok\":true}", keep);
+    } else if (VS_IS("GET", "/stats") && c->key) {               /* a tenant: its own rows, nothing of the server's */
+        i64 v[4]; char *p = o;
+        vs_stats_(c, v);
+        p = vs_str_(p, "{\"count\":"); p = vs_i64_(p, v[0]); p = vs_str_(p, ",\"dim\":"); p = vs_i64_(p, v[1]); *p++ = '}';
+        vs_http_reply_(w, c, "200 OK", o, (i32)(p - o), keep);
     } else if (VS_IS("GET", "/stats")) {
         i64 v[4], us, hot, cold; i32 run, last; char *p = o;
         vs_stats_(c, v);
@@ -828,7 +923,7 @@ static i32 vs_http_(VsWorker *w, VsConn *c)
     } else if (VS_IS("GET", "/range")) {
         char *p = o;
         i64 mx = vs_qparam_(t, tn, "max", 100, &qbad), lo = vs_qparam_(t, tn, "lo", 0, &qbad), hi = vs_qparam_(t, tn, "hi", -1, &qbad);
-        got = qbad ? 0 : store_range(c->t->s, lo, hi, w->ids, (i32)(mx < 1 ? 1 : (mx > VS_MAXK ? VS_MAXK : mx)));
+        got = qbad ? 0 : vs_range_(c, lo, hi, w->ids, (i32)(mx < 1 ? 1 : (mx > VS_MAXK ? VS_MAXK : mx)));
         if (qbad) VS_BADQ();
         else if (got < 0) VS_HTTP_LIT(w, c, "500 Internal Server Error", "{\"error\":\"out of memory\"}", keep);
         else {
@@ -860,7 +955,7 @@ static i32 vs_http_(VsWorker *w, VsConn *c)
         char *p = o;
         i64 id = vs_qparam_(t, tn, "id", -1, &qbad);
         if (qbad) VS_BADQ();
-        else if (store_get_vec(c->t->s, id, w->vec) != 0)
+        else if (vs_getvec_(c, id, w->vec) != 0)
             VS_HTTP_LIT(w, c, "404 Not Found", "{\"error\":\"no such id\"}", keep);
         else {
             p = vs_str_(p, "{\"vector\":[");
@@ -887,7 +982,7 @@ static i32 vs_http_(VsWorker *w, VsConn *c)
         else if (b[0] == 'P') {
             if (vs_setnum_(c, id, nv) == 0) VS_HTTP_LIT(w, c, "200 OK", "{\"ok\":true}", keep);
             else VS_HTTP_LIT(w, c, "404 Not Found", "{\"error\":\"no such id\"}", keep);
-        } else if (store_get_num(c->t->s, id, &v) != 0) VS_HTTP_LIT(w, c, "404 Not Found", "{\"error\":\"no such id\"}", keep);
+        } else if (vs_getnum_(c, id, &v) != 0) VS_HTTP_LIT(w, c, "404 Not Found", "{\"error\":\"no such id\"}", keep);
         else { p = vs_str_(p, "{\"num\":"); p = vs_i64_(p, v); *p++ = '}'; vs_http_reply_(w, c, "200 OK", o, (i32)(p - o), keep); }
     } else if (VS_IS("POST", "/delete")) {
         char *p = o;

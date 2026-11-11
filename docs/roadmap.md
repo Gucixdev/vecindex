@@ -33,7 +33,8 @@ tag, number and text kept, through the journal, a batch and a save), `vi_search_
 in one search), all of them in vserv too (line `group`, `between`, `num`, `update`; binary ops 15-19; HTTP), a cold index (codes past half of RAM stay on the disk at load, a search
 pages in its probed clusters: 0.7 ms against 0.4 ms warm on 2M rows, `bench/cold.c`), the lens (a file past half of RAM opens without reading every block:
 the small parts at once, texts when read, everything before a save, the rest walked one block at a time), namespaces (tenants in one store: small ones searched over their own rows, big
-ones through the scan with the namespace inside it; `vi_add_ns`, `vi_search_ns`, `vi_delete_ns`), a CRC-32C a text checked on every read (rebuilt from the parity, or not served).
+ones through the scan with the namespace inside it; `vi_add_ns`, `vi_search_ns`, `vi_delete_ns`), a CRC-32C a text checked on every read (rebuilt from the parity, or not served), API keys in vserv (`-K`: a key per tenant, a namespace and ids of its own in one
+store, or its file in a tenant directory; housekeeping stays with the server).
 
 Open:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a

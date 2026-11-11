@@ -2,7 +2,7 @@
  * (third_party/bearssl, MIT, no malloc inside). Nothing else.
  *
  *   vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-g AGGRESSION] [-m TIER] [-C] [-d DIM] [-x] [-L] [-r RECALL]
- *         [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT.pem -k KEY.pem [-a CA.pem] [-P] [-T]] [-U]
+ *         [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT.pem -k KEY.pem [-a CA.pem] [-P] [-T]] [-U] [-K KEYS]
  *         STORE.vxi | DIR
  *     STORE.vxi one store; DIR: a store per tenant, DIR/NAME.vxi, opened on a client's first "use NAME" (created
  *               there when it does not exist yet; -d gives every tenant's dimension and is required) and kept open
@@ -42,6 +42,10 @@
  *               (or is one of them), else the handshake fails; its name goes into the log
  *     -U        with DIR and -a: a client certificate's name is the one tenant it may use - the CA, not the server,
  *               decides who sees which tenant (clients without a certificate, on the Unix socket, may use any)
+ *     -K FILE   API keys, a line each: KEY TENANT (vserv_keys.c). A TCP client shows its key first (auth KEY, binary
+ *               op 20, or Authorization: Bearer KEY on every HTTP request) and reaches only its tenant: with one
+ *               store, a namespace of it with ids of its own (TENANT a number, 1 to 524287); with DIR, the tenant's
+ *               file (TENANT its name). Keys cannot build, save, snapshot or scrub; the Unix socket needs none
  *
  * The store is opened with store_load (mmap: ready in milliseconds whatever its size). Every socket speaks three
  * protocols, told apart by the first byte of a request (vserv_proto.c has the details):
@@ -130,7 +134,11 @@ typedef struct VsConn {
     char peer[112];                             /* who is on the other end (vserv_log.c) */
     struct VsTen *t;                            /* the store its requests go to; NULL: a tenant server, none chosen */
     StoreWb *wb;                                /* a batch it began: its writes wait here until commit (or abort) */
+    const struct VsKey *key;                    /* the API key it showed (vserv_keys.c); NULL: none */
+    i64 tn;                                     /* one store with keys: its tenant (a namespace, ids tn << 44 | id); 0: all */
 } VsConn;
+struct VsKey { char key[129]; i32 klen; i64 tn; char name[65]; };   /* an API key (vserv_keys.c) */
+
 
 typedef struct { i32 fd, tcp; } VsListen;       /* epoll data for a listening socket */
 
@@ -331,6 +339,10 @@ static const char *vs_use_(VsConn *c, const char *name, i32 n)
         return "a batch is open: commit or abort it first";
     if (n < 1 || n > VS_TNAME) return "a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -";
     for (i = 0; i < n; ++i) if (!vs_tname_ok_(name[i])) return "a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -";
+    if (c->key && (strlen(c->key->name) != (size_t)n || memcmp(c->key->name, name, (size_t)n) != 0)) {
+        vs_log_(c, 1, "use %.*s refused: the key is for another tenant", (int)n, name);
+        return "your key is for another tenant";
+    }
 #ifdef VSERV_TLS
     if (vs_ten_cn && c->tls && c->tls->cn.status > 0
         && (strlen(c->tls->cnbuf) != (size_t)n || memcmp(c->tls->cnbuf, name, (size_t)n) != 0)) {
@@ -525,16 +537,19 @@ static void vs_flush_(VsWorker *w, VsConn *c)
 /* the k nearest rows; their scores as the store's metric gives them: the cosine, the inner product, the L2 distance */
 static i32 vs_search_(VsWorker *w, VsConn *c, const f32 *q, i32 k)
 {
-    i32 n = store_search(c->t->s, q, k, w->ids, w->sc), i;
-    for (i = 0; i < n; ++i) w->sc[i] = store_score_out(c->t->s, w->sc[i]);
+    i32 n = c->tn ? store_search_ns(c->t->s, c->tn, q, k, w->ids, w->sc) : store_search(c->t->s, q, k, w->ids, w->sc), i;
+    for (i = 0; i < n; ++i) { w->sc[i] = store_score_out(c->t->s, w->sc[i]); if (c->tn) w->ids[i] &= ((i64)1 << 44) - 1; }
     return n;
 }
 
+/* rows, dimension, rows not indexed yet, built - a tenant (keys, one store) sees its own rows, and none of the rest */
 static void vs_stats_(VsConn *c, i64 *v)
 {
-    v[0] = store_count(c->t->s); v[1] = vs_dim; v[2] = store_pending(c->t->s); v[3] = store_built(c->t->s);
+    v[0] = c->tn ? store_count_ns(c->t->s, c->tn) : store_count(c->t->s); v[1] = vs_dim;
+    v[2] = c->key ? 0 : store_pending(c->t->s); v[3] = c->key ? 1 : store_built(c->t->s);
 }
 
+#include "vserv_keys.c"
 #include "vserv_proto.c"
 
 /* ---- connection lifecycle ---- */
@@ -895,7 +910,7 @@ static void vs_housekeep_(f64 sync_s, f64 snap_s)
 int main(int argc, char **argv)
 {
     const char *sock = (const char *)0, *bind_addr = "127.0.0.1", *cert = (const char *)0, *key = (const char *)0, *ca = (const char *)0;
-    const char *logdest = (const char *)0, *path = (const char *)0;
+    const char *logdest = (const char *)0, *path = (const char *)0, *keys = (const char *)0;
     i32 port = 0, nth = 0, dim = 0, save_on_exit = 0, created = 0, memrc = 0, i, j;
     i64 hot = 0, cold = 0;
     f32 aggr = -1.0f;
@@ -925,6 +940,7 @@ int main(int argc, char **argv)
             else { fprintf(stderr, "vserv: -M is cosine, dot or l2, not %s\n", m); return 2; }
         }
         else if (!strcmp(argv[i], "-U")) vs_ten_cn = 1;
+        else if (!strcmp(argv[i], "-K") && i + 1 < argc) keys = argv[++i];
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) vs_recall = (f32)atof(argv[++i]);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) cert = argv[++i];
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) key = argv[++i];
@@ -938,7 +954,7 @@ int main(int argc, char **argv)
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else {
             fprintf(stderr, "usage: vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-g A] [-m TIER] [-C] [-d DIM] [-x] [-L] [-r RECALL]\n"
-                            "             [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT -k KEY [-a CA] [-P] [-T]] [-U]\n"
+                            "             [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT -k KEY [-a CA] [-P] [-T]] [-U] [-K KEYS]\n"
                             "             STORE.vxi | DIR\n");
             return 2;
         }
@@ -956,6 +972,7 @@ int main(int argc, char **argv)
         vs_dim = dim;
     }
     if (vs_ten_cn && !vs_dir) { fprintf(stderr, "vserv: -U binds clients to tenants: give a directory\n"); return 2; }
+    if (keys && vs_keys_load_(keys) != 0) return 2;              /* after vs_dir: a key names a tenant or a number */
     if ((cert || key || ca || vs_unix_tls_only) && !(cert && key)) { fprintf(stderr, "vserv: TLS needs both -c CERT and -k KEY\n"); return 2; }
 #ifdef VSERV_TLS
     if (cert) {

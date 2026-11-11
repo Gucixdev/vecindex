@@ -78,3 +78,5 @@
 "&group="
 "&lo="
 "&hi="
+"auth "
+"Authorization: Bearer "

@@ -63,6 +63,23 @@ group 3 20 1 0 0 0                                 ok 1 7340032 1.000000
 update 7340032 0.9 0.1 0 0                         ok
 ```
 
+**Many users, one server** (`-K keys.tsv`): a line of the file is `KEY TENANT`. A client on the TCP port shows its
+key first - `auth KEY` (lines), op 20 (binary), `Authorization: Bearer KEY` on every HTTP request - and from then on
+reaches only its tenant. With one store a tenant is a number (1 to 524287): its rows go into a namespace of the store
+with ids of its own (0 to 2^44 - 1), so two tenants may both have an id 1, and no search, get, delete or range of one
+ever touches the other's rows. With a tenant directory a tenant is a name, and its key opens only its file. A key
+cannot build, save, snapshot or scrub - that stays with whoever runs the server - and its `stats` show only its own
+row count. The Unix socket needs no key: who may connect to it is the socket file's mode.
+
+```
+# keys.tsv
+k_9f2c41d07e3a4b55a1f0   7
+k_1b7e0c9da2f84c3e8d61   8
+
+vserv -K keys.tsv -c cert.pem -k key.pem -p 8443 data.vxi
+curl -H 'Authorization: Bearer k_9f2c41d07e3a4b55a1f0' -d '[0.1, 0.2, ...]' https://host:8443/search?k=10
+```
+
 **Binary** (`0xB5` first): little-endian frames, nothing to parse - `u8 0xB5, u8 op, u16 k, u32 nbytes, payload`.
 Ops: 1 search, 2 add, 3 delete, 4 build, 5 save, 6 stats, 7 snapshot, 8 get, 9 delete a range of ids, 10 add with a
 text, 11 get a text, 12 the ids in a range, 13 hybrid search, 14 use a tenant, 15 grouped search (`u32 shift`, then

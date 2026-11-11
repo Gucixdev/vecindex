@@ -17,11 +17,17 @@ static char *vs_txt_(VsWorker *w, i32 need)
 }
 
 /* upsert with a text (every protocol's add with a text) */
+static i32 vs_put_ns_(VsConn *c, const f32 *v, i64 id, const char *t, i32 n);
+static i32 vs_in_(const VsConn *c, i64 *id);
 static i32 vs_put_text_(VsConn *c, const f32 *v, i64 id, const char *t, i32 n)
 {
     i32 r;
-    if (c->wb) return store_batch_put_text(c->wb, v, id, 0, t, n);   /* waits in the open batch */
-    r = store_put_text(c->t->s, v, id, 0, t, n);
+    if (vs_in_(c, &id)) return -2;                               /* a tenant's id: 0 to 2^44 - 1 */
+    if (c->wb) {                                                 /* waits in the open batch, its namespace with it */
+        r = store_batch_put_text(c->wb, v, id, 0, t, n);
+        return r || !c->tn ? r : store_batch_set_ns(c->wb, id, c->tn);
+    }
+    r = c->tn ? vs_put_ns_(c, v, id, t, n) : store_put_text(c->t->s, v, id, 0, t, n);
     if (vs_logging_()) vs_log_(c, r != 0, "add id=%ld text=%d %s", (long)id, n, r == 0 ? "ok" : "refused (NaN, Inf or too long)");
     return r;
 }

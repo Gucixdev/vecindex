@@ -624,7 +624,7 @@ VI_API int vi_search_grouped(vi_db *db, const float *query, int k, int shift, vi
     if (vi_search_ok_(db, query, k, ids, scores)) return -1;
     if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
     if (shift < 0 || shift > 63) return vi_fail_(-1, "shift must be 0 to 63", (const char *)0, (const char *)0);
-    if ((n = store_search_grouped(db->s, query, (i32)k, (i32)shift, (i64 *)ids, scores)) < 0)
+    if ((n = store_search_grouped(db->s, query, (i32)k, (i32)shift, (const StoreCnf *)0, (i64 *)ids, scores)) < 0)
         return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
     vi_cos_(db, scores, n);
     return n;

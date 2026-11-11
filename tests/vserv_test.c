@@ -492,6 +492,91 @@ int main(int argc, char **argv)
         check(log_has("update id=") && log_has("num id="), "log: the updates and numbers");
     }
 
+    /* API keys (-K): two tenants in one store, each its own ids - both have an id 1 - and none of the other's rows in
+     * any protocol; housekeeping refused to a key; the Unix socket sees everything; the journal keeps it all */
+    {   char kpath[160], kstore[160], hreq[1024], body[256];
+        const char *k7 = "k_seven_0123456789ab", *k9 = "k_nine_0123456789abcd";
+        const char *old = serve_path;
+        int f7, f9, fa, ok, q, m;
+        FILE *kf;
+        sprintf(kpath, "%s/keys.tsv", dir); sprintf(kstore, "%s/keys.vxi", dir);
+        kf = fopen(kpath, "w");
+        if (kf) { fprintf(kf, "# key tenant\n%s\t7\n%s   9\n", k7, k9); fclose(kf); }
+        serve_path = kstore;
+        p = start("-K", kpath, NULL);
+        f7 = connect_tcp(); f9 = connect_tcp(); fa = connect_unix();
+        vline(line, "search 3", 0, 1); line[strlen(line) - 1] = 0; memmove(line + 9, line + 11, strlen(line + 11) + 1); strcat(line, "\n");
+        check(ask(f7, line, r, sizeof(r)) > 0 && !strcmp(r, "err auth KEY first"), "-K: a TCP search before auth -> err auth KEY first");
+        check(ask(f7, "ping\n", r, sizeof(r)) > 0 && !strcmp(r, "ok pong"), "-K: ping needs no key");
+        check(ask(f7, "auth k_wrong_aaaaaaaaaaaa\n", r, sizeof(r)) > 0 && !strcmp(r, "err unknown key"), "auth with an unknown key -> err");
+        sprintf(line, "auth %s\n", k7);
+        check(ask(f7, line, r, sizeof(r)) > 0 && !strcmp(r, "ok"), "auth with tenant 7's key -> ok");
+        sprintf(line, "auth %s\n", k9); ask(f9, line, r, sizeof(r));
+        for (i = 0, ok = 1; i < 20; ++i) {
+            vline(line, "add", 1 + i, 3000 + i); ok &= ask(f7, line, r, sizeof(r)) > 0 && !strcmp(r, "ok");
+            vline(line, "add", i ? 100 + i : 1, 4000 + i); ok &= ask(f9, line, r, sizeof(r)) > 0 && !strcmp(r, "ok");
+        }
+        check(ok && count_of(f7) == 20 && count_of(f9) == 20, "two tenants add 20 rows each, both an id 1: each counts its own 20");
+        check(count_of(fa) == 40, "the Unix socket, no key: all 40 rows");
+        {   char a7[512], a9[512];
+            ask(f7, "get 1\n", a7, sizeof(a7)); ask(f9, "get 1\n", a9, sizeof(a9));
+            check(!strncmp(a7, "ok ", 3) && !strncmp(a9, "ok ", 3) && strcmp(a7, a9) != 0, "get 1: each tenant its own row 1");
+        }
+        check(ask(f7, "get 105\n", r, sizeof(r)) > 0 && !strcmp(r, "err no such id"), "tenant 7 cannot get tenant 9's row 105");
+        for (q = 0, ok = 1; q < 20; ++q) {                       /* searches with tenant 9's own vectors: tenant 7 never sees them */
+            char *z;
+            vline(line, "search 10", 0, 4000 + q); line[strlen(line) - 1] = 0; memmove(line + 10, line + 12, strlen(line + 12) + 1); strcat(line, "\n");
+            ask(f7, line, r, sizeof(r));
+            if (strncmp(r, "ok 10 ", 6)) ok = 0;
+            for (z = r + 6, m = 0; m < 10; ++m) { long id = strtol(z, &z, 10); strtod(z, &z); if (id < 1 || id > 20) ok = 0; }
+        }
+        check(ok, "tenant 7 searches with tenant 9's vectors: only its own ids 1-20 come back");
+        check(ask(f7, "del 100 119\n", r, sizeof(r)) > 0 && !strcmp(r, "ok 0") && count_of(f9) == 20, "tenant 7 deleting 100-119: none of tenant 9's go");
+        check(ask(f7, "build\n", r, sizeof(r)) > 0 && !strncmp(r, "err the server's housekeeping", 29), "build with a key -> refused");
+        vline(line, "add", 17592186044416L, 1);
+        check(ask(f7, line, r, sizeof(r)) > 0 && !strncmp(r, "err", 3), "an id of 2^44 from a tenant -> err");
+        check(ask(f7, "stats\n", r, sizeof(r)) > 0 && !strcmp(r, "ok count=20 dim=8"), "stats with a key: its own count and the dimension, nothing else");
+        {   unsigned char pay[64];
+            int fb = connect_tcp();
+            float v[DIM];
+            memset(v, 0, sizeof(v)); v[0] = 1.0f;
+            memcpy(pay, v, sizeof(v));
+            check(bin_call(fb, 1, pay, sizeof(v), &st, &rnb, rb) == 0 && st == 6, "binary search before a key (op 1) -> status 6");
+            check(bin_call(fb, 20, k9, (unsigned)strlen(k9), &st, &rnb, rb) == 0 && st == 0, "binary auth (op 20) -> status 0");
+            {   int c2 = bin_call(fb, 1, pay, sizeof(v), &st, &rnb, rb), z; long long id;
+                ok = c2 == 0 && st == 0 && rnb == 10 * 12;
+                for (z = 0; ok && z < 10; ++z) { memcpy(&id, rb + 12 * z, 8); if (!(id == 1 || (id >= 101 && id <= 119))) ok = 0; }
+                check(ok, "binary search with tenant 9's key: only tenant 9's ids"); }
+            check(bin_call(fb, 4, NULL, 0, &st, &rnb, rb) == 0 && st == 1, "binary build with a key -> status 1");
+            close(fb);
+        }
+        sprintf(body, "[1,0,0,0,0,0,0,0]");
+        sprintf(hreq, "POST /search?k=5 HTTP/1.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", (int)strlen(body), body);
+        check(http(hreq, r, sizeof(r)) > 0 && strstr(r, "401 Unauthorized"), "HTTP without a key -> 401");
+        sprintf(hreq, "POST /search?k=5 HTTP/1.1\r\nAuthorization: Bearer %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", k7, (int)strlen(body), body);
+        {   char *ids;
+            ok = http(hreq, r, sizeof(r)) > 0 && (ids = strstr(r, "{\"ids\":[")) != NULL;
+            if (ok) { char *z = ids + 8; for (m = 0; m < 5; ++m) { long id = strtol(z, &z, 10); if (id < 1 || id > 20) ok = 0; if (*z == ',') ++z; } }
+            check(ok, "HTTP with tenant 7's key: only its ids");
+        }
+        sprintf(hreq, "GET /stats HTTP/1.1\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n", k9);
+        check(http(hreq, r, sizeof(r)) > 0 && strstr(r, "{\"count\":20,\"dim\":8}"), "HTTP /stats with a key: its own count");
+        sprintf(hreq, "POST /save HTTP/1.1\r\nAuthorization: Bearer %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", k9);
+        check(http(hreq, r, sizeof(r)) > 0 && strstr(r, "403 Forbidden"), "HTTP /save with a key -> 403");
+        check(http("GET /health HTTP/1.1\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0 && strstr(r, "200 OK"), "HTTP /health needs no key");
+        close(f7); close(f9); close(fa);
+        msleep(1500);                                             /* -f 1: on the disk within a second */
+        stop(p, SIGKILL);                                         /* the journal: rows, ids and namespaces */
+        p = start("-K", kpath, NULL);
+        f7 = connect_tcp();
+        sprintf(line, "auth %s\n", k7); ask(f7, line, r, sizeof(r));
+        check(count_of(f7) == 20 && ask(f7, "get 1\n", r, sizeof(r)) > 0 && !strncmp(r, "ok ", 3), "kill -9, restart: tenant 7's 20 rows and its row 1");
+        close(f7);
+        stop(p, SIGTERM);
+        check(log_has("auth tenant=") && log_has("auth refused: an unknown key"), "log: the keys shown, and the one refused");
+        serve_path = old;
+    }
+
     /* a tenant server: a directory, a store per tenant; the line protocol, HTTP and binary choose one; the log names it */
     {
         char tdir[160], tf[200];
@@ -539,6 +624,24 @@ int main(int argc, char **argv)
         stop(p, SIGTERM);
         check(log_has("tenant created name=acme"), "log: a tenant created");
         check(log_has("tenant=acme add id=1 ok"), "log: a connection's lines name its tenant");
+        {   /* keys on a tenant directory: a key names its tenant's file, and no other */
+            char kp2[200];
+            FILE *kf = (FILE *)0;
+            int fk;
+            sprintf(kp2, "%s/dkeys.tsv", dir);
+            if ((kf = fopen(kp2, "w")) != (FILE *)0) { fprintf(kf, "k_acme_0123456789abcdef acme\n"); fclose(kf); }
+            p = start("-K", kp2, NULL);
+            fk = connect_tcp();
+            check(ask(fk, "use acme\n", r, sizeof(r)) > 0 && !strcmp(r, "err auth KEY first"), "-K on a directory: use before auth -> err");
+            check(ask(fk, "auth k_acme_0123456789abcdef\n", r, sizeof(r)) > 0 && !strcmp(r, "ok") && count_of(fk) == 1, "auth with acme's key: acme's store");
+            check(ask(fk, "use beta\n", r, sizeof(r)) > 0 && !strcmp(r, "err your key is for another tenant"), "the acme key at use beta -> err");
+            check(http("GET /stats HTTP/1.1\r\nAuthorization: Bearer k_acme_0123456789abcdef\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0
+                  && strstr(r, "\"count\":1"), "HTTP with acme's key, no /t/NAME/: acme");
+            check(http("GET /t/beta/stats HTTP/1.1\r\nAuthorization: Bearer k_acme_0123456789abcdef\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0
+                  && strstr(r, "403"), "HTTP with acme's key at /t/beta/ -> 403");
+            close(fk);
+            stop(p, SIGTERM);
+        }
         serve_path = store_path;
     }
 
