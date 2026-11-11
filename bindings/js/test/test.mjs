@@ -8,8 +8,9 @@ import { open, version, Library, MemoryFiles, NodeFiles } from '../index.mjs';
 const DIM = 8;
 const MAGIC = 0x34584956;                                  // "VIX4", STORE_MAGIC of src/store.c
 const vec = i => Array.from({ length: DIM }, (_, d) => Math.sin(i * 1.3 + d * 0.7) + (d === i % DIM ? 0.5 : 0));
-let n = 0;
-const t = async (name, f) => { await f(); n++; console.log('  ok   ' + name); };
+let n = 0, skipped = 0;
+// a test that returns 'skip' did not run: it is counted apart, never as passed
+const t = async (name, f) => { if ((await f()) === 'skip') { skipped++; console.log('  skip ' + name); } else { n++; console.log('  ok   ' + name); } };
 
 const dir = fs.mkdtempSync(join(tmpdir(), 'vecindex_js_'));
 try {
@@ -45,6 +46,70 @@ try {
     assert.ok([9, 10].includes(b.readInt32LE(4)));
     assert.strictEqual(b.readInt32LE(8), DIM);
     assert.strictEqual(b.readInt32LE(12), 200);
+  });
+
+  await t('scores: each the cosine of its row with the query, best first', async () => {
+    const db = await open(null, { dim: DIM });
+    for (let i = 1; i <= 100; i++) db.add(i, vec(i));
+    const q = vec(1000), hits = db.search(q, 10);
+    const cos = (a, b) => { let ab = 0, aa = 0, bb = 0; for (let d = 0; d < DIM; d++) { ab += a[d] * b[d]; aa += a[d] * a[d]; bb += b[d] * b[d]; } return ab / Math.sqrt(aa * bb); };
+    assert.strictEqual(hits.length, 10);
+    for (let j = 0; j < hits.length; j++) {
+      assert.ok(Math.abs(hits[j][1] - cos(q, vec(hits[j][0]))) < 1e-4, `hit ${j}: ${hits[j][1]} vs ${cos(q, vec(hits[j][0]))}`);
+      if (j) assert.ok(hits[j][1] <= hits[j - 1][1]);
+    }
+    db.close();
+  });
+
+  await t('a store opened three times, written each time: the journal appended to, not overwritten', async () => {
+    for (let round = 0; round < 3; round++) {
+      const db = await open('three.vxi', { dim: DIM, dir });
+      assert.strictEqual(db.length, round * 10);
+      for (let i = 0; i < 10; i++) db.add(round * 10 + i, vec(round * 10 + i), `r${round}`);
+      db.sync();
+      db.close();
+    }
+    const db = await open('three.vxi', { dir });
+    assert.strictEqual(db.length, 30);
+    assert.strictEqual(db.text(25), 'r2');
+    db.close();
+  });
+
+  await t('the file layer: create, truncate on open, append, read at an offset, rename, unlink, list', async () => {
+    for (const files of [new MemoryFiles(), new NodeFiles(fs, fs.mkdtempSync(join(dir, 'fl-')))]) {
+      const kind = files.constructor.name;
+      let r = files.open('a', true, false, false);
+      files.write(r.h, new Uint8Array([1, 2, 3, 4, 5]), 0);
+      files.close(r.h);
+      r = files.open('a', true, false, true);                        // O_TRUNC
+      assert.strictEqual(files.size(r.h), 0, kind + ' truncate');
+      files.write(r.h, new Uint8Array([9, 8]), 0);
+      files.write(r.h, new Uint8Array([7]), files.size(r.h));
+      const b = new Uint8Array(2);
+      assert.strictEqual(files.read(r.h, b, 1), 2, kind + ' pread');
+      assert.deepStrictEqual(Array.from(b), [8, 7], kind + ' pread');
+      files.close(r.h);
+      assert.strictEqual(files.open('a', true, true, false).err, 20, kind + ' O_EXCL on an existing file');
+      assert.strictEqual(files.open('nope', false, false, false).err, 44, kind + ' ENOENT');
+      assert.strictEqual(files.rename('a', 'b'), 0);
+      assert.strictEqual(files.stat('a'), null);
+      assert.strictEqual(files.stat('b').size, 3, kind + ' rename');
+      assert.deepStrictEqual(files.list('').map(e => e.name), ['b'], kind + ' list');
+      assert.strictEqual(files.unlink('b'), 0);
+      assert.strictEqual(files.stat('b'), null, kind + ' unlink');
+    }
+    // and through the WASI calls the C library makes: a file opened for appending writes at its end
+    const files = new MemoryFiles(), lib = await Library.load({ files });
+    const db = lib.open('ap.vxi', { dim: DIM });
+    for (let i = 0; i < 5; i++) db.add(i, vec(i));
+    db.save(); db.close();
+    const j0 = files.exportFile('ap.vxi.j').length;
+    const db2 = lib.open('ap.vxi');
+    db2.add(99, vec(99)); db2.sync(); db2.close();
+    const j1 = files.exportFile('ap.vxi.j');
+    assert.ok(j1.length > j0, 'the journal grew');
+    assert.strictEqual(j1[0], 0x56, 'its header kept (VXJ3)');
+    assert.strictEqual(lib.open('ap.vxi').length, 6);
   });
 
   await t('errors: a wrong length, a NaN, a file that is not a store', async () => {
@@ -84,15 +149,34 @@ try {
     db.close();
   });
 
-  await t('one hit a document (ids doc << 20 | chunk); ids past 2^53 as BigInt', async () => {
+  await t('one hit a document (ids doc << 20 | chunk), where a plain search gives one document\'s chunks; ids past 2^53', async () => {
     const db = await open(null, { dim: DIM });
-    for (let doc = 1; doc <= 5; doc++) for (let c = 0; c < 4; c++) db.add(doc * 2 ** 20 + c, vec(doc * 10 + c));
+    for (let doc = 1; doc <= 5; doc++) for (let c = 0; c < 4; c++) db.add(doc * 2 ** 20 + c, vec(doc * 10).map((x, d) => x + (d === c ? 0.001 : 0)));
+    const plain = db.search(vec(30), 3).map(([i]) => Math.floor(i / 2 ** 20));
+    assert.deepStrictEqual(plain, [3, 3, 3]);                   // the three nearest are chunks of one document
     const docs = db.search(vec(30), 3, { group: 20 }).map(([i]) => Math.floor(i / 2 ** 20));
     assert.strictEqual(docs[0], 3);
-    assert.strictEqual(new Set(docs).size, docs.length);
+    assert.strictEqual(new Set(docs).size, 3);
     db.add(2n ** 60n + 5n, vec(500));
     assert.strictEqual(db.search(vec(500), 1)[0][0], 2n ** 60n + 5n);
     db.close();
+  });
+
+  await t('metrics: dot scores are the inner product, L2 scores the distance; an unknown metric refused', async () => {
+    const dot = (a, b) => a.reduce((s, x, d) => s + x * b[d], 0);
+    const dist = (a, b) => Math.sqrt(a.reduce((s, x, d) => s + (x - b[d]) ** 2, 0));
+    const big = i => vec(i).map(x => x * (1 + i % 7));             // lengths that differ: cosine would rank otherwise
+    for (const [metric, f, better] of [['dot', dot, (a, b) => a >= b], ['l2', dist, (a, b) => a <= b]]) {
+      const db = await open(null, { dim: DIM, metric });
+      for (let i = 1; i <= 50; i++) db.add(i, big(i));
+      const q = big(1001), h = db.search(q, 5);
+      h.forEach(([i, s], j) => {
+        assert.ok(Math.abs(s - f(q, big(i))) < 1e-3 * Math.max(1, Math.abs(s)), `${metric} ${i}: ${s} vs ${f(q, big(i))}`);
+        if (j) assert.ok(better(h[j - 1][1], s), metric + ' best first');
+      });
+      db.close();
+    }
+    await assert.rejects(open(null, { dim: DIM, metric: 'manhattan' }), /metric/);
   });
 
   await t('memory files: a store exported as bytes and imported into another instance (a browser\'s IndexedDB)', async () => {
@@ -115,7 +199,7 @@ try {
 
   await t('a store written by the WebAssembly build opens in the native one (same file format)', async () => {
     const native = process.env.VECINDEX_NATIVE_PROBE;     // ./run sets it: a C program that prints count and a text
-    if (!native) { console.log('       (no VECINDEX_NATIVE_PROBE: skipped)'); return; }
+    if (!native) return 'skip';                              // no native build to read it with
     const { execFileSync } = await import('node:child_process');
     const out = execFileSync(native, [join(dir, 't.vxi')]).toString().trim();
     assert.strictEqual(out, '200 chunk 20');
@@ -123,7 +207,7 @@ try {
 
   await t('stores the native builds wrote (tests/compat: 0.3.0 and 0.4.0) open here with their rows and texts', async () => {
     const compat = new URL('../../../tests/compat/', import.meta.url);
-    if (!fs.existsSync(compat)) { console.log('       (not inside the repository: skipped)'); return; }
+    if (!fs.existsSync(compat)) return 'skip';             // not inside the repository
     const { gunzipSync } = await import('node:zlib');
     for (const name of ['v9-0.3.0-cos', 'v10-0.4.0-cos', 'v9-0.3.0-l2i8']) {
       const files = new MemoryFiles();
@@ -138,7 +222,7 @@ try {
   });
 
   const rt = globalThis.Deno ? 'deno ' + Deno.version.deno : process.versions.bun ? 'bun ' + process.versions.bun : 'node ' + process.versions.node;
-  console.log(`js: OK (${n} tests, ${rt})`);
+  console.log(`js: OK (${n} tests${skipped ? ', ' + skipped + ' skipped' : ''}, ${rt})`);
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }

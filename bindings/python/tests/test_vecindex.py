@@ -37,11 +37,14 @@ class Store(unittest.TestCase):
             self.assertEqual(hits[0][0], 42)
             self.assertGreater(hits[0][1], 0.99)
             self.assertEqual(db.text(15), "chunk 15 about cats")
+            long_text = "".join("word%d " % j for j in range(3000))        # 25 kB: past the first read's buffer
+            db.add(500, vec(500), text=long_text)
+            self.assertEqual(db.text(500), long_text)
             self.assertIsNone(db.text(16))
             db.sync()
         with vecindex.open(self.path) as db:                     # dim 0: the file says
             self.assertEqual(db.dim, DIM)
-            self.assertEqual(len(db), 200)
+            self.assertEqual(len(db), 201)
             self.assertEqual(db.search(vec(7), k=1)[0][0], 7)
             self.assertEqual(db.text(20), "chunk 20 about ships")
             got = db.get(9)
@@ -58,14 +61,21 @@ class Store(unittest.TestCase):
             db.add(12, array.array("f", vec(12)))
             self.assertEqual(len(db), 13)
             self.assertEqual(db.search(array.array("f", vec(11)), k=1)[0][0], 11)
-            try:
-                import numpy as np
-            except ImportError:
-                np = None
-            if np is not None:
-                db.add(13, np.asarray(vec(13), dtype=np.float32))
-                db.add(14, np.asarray(vec(14), dtype=np.float64))
-                self.assertEqual(db.search(np.asarray(vec(14), dtype=np.float32), k=1)[0][0], 14)
+
+    def test_numpy(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("no numpy")                            # reported as a skip, never as a pass
+        with vecindex.open(None, dim=DIM) as db:
+            db.add(13, np.asarray(vec(13), dtype=np.float32))
+            db.add(14, np.asarray(vec(14), dtype=np.float64))
+            db.add_many([15, 16], np.asarray([vec(15), vec(16)], dtype=np.float32))
+            self.assertEqual(db.search(np.asarray(vec(14), dtype=np.float32), k=1)[0][0], 14)
+            self.assertEqual(db.search(np.asarray(vec(16), dtype=np.float32), k=1)[0][0], 16)
+            wide = np.asarray([vec(17), vec(18)], dtype=np.float32).T.copy().T   # a strided view: every other float
+            db.add(17, wide[0])
+            self.assertEqual(db.search(vec(17), k=1)[0][0], 17)
 
     def test_errors(self):
         with vecindex.open(None, dim=DIM) as db:
@@ -119,12 +129,71 @@ class Store(unittest.TestCase):
     def test_grouped(self):
         with vecindex.open(None, dim=DIM) as db:
             for doc in range(1, 6):
-                for chunk in range(4):
-                    db.add(doc << 20 | chunk, vec(doc * 10 + chunk))
-            hits = db.search(vec(30), k=3, group=20)
-            docs = [i >> 20 for i, _ in hits]
-            self.assertEqual(len(set(docs)), len(docs))
+                for chunk in range(4):                           # a document's chunks all but the same vector
+                    db.add(doc << 20 | chunk, [x + (0.001 if d == chunk else 0) for d, x in enumerate(vec(doc * 10))])
+            self.assertEqual([i >> 20 for i, _ in db.search(vec(30), k=3)], [3, 3, 3])
+            docs = [i >> 20 for i, _ in db.search(vec(30), k=3, group=20)]
             self.assertEqual(docs[0], 3)
+            self.assertEqual(len(set(docs)), 3)
+
+    def test_scores(self):
+        def cos(a, b):
+            return sum(x * y for x, y in zip(a, b)) / math.sqrt(sum(x * x for x in a) * sum(y * y for y in b))
+        with vecindex.open(None, dim=DIM) as db:
+            for i in range(1, 101):
+                db.add(i, vec(i))
+            q = vec(1000)
+            hits = db.search(q, k=10)
+            self.assertEqual(len(hits), 10)
+            for j, (i, s) in enumerate(hits):
+                self.assertAlmostEqual(s, cos(q, vec(i)), places=4)
+                if j:
+                    self.assertLessEqual(s, hits[j - 1][1])
+
+    def test_metrics(self):
+        def big(i):
+            return [x * (1 + i % 7) for x in vec(i)]
+        dot = lambda a, b: sum(x * y for x, y in zip(a, b))
+        dist = lambda a, b: math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+        for metric, f, sign in (("dot", dot, -1), ("l2", dist, 1)):
+            with vecindex.open(None, dim=DIM, metric=metric) as db:
+                for i in range(1, 51):
+                    db.add(i, big(i))
+                q = big(1001)
+                hits = db.search(q, k=5)
+                for j, (i, s) in enumerate(hits):
+                    self.assertAlmostEqual(s, f(q, big(i)), delta=1e-3 * max(1.0, abs(s)))
+                    if j:
+                        self.assertGreaterEqual(sign * s, sign * hits[j - 1][1])
+        with self.assertRaises(ValueError):
+            vecindex.open(None, dim=DIM, metric="manhattan")
+
+    def test_manual(self):
+        # The only outside sign of manual=True: the store starts no indexing thread of its own (search results are the
+        # same either way, unbuilt rows are found by an exact scan). Threads are counted in /proc, so Linux only.
+        if not os.path.isdir("/proc/self/task"):
+            self.skipTest("no /proc/self/task")
+        threads = lambda: len(os.listdir("/proc/self/task"))
+        before = threads()
+        with vecindex.open(None, dim=DIM, manual=True) as db:
+            self.assertEqual(threads(), before)
+            for i in range(50):
+                db.add(i, vec(i))
+            db.build()
+            self.assertEqual(db.search(vec(7), k=1)[0][0], 7)
+        with vecindex.open(None, dim=DIM) as db:
+            self.assertEqual(threads(), before + 1)
+
+    def test_three_opens(self):
+        for r in range(3):                                       # the journal appended to on every open
+            with vecindex.open(self.path, dim=DIM) as db:
+                self.assertEqual(len(db), r * 10)
+                for i in range(10):
+                    db.add(r * 10 + i, vec(r * 10 + i), text="r%d" % r)
+                db.sync()
+        with vecindex.open(self.path) as db:
+            self.assertEqual(len(db), 30)
+            self.assertEqual(db.text(25), "r2")
 
 
 if __name__ == "__main__":

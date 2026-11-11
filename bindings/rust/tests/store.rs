@@ -94,15 +94,20 @@ fn grouped_and_threads() {
     let db = std::sync::Arc::new(Db::memory(DIM).unwrap());
     for doc in 1..=5i64 {
         for chunk in 0..4 {
-            db.add(doc << 20 | chunk, &vec(doc * 10 + chunk)).unwrap();
+            let mut v = vec(doc * 10);
+            v[chunk as usize] += 0.001;                          // a document's chunks all but the same vector
+            db.add(doc << 20 | chunk, &v).unwrap();
         }
     }
+    let plain: Vec<i64> = db.search(&vec(30), 3).unwrap().iter().map(|h| h.0 >> 20).collect();
+    assert_eq!(plain, vec![3, 3, 3]);
     let hits = db.search_where(Some(&vec(30)), 3, Some(Filter::Group(20))).unwrap();
     let docs: Vec<i64> = hits.iter().map(|h| h.0 >> 20).collect();
     assert_eq!(docs[0], 3);
     let mut seen = docs.clone();
+    seen.sort_unstable();
     seen.dedup();
-    assert_eq!(seen.len(), docs.len());
+    assert_eq!(seen.len(), 3);
     let ts: Vec<_> = (0..4)
         .map(|t| {
             let db = db.clone();
@@ -125,4 +130,74 @@ fn version_and_key() {
     assert_eq!(vecindex::version(), env!("CARGO_PKG_VERSION"));
     assert_eq!(key("acme"), key("acme"));
     assert_ne!(key("acme"), key("acmf"));
+}
+
+#[test]
+fn scores_and_metrics() {
+    let cos = |a: &[f32], b: &[f32]| {
+        let (ab, aa, bb) = a.iter().zip(b).fold((0.0f64, 0.0f64, 0.0f64), |s, (x, y)| (s.0 + (*x as f64) * (*y as f64), s.1 + (*x as f64).powi(2), s.2 + (*y as f64).powi(2)));
+        ab / (aa * bb).sqrt()
+    };
+    let db = Db::memory(DIM).unwrap();
+    for i in 1..=100 {
+        db.add(i, &vec(i)).unwrap();
+    }
+    let q = vec(1000);
+    let h = db.search(&q, 10).unwrap();
+    assert_eq!(h.len(), 10);
+    for (j, (i, s)) in h.iter().enumerate() {
+        assert!(((*s as f64) - cos(&q, &vec(*i))).abs() < 1e-4, "hit {}: {} vs {}", j, s, cos(&q, &vec(*i)));
+        if j > 0 {
+            assert!(*s <= h[j - 1].1);
+        }
+    }
+    let big = |i: i64| -> Vec<f32> { vec(i).iter().map(|x| x * (1 + i % 7) as f32).collect() };
+    let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum::<f64>();
+    let dist = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| ((*x - *y) as f64).powi(2)).sum::<f64>().sqrt();
+    for (metric, f, sign) in [(vecindex::Metric::Dot, &dot as &dyn Fn(&[f32], &[f32]) -> f64, -1.0f64), (vecindex::Metric::L2, &dist, 1.0)] {
+        let db = Db::open_with(None, DIM, metric).unwrap();
+        for i in 1..=50 {
+            db.add(i, &big(i)).unwrap();
+        }
+        let q = big(1001);
+        let h = db.search(&q, 5).unwrap();
+        for (j, (i, s)) in h.iter().enumerate() {
+            let want = f(&q, &big(*i));
+            assert!(((*s as f64) - want).abs() < 1e-3 * want.abs().max(1.0), "{:?} {}: {} vs {}", metric, i, s, want);
+            if j > 0 {
+                assert!(sign * (*s as f64) >= sign * (h[j - 1].1 as f64));
+            }
+        }
+    }
+}
+
+#[test]
+fn three_opens() {
+    let d = tmp("three");
+    let p = d.join("t.vxi");
+    for r in 0..3i64 {
+        let db = Db::open(&p, DIM).unwrap();
+        assert_eq!(db.len(), (r * 10) as usize);
+        for i in 0..10 {
+            db.add_text(r * 10 + i, &vec(r * 10 + i), format!("r{}", r)).unwrap();
+        }
+        db.sync().unwrap();
+    }
+    let db = Db::open(&p, 0).unwrap();
+    assert_eq!(db.len(), 30);
+    assert_eq!(db.text(25).as_deref(), Some("r2"));
+    drop(db);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn long_text_and_bad_batch() {
+    let db = Db::memory(DIM).unwrap();
+    let long: String = (0..10_000).map(|i| (b'a' + (i % 26) as u8) as char).collect();   // past the first 4 kB read
+    db.add_text(1, &vec(1), long.clone()).unwrap();
+    assert_eq!(db.text(1).as_deref(), Some(long.as_str()));
+    let ids = [2i64, 3];
+    let short = vec(2);                                                                    // 2 ids, 1 vector
+    assert!(db.add_many(&ids, &short).is_err());
+    assert_eq!(db.len(), 1);
 }
