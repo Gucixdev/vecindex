@@ -36,7 +36,7 @@ ones through the scan with the namespace inside it; `vi_add_ns`, `vi_search_ns`,
 store, or its file in a tenant directory; housekeeping stays with the server), limits a key (rows, requests a second), `/metrics` (JSON)
 and `/prometheus` (the Prometheus text format) for the operator, a replica on a second machine (`vserv -F`: the file and
 its journal, never ahead of the primary's last fsync, a new file fetched and checked block by block after a snapshot,
-failover by starting `vserv` on it).
+failover by starting `vserv` on it), encryption at rest left to LUKS, ZFS or fscrypt (docs/server.md).
 
 Open:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a

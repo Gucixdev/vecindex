@@ -181,6 +181,28 @@ vserv -F /run/vx/primary.sock /srv/vx/
 
 A tenant server's replica opens every tenant on the primary (`use NAME`), which keeps them open there afterwards.
 
+## Encryption at rest: the operating system's
+
+The server writes plain files and leaves encryption to the layer below, which does it at disk speed with AES-NI and
+already solves the hard part, the keys (a passphrase at boot, a TPM, a network key server). Its own encryption would
+gain nothing: the store is memory-mapped, so its pages sit in the page cache in the clear while it runs whatever the
+file holds. Pick one:
+
+- **The whole volume, LUKS.** `cryptsetup luksFormat /dev/nvme0n1p3`, `cryptsetup open /dev/nvme0n1p3 vx`,
+  `mkfs.ext4 /dev/mapper/vx`, mount it where the stores live. Unattended boot: `systemd-cryptenroll --tpm2-device=auto`
+  (the key in the TPM) or clevis with a tang server (the key only on your network). Covers a stolen disk, a disk sent
+  back under warranty, a disk thrown away.
+- **A dataset, ZFS native encryption.** `zfs create -o encryption=aes-256-gcm -o keyformat=passphrase tank/vx`.
+  `zfs send --raw` replicates or backs it up still encrypted: the backup machine never sees the key.
+- **A directory, fscrypt** (ext4 with `-O encrypt`, or f2fs): the key of one directory, locked again by removing the
+  key. With a server per directory, deleting that directory's key makes its data unreadable everywhere, backups
+  included (crypto-shredding). Tenants in one directory share its key.
+
+What else holds the data and must be on the same encrypted layer: the snapshot's temporary file (`NAME.vxi.snap`, in
+the same directory), the replica's files and every backup copy (encrypted only if where they land is), swap (encrypt
+it, or keep the store in RAM with `-m`), and core dumps (`LimitCORE=0` in the unit). In transit there is TLS (`-c`/`-k`
+below) for clients and ssh for the replica.
+
 ## Memory: hot codes in RAM, cold rows on the disk
 
 A search scans the hot part of a store every time: the index's codes (1, 2 or 4 bits a dimension), its slot table and
