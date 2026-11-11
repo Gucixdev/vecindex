@@ -3,7 +3,8 @@
 Lean 4 proofs about the kernels of vecindex's C code, and a test that holds the C code to the proved model. The
 proofs cover the integrity of the store file (GF(2^8), the Cauchy Reed-Solomon parity and its rebuild, CRC-32C), the
 integer arithmetic of the fast-scan kernels, what the codes mean and what the table scans add up, the rotation and
-the top-k insertion. Every theorem rests on Lean's three standard axioms only. The C code is compared with the Lean
+the top-k insertion; and on the server's side, the isolation of tenants' ids, the key file's tenant number, the
+replica's journal after a crash and the request limit of an API key. Every theorem rests on Lean's three standard axioms only. The C code is compared with the Lean
 definitions on every input of the GF(2^8) and digit tables, on ranges and grids of the other finite kernels and on
 random inputs of the rest.
 
@@ -29,8 +30,9 @@ four links, and each is either proved or checked by a program:
    top-k insertion. The C side is built three times (`-march=native`, `haswell`, `x86-64`), so the AVX-512, AVX2
    and scalar kernels and both CRC paths (SSE4.2 and the table) meet the same oracle.
 4. **Does the test catch a wrong kernel?** `mutants` breaks the C code on purpose, one small change at a time in a
-   copy of `src/`, and checks that the step covering it fails. 14 of 15 mutants are caught; the 15th removes the row
-   swap of `gf_invert_`, which no input of the C code reaches (see Findings).
+   copy of `src/`, and checks that the step covering it fails. 23 of 25 mutants are caught; the two that survive change
+   code no input reaches: the row swap of `gf_invert_`, and the replica walk's cap on a frame's length, which only a
+   journal past 1 GB could exercise (see Findings).
 
 What stays trusted: Lean's kernel, the Lean compiler (it builds the oracle), gcc and the libc. The step from the model
 to the C code is tested, not proved: exhaustively for the tables, on ranges, grids and random cases for the rest. The
@@ -53,13 +55,13 @@ first build. Without it lake compiles the part of Mathlib these files need, with
 modules, which took about 30 minutes on the 2 vCPUs used here. `./run all` runs `lean4/run` too when `lake` is
 installed.
 
-On a 2-vCPU Xeon with AVX-512, 2026-11-06:
+On a 2-vCPU Xeon with AVX-512, 2026-11-11:
 
 ```
 =================== lean4 summary ===================
   STEP                   RESULT  WHAT IT CHECKED
-  lake build             ok      2737 jobs, proofs and oracle
-  axiom audit            ok      564 theorems (213 written in the sources)
+  lake build             ok      2743 jobs, proofs and oracle
+  axiom audit            ok      705 theorems (250 written in the sources)
   source scan            ok      no sorry, admit, native_decide, bv_decide or axiom
   gen/trustlean.c        ok      printed by TrustLean from the proved programs
   gf native              ok      260 lines: every table entry and product, the coefficients hashed
@@ -67,12 +69,15 @@ On a 2-vCPU Xeon with AVX-512, 2026-11-06:
   vd native              ok      3 lines: every even dpad to 4096, 1, 2 and 4 bits
   layout native          ok      1050 lines: a grid of sizes, block sizes, k, m
   chunks native          ok      1024 lines: every dpad from 1 to 1024
-  crc native             ok      302 random cases, seed 20261106
-  block native           ok      300 random cases, seed 20261106
-  topk native            ok      300 random cases, seed 20261106
+  crc native             ok      302 random cases, seed 20261111
+  block native           ok      300 random cases, seed 20261111
+  topk native            ok      300 random cases, seed 20261111
   props native           ok      9 checks
   ... the same nine steps for haswell and x86-64 ...
-  31 steps, all ok   (75 s)
+  tenant                 ok      2666 cases: edges of ids, ranges, tenants, numbers in the key file; and random, seed 20261111
+  journal                ok      300 cases: journals torn, flipped, past the cap, wrong stamp: random, seed 20261111
+  rate                   ok      300 cases: runs of 200 requests, f64 exact: random, seed 20261111
+  34 steps, all ok   (52 s)
 ```
 
 The nine checks in C alone (`c/diff.c props`): `tq_code_` counts the boundaries below the value (random values,
@@ -101,6 +106,9 @@ m + 1 is reported as damaged, not passed off as rebuilt.
 | q1-q5 packing, `q*_lut_resid`, `vs_lut_gather_dot`, `q*_reconstruct_into` | `Codes.lean` | `digit_pack`, `or_pack`, `pack_lt`: packing levels into a byte and reading them back gives the levels; `scan_eq_dot`: the table scan is the inner product of the residual with the dequantized vector |
 | `tq_wht_`, `tq_rot_`, the shuffle in `tq_build_skip` | `Hadamard.lean` | `pass_dot`, `wht_dot`, `whtN_dot`: each butterfly pass doubles a chunk's inner product, so the scaled transform keeps it; `chunks_cover`: the chunks are powers of two that lie inside `[0, dpad)` and add up to `dpad`; `signs_dot`, `perm_dot`, `shuffle_bijective`: the signs and the permutation keep inner products |
 | `q1_topk_insert_` (and q2-q5) | `TopK.lean` | `topk_correct`: after any sequence of candidates the array holds `min(k, n)` of them, sorted, and no candidate left out is better than one kept; `bubble_eq_ins`: ties keep their arrival order |
+| `vs_in_`, `vs_out_`, `vs_rin_`, `vs_own_`, the tenant number of `vs_keys_load_` (`vserv_keys.c`) | `Tenant.lean` | `out_in`: a wire id comes back as itself; `in_inj`: no two tenants share a store id; `in_fits`: tenant << 44 stays positive inside i64; `rin_exact`, `rin_none`: a tenant's range reaches exactly its own ids in the range; `own_iff`: the hybrid post-filter keeps exactly the tenant's rows; `parse_iff`: the key file takes a tenant number exactly when it is digits of a value 1 to 524287, `parse_bound`: no intermediate value past 5242879 |
+| `vs_rjtrim_` (`vserv_repl.c`), the frame of `store_jframe_` (`store_batch.c`) | `Journal.lean` | `walk_frames`: a journal of whole frames is kept whole; `walk_take`, `good_take`, `trim_take`: any prefix of the primary's journal (a replica killed mid-write) keeps exactly the frames that arrived whole - the primary's header and first k frames, never a piece of a record; `resume`: the rest from that offset gives the primary's journal back. For any checksum into u32 |
+| `vs_bucket_` (`vserv_keys.c`) | `Rate.lean` | `step_inv`: the tokens stay in [0, qps]; `window`: of any run of requests from t1 to t2 at most qps + qps (t2 - t1) get through, whatever came before; `wait_ok`: after 1/qps of quiet a request is let through |
 
 ## TrustLean and AMO-Lean
 
@@ -140,13 +148,24 @@ cryptography and has no counterpart in vecindex; it is not imported.
   test stands in for it.
 - **AMO-Lean declares 8 axioms**, all in its Radix-4 NTT. None of the modules used here depends on them; the axiom
   audit would fail if one did.
+- **A tenant's hybrid search can return fewer than k rows.** `vs_hybrid_` asks the whole store for 4 k hits and keeps
+  the tenant's own (`own_iff` proves that it keeps exactly those): with many other tenants' rows ranked higher, fewer
+  than k of 4 k are its own. Isolation holds; recall can suffer. The vector and range searches do not have this: they
+  search the tenant's namespace itself.
+- **The key file once read a long line as two.** A line past the reader's 511 bytes had its tail parsed as a line of
+  its own, so a long comment could carry a key. Found while modelling the parser; `vs_keys_load_` now refuses the file,
+  and `tests/vserv_test.c` fails on the old code.
+- **The cap of the replica's walk is unreachable in tests.** A frame length past `STORE_BATCH_MAX` (1 GB) is also past
+  the bytes of any test journal, so removing the check stops the walk at the same place (the mutant survives, listed).
 - **Both libraries use `native_decide` widely** (675 uses in TrustLean, 511 in AMO-Lean, outside comments). The lemmas
   used here do not depend on it (audit).
 
 ## Not covered
 
 Threads and locks, the journal replay and the file I/O around the parity, BLAKE3 (tested against the reference
-implementation's digests in `tests/store_test.c`), the k-means and HNSW routers, BM25, the server and its protocols,
+implementation's digests in `tests/store_test.c`), the k-means and HNSW routers, BM25, the server's protocols and TLS
+(only its id mapping, key file number, token bucket and the replica's journal walk are modelled), the primary's side
+of the replica (that the bytes served end on a whole record is the write lock's business, tested in `tests/vserv_test.c`),
 and the rounding of f32 arithmetic (bounded by tests, not proved). The proofs assume that a damaged block's BLAKE3
 digest differs from the stored one; a collision is outside the model.
 
@@ -157,7 +176,8 @@ digest differs from the stored one; a collision is outside the model.
 | `Vecindex/` | the model and the proofs, one file per kernel (`Vecindex.lean` imports them all) |
 | `Oracle.lean` | `vecindex-oracle`: the model on concrete inputs; prints `gen/trustlean.c` |
 | `Audit.lean` | the axiom audit |
-| `c/diff.c` | the C side of the differential test |
+| `c/diff.c` | the C side of the differential test (the store's kernels) |
+| `c/vsdiff.c` | the same for the server's kernels: it includes `vserv.c` with its main renamed |
 | `gen/trustlean.c` | the C that TrustLean prints from the proved programs (generated, committed for review) |
 | `run`, `mutants` | the test and the mutation test |
 | `lakefile.lean`, `lake-manifest.json`, `lean-toolchain` | Lean 4.26.0, Mathlib v4.26.0, TrustLean and AMO-Lean pinned |

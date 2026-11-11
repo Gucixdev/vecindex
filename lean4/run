@@ -5,7 +5,9 @@
 #                         -march=native, haswell and x86-64 (AVX-512, AVX2 and scalar kernels, both CRC paths), against
 #                         the Lean oracle on every input of the GF(2^8) and digit tables, on ranges and grids of the
 #                         column counts, file layouts and Walsh-Hadamard chunks, and on random inputs of the others,
-#                         and the properties checked in C alone (the rebuild of damaged store files among them)
+#                         and the properties checked in C alone (the rebuild of damaged store files among them);
+#                         then the server's kernels (c/vsdiff.c): tenant ids, the key file's tenant number, the
+#                         replica's journal walk and the token bucket against Tenant, Journal and Rate
 #   lean4/run quick       the same without rebuilding the proofs (a previous build must exist)
 #   N=2000 SEED=7 lean4/run   more random cases, another seed (defaults: 300, the date)
 # Needs elan with leanprover/lean4:v4.26.0 (lake), gcc and bash. Without the Mathlib cache the first build compiles
@@ -82,6 +84,22 @@ for arch in native haswell x86-64; do
         rec "props $arch" ok "$(grep -c '^ok' "$OUT/log_props_$arch.txt") checks"
     else grep -v '^ok' "$OUT/log_props_$arch.txt" | head; rec "props $arch" FAIL; fi
 done
+# 5. the server's kernels (vsdiff.c includes vserv.c): tenant ids and the key file's number, the replica's journal
+# walk, the token bucket - grids of the edges and random cases, against Tenant.lean, Journal.lean and Rate.lean
+echo "== server kernels"
+declare -A SWHAT=([tenant]="edges of ids, ranges, tenants, numbers in the key file; and" [journal]="journals torn, flipped, past the cap, wrong stamp:"
+                  [rate]="runs of 200 requests, f64 exact:")
+if gcc -std=c89 -pedantic -Wall -Wextra -Werror -O2 -DVSERV_NO_TLS -I../src c/vsdiff.c -lm -lpthread -o "$OUT/vsdiff" 2> "$OUT/log_cc_vsdiff.txt"; then
+    for t in tenant journal rate; do
+        "$OUT/vsdiff" "cases-$t" "$N" "$SEED" > "$OUT/out/$t.in"
+        "$ORACLE" "$t" < "$OUT/out/$t.in" > "$OUT/out/$t.lean"
+        "$OUT/vsdiff" "$t" < "$OUT/out/$t.in" > "$OUT/out/$t.c"
+        if [[ -s $OUT/out/$t.lean ]] && cmp -s "$OUT/out/$t.lean" "$OUT/out/$t.c"; then
+            rec "$t" ok "$(wc -l < "$OUT/out/$t.lean") cases: ${SWHAT[$t]} random, seed $SEED"
+        else diff "$OUT/out/$t.lean" "$OUT/out/$t.c" | head -5; rec "$t" FAIL; fi
+    done
+else head -20 "$OUT/log_cc_vsdiff.txt"; rec "build vsdiff" FAIL; fi
+
 if [[ -f $OUT/log_props_native.txt ]]; then echo "== properties (native build)"; sed 's/^/    /' "$OUT/log_props_native.txt"; fi
 
 echo

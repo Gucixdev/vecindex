@@ -11,6 +11,10 @@
     vecindex-oracle crc       stdin: messages as hex lines; out: their CRC-32C
     vecindex-oracle block     stdin: cases "vd, 16 vd code bytes, 16 vd table bytes"; out: the 32 row sums
     vecindex-oracle topk      stdin: cases "k n, then n (id score)"; out: the kept (id score) pairs
+    vecindex-oracle tenant    stdin: "in TN X", "out TN Y", "rin TN LO HI", "own TN Y", "parse HEX"; out: the results
+    vecindex-oracle journal   stdin: "journal STAMP HEX" (the stamp of the file beside it, the journal's bytes);
+                              out: the good part vs_rjtrim_ keeps
+    vecindex-oracle rate      stdin: "rate QPS T1 .. TN" (times in 1/1024 s); out: which requests get through
 -/
 import Vecindex
 
@@ -102,6 +106,60 @@ partial def topkOut (xs : List Int) : IO Unit := do
     topkOut (rest.drop (2 * n.toNat))
   | _ => pure ()
 
+
+def showOpt (o : Option Int) : String := match o with | some v => toString v | none => "none"
+
+def tenantOut (input : String) : IO Unit := do
+  for line in input.splitOn "\n" do
+    let w := (line.trim.splitToList Char.isWhitespace).filter (· ≠ "")
+    match w with
+    | ["in", a, b] => match a.toInt?, b.toInt? with
+      | some tn, some x => IO.println ("in " ++ a ++ " " ++ b ++ " " ++ showOpt (Tenant.inId tn x))
+      | _, _ => pure ()
+    | ["out", a, b] => match a.toInt?, b.toInt? with
+      | some tn, some y => IO.println ("out " ++ a ++ " " ++ b ++ " " ++ toString (Tenant.outId tn y))
+      | _, _ => pure ()
+    | ["own", a, b] => match a.toInt?, b.toInt? with
+      | some tn, some y => IO.println ("own " ++ a ++ " " ++ b ++ " " ++ showOpt (Tenant.own tn y))
+      | _, _ => pure ()
+    | ["rin", a, b, c] => match a.toInt?, b.toInt?, c.toInt? with
+      | some tn, some lo, some hi => IO.println ("rin " ++ a ++ " " ++ b ++ " " ++ c ++ " " ++
+          (match Tenant.rin tn lo hi with | some (x, y) => toString x ++ " " ++ toString y | none => "none"))
+      | _, _, _ => pure ()
+    | ["parse", h] => IO.println ("parse " ++ h ++ " " ++
+        (match Tenant.parse (parseHex h.toList) with | some n => toString n | none => "none"))
+    | _ => pure ()
+
+def le32At (b : List Nat) (i : Nat) : Nat :=
+  b.getD i 0 + 256 * b.getD (i + 1) 0 + 65536 * b.getD (i + 2) 0 + 16777216 * b.getD (i + 3) 0
+
+/-- The header check of `vs_rjtrim_`: magic VXJ3, its CRC-32C, the stamp of the file beside it. -/
+def jhead (fst : Nat) (h : List Nat) : Bool :=
+  le32At h 0 == 0x334a5856 && Crc.crc32c ((h.drop 4).take 12) == le32At h 16 && fst != 0 &&
+    le32At h 8 + 4294967296 * le32At h 12 == fst
+
+def journalOut (input : String) : IO Unit := do
+  for line in input.splitOn "\n" do
+    match (line.trim.splitToList Char.isWhitespace).filter (· ≠ "") with
+    | ["journal", st, hx] => match st.toNat? with
+      | some fst =>
+        let b := if hx == "-" then [] else parseHex hx.toList
+        IO.println ("journal " ++ toString (Journal.good Crc.crc32c (jhead fst) b))
+      | none => pure ()
+    | _ => pure ()
+
+def rateOut (input : String) : IO Unit := do
+  for line in input.splitOn "\n" do
+    match (line.trim.splitToList Char.isWhitespace).filter (· ≠ "") with
+    | "rate" :: q :: ts =>
+      match q.toNat? with
+      | some qn =>
+        let times : List ℚ := ts.filterMap fun t => t.toNat?.map fun k => (k : ℚ) / 1024
+        let d := Rate.decide' (qn : ℚ) ⟨(qn : ℚ), 0⟩ times
+        IO.println ("rate " ++ String.ofList (d.map fun x => if x then '1' else '0'))
+      | none => pure ()
+    | _ => pure ()
+
 def main (args : List String) : IO UInt32 := do
   match args with
   | ["gen"] => IO.print CodeGen.cFile; pure 0
@@ -113,4 +171,7 @@ def main (args : List String) : IO UInt32 := do
   | ["crc"] => crcOut (← (← IO.getStdin).readToEnd); pure 0
   | ["block"] => blockOut (numbers (← (← IO.getStdin).readToEnd)); pure 0
   | ["topk"] => topkOut (ints (← (← IO.getStdin).readToEnd)); pure 0
-  | _ => IO.eprintln "usage: vecindex-oracle gen|gf|digits|vd|layout|chunks|crc|block|topk"; pure 2
+  | ["tenant"] => tenantOut (← (← IO.getStdin).readToEnd); pure 0
+  | ["journal"] => journalOut (← (← IO.getStdin).readToEnd); pure 0
+  | ["rate"] => rateOut (← (← IO.getStdin).readToEnd); pure 0
+  | _ => IO.eprintln "usage: vecindex-oracle gen|gf|digits|vd|layout|chunks|crc|block|topk|tenant|journal|rate"; pure 2

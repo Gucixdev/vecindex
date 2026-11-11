@@ -119,7 +119,7 @@ static i32 vs_hybrid_(VsWorker *w, VsConn *c, i32 hv, const char *t, i32 tn, i32
     if (!c->tn) return store_search_hybrid(c->t->s, hv ? w->vec : (const f32 *)0, t, tn, k, w->ids, w->sc);
     n = store_search_hybrid(c->t->s, hv ? w->vec : (const f32 *)0, t, tn, k * 4 > VS_MAXK ? VS_MAXK : k * 4, w->ids, w->sc);
     for (i = m = 0; i < n && m < k; ++i)                         /* a tenant: its own rows of 4 k, the rest dropped */
-        if ((w->ids[i] >> VS_TSHIFT) == c->tn) { w->ids[m] = w->ids[i] & VS_TMASK; w->sc[m] = w->sc[i]; ++m; }
+        if (vs_own_(c, &w->ids[i])) { w->ids[m] = w->ids[i]; w->sc[m] = w->sc[i]; ++m; }
     return m;
 }
 

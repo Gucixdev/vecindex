@@ -209,6 +209,14 @@ static i32 vs_in_(const VsConn *c, i64 *id)
     return 0;
 }
 static void vs_out_(const VsConn *c, i64 *ids, i32 n) { i32 i; if (c->tn) for (i = 0; i < n; ++i) ids[i] &= VS_TMASK; }
+/* a store id found by a search over the whole store: 1 when it is the tenant's own (then *id is the wire id), 0 not.
+ * lean4/Vecindex/Tenant.lean: own_iff */
+static i32 vs_own_(const VsConn *c, i64 *id)
+{
+    if ((*id >> VS_TSHIFT) != c->tn) return 0;
+    *id &= VS_TMASK;
+    return 1;
+}
 /* a range of ids [lo, hi] as the tenant's: clipped to [0, 2^44) and moved up; -1 when nothing of it is left */
 static i32 vs_rin_(const VsConn *c, i64 *lo, i64 *hi)
 {

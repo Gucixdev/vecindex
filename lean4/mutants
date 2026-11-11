@@ -31,6 +31,15 @@ mutants=(
 "layout: one parity block too few@store_sum.c@s/z->P = z->G \* m;/z->P = z->G * m - (m > 0);/@native@layout@caught"
 "Walsh-Hadamard chunk: largest power not taken@tq.c@s/for (len = 1; len \* 2 <= dpad; len \*= 2) {}/for (len = 1; len * 4 <= dpad; len *= 2) {}/@x86-64@chunks@caught"
 "rebuild uses the wrong parity row@store_sum.c@s/gf_coef_(k, use\[q\], md\[p\])/gf_coef_(k, use[q] + 1, md[p])/@native@props@caught"
+"vs_in_ takes id 2^44 - 1 as outside@vserv_keys.c@s/if (\*id < 0 [|][|] \*id > VS_TMASK) return -1;/if (*id < 0 || *id >= VS_TMASK) return -1;/@native@tenant@caught"
+"vs_rin_ clips a negative low end to 1@vserv_keys.c@s/if (\*lo < 0) \*lo = 0;/if (*lo < 0) *lo = 1;/@native@tenant@caught"
+"vs_own_ drops the top bit of the wire id@vserv_keys.c@s/    \*id \&= VS_TMASK;/    *id \&= VS_TMASK >> 1;/@native@tenant@caught"
+"key file: tenant 524287 refused@vserv_keys.c@s/if (i < tl [|][|] n < 1 [|][|] n > VS_TMAXN) {/if (i < tl || n < 1 || n >= VS_TMAXN) {/@native@tenant@caught"
+"replica walk: a frame's CRC not checked@vserv_repl.c@s/if (store_crc32c_(g, n) != vs_le32_(fh + 5)) break;/if (0) break;/@native@journal@caught"
+"replica walk: the header's CRC not checked@vserv_repl.c@s/store_crc32c_(h + 4, 12) == vs_le32_(h + 16)/1/@native@journal@caught"
+"replica walk: a length past STORE_BATCH_MAX taken (only a journal past 1 GB holds such a frame whole; in the test files the bytes run out first, the same stop)@vserv_repl.c@s/if ((size_t)n > STORE_BATCH_MAX) break;/if (0) break;/@native@journal@survives"
+"bucket: never above qps + 1 instead of qps@vserv_keys.c@s/if (\*tokens > qps) \*tokens = qps;/if (*tokens > qps + 1.0) *tokens = qps + 1.0;/@native@rate@caught"
+"bucket: a request needs more than one token@vserv_keys.c@s/ok = \*tokens >= 1.0;/ok = *tokens > 1.0;/@native@rate@caught"
 )
 
 for row in "${mutants[@]}"; do
@@ -40,14 +49,18 @@ for row in "${mutants[@]}"; do
     sed -i "$expr" "$d/src/$file"
     if cmp -s "../src/$file" "$d/src/$file"; then echo "?? $name: the sed did not apply"; missed=1; continue; fi
     bin=$d/diff
-    if ! gcc "${CFLAGS[@]}" -I"$d/src" -march="$arch" c/diff.c -lm -lpthread -o "$bin" 2> "$d/cc.txt"; then
+    case $check in
+        tenant|journal|rate) src=c/vsdiff.c; flags=(-std=c89 -pedantic -Wall -Wextra -Werror -O2 -DVSERV_NO_TLS) ;;
+        *) src=c/diff.c; flags=("${CFLAGS[@]}") ;;
+    esac
+    if ! gcc "${flags[@]}" -I"$d/src" -march="$arch" "$src" -lm -lpthread -o "$bin" 2> "$d/cc.txt"; then
         echo "WRONG     (does not compile): $name"; missed=1; continue; fi
     caught=0
     case $check in
         gf|digits|vd|layout|chunks)
             "$ORACLE" "$check" > "$d/want"; "$bin" "$check" > "$d/got" || true
             cmp -s "$d/want" "$d/got" || caught=1 ;;
-        crc|block|topk)
+        crc|block|topk|tenant|journal|rate)
             "$bin" "cases-$check" 300 1 > "$d/in"
             "$ORACLE" "$check" < "$d/in" > "$d/want"; "$bin" "$check" < "$d/in" > "$d/got" || true
             cmp -s "$d/want" "$d/got" || caught=1 ;;
