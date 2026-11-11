@@ -4,6 +4,7 @@
  *   vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-g AGGRESSION] [-m TIER] [-C] [-d DIM] [-x] [-L] [-r RECALL]
  *         [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT.pem -k KEY.pem [-a CA.pem] [-P] [-T]] [-U] [-K KEYS]
  *         STORE.vxi | DIR
+ *   vserv -F HOST:PORT|SOCK [-f SECONDS] [-l DEST] REPLICA.vxi | DIR      (a replica on a second machine)
  *     STORE.vxi one store; DIR: a store per tenant, DIR/NAME.vxi, opened on a client's first "use NAME" (created
  *               there when it does not exist yet; -d gives every tenant's dimension and is required) and kept open
  *     -s PATH   Unix socket, created mode 0600 (default ./vecindex.sock when -p is not given)
@@ -47,6 +48,10 @@
  *               store, a namespace of it with ids of its own (TENANT a number, 1 to 524287); with DIR, the tenant's
  *               file (TENANT its name); KEY TENANT ROWS QPS adds limits, KEY * is the operator's key. Keys
  *               cannot build, save, snapshot or scrub, nor read /metrics or /prometheus; the Unix socket needs none
+ *     -F ADDR   be a replica of the primary at ADDR (HOST:PORT, plaintext, or a Unix socket - an ssh tunnel to it
+ *               for another machine): copy its file and journal into REPLICA.vxi (or every tenant into DIR) every -f
+ *               seconds, until SIGTERM; it serves nothing. $VSERV_KEY: the operator's key of a primary with -K.
+ *               Failover: stop it, start vserv on REPLICA (vserv_repl.c)
  *
  * The store is opened with store_load (mmap: ready in milliseconds whatever its size). Every socket speaks three
  * protocols, told apart by the first byte of a request (vserv_proto.c has the details):
@@ -67,7 +72,7 @@
  * Who may connect is the operating system's business (the socket file's mode and group, the address the port is
  * bound to) and TLS client certificates'; what each connection did goes to the log. Durability: the journal of
  * changes is flushed every second (-f) and folded into the file by background snapshots (store_snapshot), so a
- * restart replays at most what came in since the last snapshot. Replication is a copy of the file and its journal.
+ * restart replays at most what came in since the last snapshot. Replication (-F) copies the file and its journal.
  *
  * TLS (when -c/-k are given): a connection is TLS when its first byte is a handshake record (0x16). TLS 1.2 only,
  * ECDHE key exchange (forward secrecy), AEAD suites only (AES-GCM - AES-NI when the CPU has it - and
@@ -912,7 +917,7 @@ static void vs_housekeep_(f64 sync_s, f64 snap_s)
 int main(int argc, char **argv)
 {
     const char *sock = (const char *)0, *bind_addr = "127.0.0.1", *cert = (const char *)0, *key = (const char *)0, *ca = (const char *)0;
-    const char *logdest = (const char *)0, *path = (const char *)0, *keys = (const char *)0;
+    const char *logdest = (const char *)0, *path = (const char *)0, *keys = (const char *)0, *follow = (const char *)0;
     i32 port = 0, nth = 0, dim = 0, save_on_exit = 0, created = 0, memrc = 0, i, j;
     i64 hot = 0, cold = 0;
     f32 aggr = -1.0f;
@@ -953,16 +958,19 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-S") && i + 1 < argc) snap_s = atof(argv[++i]);
         else if (!strcmp(argv[i], "-l") && i + 1 < argc) logdest = argv[++i];
         else if (!strcmp(argv[i], "-A")) vs_log_all = 1;
+        else if (!strcmp(argv[i], "-F") && i + 1 < argc) follow = argv[++i];
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else {
             fprintf(stderr, "usage: vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-g A] [-m TIER] [-C] [-d DIM] [-x] [-L] [-r RECALL]\n"
                             "             [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT -k KEY [-a CA] [-P] [-T]] [-U] [-K KEYS]\n"
-                            "             STORE.vxi | DIR\n");
+                            "             STORE.vxi | DIR\n"
+                            "       vserv -F HOST:PORT|SOCK [-f SECONDS] [-l DEST] REPLICA.vxi | DIR\n");
             return 2;
         }
     }
     if (logdest && vs_log_open_(logdest) != 0) { fprintf(stderr, "vserv: cannot open the log %s: %s\n", logdest, strerror(errno)); return 1; }
     if (!path) { fprintf(stderr, "vserv: no store file or tenant directory given\n"); return 2; }
+    if (follow) return vs_follow_(follow, path, sync_s);            /* a replica: copies, serves nothing (vserv_repl.c) */
     if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {           /* a directory: a store per tenant in it */
         char *d = (char *)malloc(strlen(path) + 1);
         size_t n;

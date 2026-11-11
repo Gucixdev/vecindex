@@ -107,7 +107,7 @@ In all three an add replaces the row with the same id: one row per id. A request
 buffer of a connection starts small, grows for a big request and goes back once it is answered. The full reference is the comment at the top
 of `src/vserv_proto.c`.
 
-## Durability: a journal and background snapshots, no replication
+## Durability: a journal and background snapshots
 
 Every write goes into the journal next to the file (`docs.vxi.j`), which is flushed to the disk every second (`-f
 SECONDS`; 0 leaves it to the kernel), so a crash loses at most that second. A new store's file is created at start,
@@ -142,10 +142,44 @@ line protocol reads every block of the current store's file from the disk, rebui
 rows_bad= rows_healed= journal=ok|damaged`: what the load found, then the rows that failed their check when a search
 read them - rebuilt from the parity on the spot, or left out of the results. A cron line that runs `scrub` weekly is the ZFS habit.
 
-There is no replication inside the server. A copy of the store is the file plus its journal, both written atomically
-(`rename`), so `rsync` or `cp` of the two at any moment is a consistent backup; a standby machine that replays them
-starts in milliseconds (mmap). A snapshot to another path (`store_snapshot` / `vi_snapshot` with a path) writes a
-point-in-time copy without touching the live journal.
+A copy of the store is the file plus its journal, both written atomically (`rename`), so `rsync` or `cp` of the two
+at any moment is a consistent backup; a standby machine that replays them starts in milliseconds (mmap). A snapshot
+to another path (`store_snapshot` / `vi_snapshot` with a path) writes a point-in-time copy without touching the live
+journal. For a copy that keeps up by itself, see the replica below.
+
+## A replica on a second machine: `vserv -F`
+
+```sh
+# on the standby: copy everything the primary has flushed, every second, until stopped
+vserv -F 10.0.0.5:8077 /srv/vx/docs.vxi          # a one-store primary (plaintext TCP: -P if it has TLS)
+vserv -F /run/vx/primary.sock /srv/vx/           # a tenant server: every tenant, NAME.vxi in the directory
+VSERV_KEY=op_key_... vserv -F 10.0.0.5:8077 ...  # the operator's key, when the primary has -K
+```
+
+The replica copies what `store_load` reads, the file and its journal, and serves nothing. The journal comes over byte
+for byte, but only up to what the primary's last fsync covered, which always ends on a whole record - so the replica
+never holds a write the primary could still lose in a crash, and a write reaches it within about a second (`-f` on
+the primary; with `-f 0` the replica sees writes only after a `commit sync` or a snapshot). When a save or a snapshot
+gives the primary's file a new stamp, the replica fetches the new file in 4 MB chunks into `NAME.vxi.part`, checks every
+block against its digest (rebuilding from the parity what it can), renames it into place and starts the journal over;
+in between the old file and its journal stay a matching pair. A torn tail on the replica's own journal (it was
+killed mid-write) is cut when it starts and fetched again. Every file copied is a line on stderr and in the log (`-l`).
+
+Failover is by hand or by the init system: stop the replica, start `vserv` on the same path. It replays the journal
+like any restart and has every row the primary had flushed - `tests/vserv_test.c` kills the primary with `kill -9`
+and checks exactly that. Never run a replica and a server on the same files at once. There is one primary per store:
+the replica is a standby, not a second place to write.
+
+The primary side is three binary ops (21 journal, 22 file, 23 the tenants), refused to tenant keys: the Unix socket
+or the operator's key (`*` in `-K`). The replica speaks plaintext. Across machines either let the primary's TCP port
+take plaintext on a private network (`-P` with TLS, or no TLS) or carry the Unix socket over ssh, which encrypts it:
+
+```sh
+ssh -N -L /run/vx/primary.sock:/srv/vx/vecindex.sock vx@primary &   # a local socket that is the primary's
+vserv -F /run/vx/primary.sock /srv/vx/
+```
+
+A tenant server's replica opens every tenant on the primary (`use NAME`), which keeps them open there afterwards.
 
 ## Memory: hot codes in RAM, cold rows on the disk
 
@@ -237,5 +271,7 @@ byte, oversized and malformed input, 8 concurrent clients, SIGTERM saves, restar
 socket and no build call) and `py/vserv_tls_test.py` (22 checks: resumption on every reconnect, multi-record replies,
 plaintext refused, untrusted CA, mTLS accept/reject, RSA key, curl, TLS on the Unix socket), and `tests/vserv_test.c`
 (the line protocol and its errors, the binary and HTTP snapshot, get and range-delete calls, replace-on-add, the log
-and its peers, kill -9 against the journal, timed snapshots, and the certificate name of a curl client under mutual
-TLS in the log) run in `./run`.
+and its peers, kill -9 against the journal, timed snapshots, API keys and their limits, /metrics and /prometheus, a
+replica (`-F`) through a snapshot, a kill -9 of the primary and a failover, over TCP with the operator's key, on a
+tenant directory and past a torn tail, and the certificate name of a curl client under mutual TLS in the log) run in
+`./run`.

@@ -214,6 +214,26 @@ static void store_jframe_(RagStore *s, const void *const *part, const size_t *pl
     }
 }
 
+/* With the write lock held and the stdio buffers just flushed: the journals' sizes, whole records only (writers hold
+ * the same lock), into at[2]; returns jgen. After their fsync, store_jdur_ makes them what a replica may copy. */
+static u64 store_jmark_(RagStore *s, i64 *at)
+{
+    struct stat st;
+    at[0] = s->jf && fstat(fileno(s->jf), &st) == 0 ? (i64)st.st_size : -1;
+    at[1] = s->jf2 && fstat(fileno(s->jf2), &st) == 0 ? (i64)st.st_size : -1;
+    return s->jgen;
+}
+
+static void store_jdur_(RagStore *s, u64 gen, const i64 *at)
+{
+    pthread_rwlock_wrlock(&s->lock);
+    if (s->jgen == gen) {
+        if (at[0] > s->jdur) s->jdur = at[0];
+        if (at[1] > s->jdur2) s->jdur2 = at[1];
+    }
+    pthread_rwlock_unlock(&s->lock);
+}
+
 /* Durable up to journal write seq: one fsync at a time under jsync_mu, the write lock held only while the stdio
  * buffers go to the kernel; a commit whose write an fsync started after it already covered returns at once. */
 static i32 store_jsync_(RagStore *s, u64 seq)
@@ -222,16 +242,18 @@ static i32 store_jsync_(RagStore *s, u64 seq)
     pthread_mutex_lock(&s->jsync_mu);
     if (s->jsynced < seq) {
         int fd[2];
-        u64 at;
+        u64 at, gen;
+        i64 sz[2];
         fd[0] = fd[1] = -1;
         pthread_rwlock_wrlock(&s->lock);
         at = s->jseq;
         if (s->jf) { if (fflush(s->jf) != 0) r = -1; else fd[0] = dup(fileno(s->jf)); }
         if (s->jf2) { if (fflush(s->jf2) != 0) r = -1; else fd[1] = dup(fileno(s->jf2)); }
+        gen = store_jmark_(s, sz);
         pthread_rwlock_unlock(&s->lock);
         for (i = 0; i < 2; ++i)
             if (fd[i] >= 0) { if (fsync(fd[i]) != 0) r = -1; close(fd[i]); }
-        if (r == 0) s->jsynced = at;
+        if (r == 0) { s->jsynced = at; store_jdur_(s, gen, sz); }
     }
     pthread_mutex_unlock(&s->jsync_mu);
     return r;

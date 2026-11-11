@@ -180,7 +180,8 @@ static i32 vs_setnum_(VsConn *c, i64 id, i64 num)
 /* ---- binary protocol: little-endian frames, nothing to parse ----
  *   request  u8 0xB5 | u8 op | u16 k | u32 nbytes | payload[nbytes]
  *   response u8 0xB5 | u8 status | u16 count | u32 nbytes | payload[nbytes]
- *   status 0 ok, 1 refused or failed, 2 bad request, 3 unknown op, 4 busy, 5 no tenant chosen (a tenant server)
+ *   status 0 ok, 1 refused or failed, 2 bad request, 3 unknown op, 4 busy, 5 no tenant chosen (a tenant server),
+ *          6 no key shown yet, 7 over the key's rate, 8 the stamp changed (op 21, 22)
  *   op 1 search        payload: dim x f32            reply: count x { i64 id, f32 score }
  *   op 2 add           payload: i64 id, dim x f32    (replaces a row with the same id)
  *   op 3 delete        payload: i64 id               reply count: rows removed
@@ -206,7 +207,9 @@ static i32 vs_setnum_(VsConn *c, i64 id, i64 num)
  *   op 20 auth             payload: an API key (-K); status 1 with the reason when refused. Until a TCP connection to
  *                          a server with keys shows one, every other op answers status 6. A keyed connection gets
  *                          status 1 for build, save and snapshot (the server's housekeeping); status 7: the key's
- *                          requests a second are used up */
+ *                          requests a second are used up
+ *   op 21 journal, op 22 file, op 23 tenants: a replica following this server (vserv -F, vserv_repl.c); the
+ *                          operator's only. status 8: the stamp changed, the payload is the new one */
 
 /* a reply whose payload sits elsewhere (a text): the header, then the payload as it is */
 static void vs_bin_reply_at_(VsWorker *w, VsConn *c, u8 status, u16 count, const char *payload, u32 nbytes)
@@ -242,6 +245,8 @@ static void vs_getf_(f32 *v, const u8 *p, i32 n)
     for (i = 0; i < n; ++i) { u32 u = vs_le32_(p + 4 * i); memcpy(&v[i], &u, 4); }
 }
 
+#include "vserv_repl.c"
+
 /* returns bytes consumed, 0 if the frame is incomplete, -1 to close */
 static i32 vs_binary_(VsWorker *w, VsConn *c)
 {
@@ -261,11 +266,19 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
     }
     if (vs_need_key_(c)) { vs_bin_reply_(w, c, 6, 0, (const char *)0, 0); return (i32)(8 + nb); }   /* no key shown yet */
     if (!vs_key_take_(c)) { vs_bin_reply_(w, c, 7, 0, (const char *)0, 0); return (i32)(8 + nb); }   /* over the key's QPS */
-    if (!vs_admin_(c) && (op == 4 || op == 5 || op == 7)) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); return (i32)(8 + nb); }
+    if (!vs_admin_(c) && (op == 4 || op == 5 || op == 7 || op >= 21)) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); return (i32)(8 + nb); }
     if (op == 14) {                                              /* use a tenant: the payload is its name */
         const char *why = nb <= VS_TNAME ? vs_use_(c, (const char *)b, (i32)nb) : "a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -";
         if (why) vs_bin_reply_(w, c, 1, 0, why, (u32)strlen(why));
         else vs_bin_reply_(w, c, 0, 0, (const char *)0, 0);
+        return (i32)(8 + nb);
+    }
+    if (op == 23) {                                              /* the tenants, for a replica of a tenant server */
+        char *t = (char *)0;
+        u32 n = 0;
+        if (vs_repl_tenants_(&t, &n) != 0) vs_bin_reply_(w, c, 1, 0, (const char *)0, 0);
+        else vs_bin_reply_at_(w, c, 0, 0, t, n);
+        free(t);
         return (i32)(8 + nb);
     }
     if (!c->t) { vs_bin_reply_(w, c, 5, 0, (const char *)0, 0); return (i32)(8 + nb); }   /* a tenant server: none chosen */
@@ -379,6 +392,18 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
             if (vs_getnum_(c, vs_le64_(b), &v) != 0) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); break; }
             vs_put64_(p, v);
             vs_bin_reply_(w, c, 0, 0, p, 8); }
+        break;
+    case 21: case 22:                                            /* a replica following this server (vserv_repl.c) */
+        if (nb != 16) { vs_bin_reply_(w, c, 2, 0, (const char *)0, 0); break; }
+        {   char *d = (char *)0, p[8];
+            u32 n = 0;
+            u64 cur = 0;
+            i32 last = 0, r = op == 21 ? vs_repl_journal_(c->t->s, vs_le64u_(b), vs_le64u_(b + 8), &d, &n, &cur)
+                                      : vs_repl_file_(c->t->path, vs_le64u_(b), vs_le64u_(b + 8), &d, &n, &last, &cur);
+            if (r == 8) { vs_put64u_(p, cur); vs_bin_reply_(w, c, 8, 0, p, 8); }
+            else if (r != 0) vs_bin_reply_(w, c, (u8)r, 0, (const char *)0, 0);
+            else vs_bin_reply_at_(w, c, 0, (u16)last, d, n);
+            free(d); }
         break;
     default: vs_bin_reply_(w, c, 3, 0, (const char *)0, 0); break;
     }

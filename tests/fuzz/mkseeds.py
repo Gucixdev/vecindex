@@ -24,6 +24,8 @@ seeds["bin_maint"] = frame(4, 0, b"") + frame(5, 0, b"") + frame(6, 0, b"") + fr
 seeds["bin_range_delrange"] = frame(2, 0, struct.pack("<q", 3) + fv) + frame(12, 10, struct.pack("<qq", 0, 100)) + frame(9, 0, struct.pack("<qq", 0, 100))
 seeds["bin_text"] = frame(10, 0, struct.pack("<q", 5) + fv + b"hello world") + frame(11, 0, struct.pack("<q", 5)) \
     + frame(13, 3, struct.pack("<I", 1) + fv + b"hello") + frame(13, 3, struct.pack("<I", 0) + b"world")
+seeds["bin_repl"] = frame(23, 0, b"") + frame(21, 0, struct.pack("<QQ", 0, 0)) + frame(21, 0, struct.pack("<QQ", 1, 20)) \
+    + frame(22, 0, struct.pack("<QQ", 0, 0)) + frame(22, 0, struct.pack("<QQ", 1, 1 << 40)) + frame(21, 0, b"short")
 seeds["bin_use_unknown"] = frame(14, 0, b"acme") + frame(99, 0, b"") + frame(1, 0, b"short")
 seeds["line_basic"] = b"ping\nstats\nadd 1 0.1 -0.2 0.3 0.4\nadd 2 0.5 0.1 -0.9 0.2\nsearch 2 0.1 -0.2 0.3 0.4\n"
 seeds["line_get_del"] = b"add 7 1 0 0 0\nget 7\ndel 7\nget 7\ndel 1 100\n"

@@ -8,8 +8,7 @@ memory (mem.c and its rule engine) and the cross-encoder re-rank moved to `examp
 a separate project that uses vecindex as a library; vecindex itself is back in holyc as `vecindex/`.
 
 Done and tested: quantization with an exact re-rank (4, 2 and 1-bit codes), SIMD (AVX-512, AVX2, NEON, a scalar path
-elsewhere), hybrid BM25 search, concurrent updates (one rwlock, live indexing), background snapshots instead of
-replication, a line protocol beside binary and HTTP, system logs instead of users and roles, any language through
+elsewhere), hybrid BM25 search, concurrent updates (one rwlock, live indexing), background snapshots, a line protocol beside binary and HTTP, system logs instead of users and roles, any language through
 the C ABI and the protocols, i64 ids, one CPU knob, texts with chunk ranges, vfind.
 
 Done and tested since 2026-11-06 (`./run`, every step passing on a 2-vCPU Xeon): memory tiers (hot codes in RAM,
@@ -35,7 +34,9 @@ pages in its probed clusters: 0.7 ms against 0.4 ms warm on 2M rows, `bench/cold
 the small parts at once, texts when read, everything before a save, the rest walked one block at a time), namespaces (tenants in one store: small ones searched over their own rows, big
 ones through the scan with the namespace inside it; `vi_add_ns`, `vi_search_ns`, `vi_delete_ns`), a CRC-32C a text checked on every read (rebuilt from the parity, or not served), API keys in vserv (`-K`: a key per tenant, a namespace and ids of its own in one
 store, or its file in a tenant directory; housekeeping stays with the server), limits a key (rows, requests a second), `/metrics` (JSON)
-and `/prometheus` (the Prometheus text format) for the operator.
+and `/prometheus` (the Prometheus text format) for the operator, a replica on a second machine (`vserv -F`: the file and
+its journal, never ahead of the primary's last fsync, a new file fetched and checked block by block after a snapshot,
+failover by starting `vserv` on it).
 
 Open:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a

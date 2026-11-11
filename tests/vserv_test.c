@@ -154,6 +154,55 @@ static int count_of(int fd)
     return atoi(c + 6);
 }
 
+/* 1 when the files at a and b hold the same bytes (both missing counts as different) */
+static int same_file(const char *a, const char *b)
+{
+    FILE *f = fopen(a, "rb"), *g = fopen(b, "rb");
+    int ca = 0, cb = 0, same = f && g;
+    while (same) { ca = getc(f); cb = getc(g); if (ca != cb) same = 0; else if (ca == EOF) break; }
+    if (f) fclose(f);
+    if (g) fclose(g);
+    return same;
+}
+
+/* the replica's file and journal equal the primary's, within ms */
+static int wait_same(const char *pa, const char *ra, int ms)
+{
+    char pj[256], rj[256];
+    int t;
+    sprintf(pj, "%s.j", pa); sprintf(rj, "%s.j", ra);
+    for (t = 0; t < ms; t += 50) { if (same_file(pa, ra) && same_file(pj, rj)) return 1; msleep(50); }
+    return 0;
+}
+
+/* vserv -F ADDR -f 0.1 REPLICA, $VSERV_KEY = key when given */
+static pid_t follow(const char *addr, const char *rep, const char *key)
+{
+    pid_t p = fork();
+    if (p == 0) {
+        char flog[160];
+        if (key) setenv("VSERV_KEY", key, 1); else unsetenv("VSERV_KEY");
+        sprintf(flog, "%s/follow.log", dir);
+        if (!freopen(flog, "a", stderr)) {}
+        execl(getenv("VSERV"), getenv("VSERV"), "-F", addr, "-f", "0.1", rep, (char *)0);
+        _exit(127);
+    }
+    return p;
+}
+
+/* rows id0..id1-1 with the text "row ID", over a connection */
+static int add_rows(int fd, long id0, long id1)
+{
+    char l[2048], r[256];
+    long id;
+    for (id = id0; id < id1; ++id) {
+        vline(l, "addt", id, (int)id);
+        sprintf(l + strlen(l) - 1, " row %ld\n", id);
+        if (ask(fd, l, r, sizeof(r)) < 0 || strcmp(r, "ok")) return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char line[2048], r[65536], what[256];
@@ -667,6 +716,97 @@ int main(int argc, char **argv)
             close(fk);
             stop(p, SIGTERM);
         }
+        serve_path = store_path;
+    }
+
+    /* replication (-F): a replica copies the file and the journal, a snapshot makes it fetch the new file, and vserv
+     * on the replica after a kill -9 of the primary has every row the primary flushed; over TCP with the operator's
+     * key (a tenant's key is refused); a tenant directory, every tenant; a torn tail on the replica fetched again */
+    {
+        char pa[300], rdir[300], ra[400], rpj[600], kp[300], addr[64];
+        pid_t f;
+        FILE *kf;
+        int fr;
+        sprintf(pa, "%s/prim.vxi", dir); sprintf(rdir, "%s/replica", dir); sprintf(ra, "%s/prim.vxi", rdir);
+        mkdir(rdir, 0700);
+        serve_path = pa;
+        p = start(NULL, NULL, NULL);
+        fd = connect_unix();
+        check(add_rows(fd, 1, 301) == 0, "replication: 300 rows with texts on the primary");
+        f = follow(sock_path, ra, NULL);
+        check(wait_same(pa, ra, 6000), "-F: the replica's file and journal are the primary's");
+        check(ask(fd, "del 1 10\n", r, sizeof(r)) > 0 && !strcmp(r, "ok 10"), "deletes on the primary");
+        check(ask(fd, "snapshot\n", r, sizeof(r)) > 0 && !strcmp(r, "ok started"), "a snapshot on the primary");
+        for (i = 0; i < 200; ++i) { if (ask(fd, "stats\n", r, sizeof(r)) > 0 && strstr(r, "snapshot=idle")) break; msleep(25); }
+        check(wait_same(pa, ra, 6000), "-F after the snapshot: the new file and its journal");
+        check(add_rows(fd, 301, 351) == 0, "50 more rows after it");
+        close(fd);
+        msleep(1500);                                            /* past the primary's journal flush (-f 1) */
+        stop(p, SIGKILL);
+        check(wait_same(pa, ra, 6000), "-F: the journal up to the primary's last flush");
+        stop(f, SIGTERM);
+        serve_path = ra;
+        p = start(NULL, NULL, NULL);
+        fd = connect_unix();
+        check(count_of(fd) == 340 && ask(fd, "text 350\n", r, sizeof(r)) > 0 && !strcmp(r, "ok 7 row 350")
+              && ask(fd, "text 5\n", r, sizeof(r)) > 0 && !strcmp(r, "err no such id"),
+              "failover: vserv on the replica has the 340 rows and their texts");
+        close(fd);
+        stop(p, SIGTERM);
+
+        /* over TCP with -K: a tenant's key may not follow, the operator's may */
+        sprintf(kp, "%s/rkeys.tsv", dir);
+        if ((kf = fopen(kp, "w")) != (FILE *)0) { fprintf(kf, "op_key_0123456789abcdef *\nt_key_0123456789abcdef 3\n"); fclose(kf); }
+        serve_path = pa;
+        p = start("-K", kp, NULL);
+        fd = connect_tcp();
+        {   unsigned char pl[16];
+            memset(pl, 0, sizeof(pl));
+            check(bin_call(fd, 20, "t_key_0123456789abcdef", 22, &st, &rnb, rb) == 0 && st == 0
+                  && bin_call(fd, 21, pl, 16, &st, &rnb, rb) == 0 && st == 1, "op 21 with a tenant's key -> refused");
+            check(bin_call(fd, 23, NULL, 0, &st, &rnb, rb) == 0 && st == 1, "op 23 with a tenant's key -> refused");
+        }
+        close(fd);
+        sprintf(ra, "%s/tcp.vxi", rdir);
+        sprintf(addr, "127.0.0.1:%d", port);
+        f = follow(addr, ra, "op_key_0123456789abcdef");
+        check(wait_same(pa, ra, 6000), "-F over TCP with the operator's key in VSERV_KEY");
+        stop(f, SIGTERM);
+        stop(p, SIGTERM);
+
+        /* a tenant directory: every tenant, op 23 lists them */
+        sprintf(pa, "%s/ptens", dir); sprintf(ra, "%s/rtens", dir);
+        mkdir(pa, 0700); mkdir(ra, 0700);
+        serve_path = pa;
+        p = start(NULL, NULL, NULL);
+        fd = connect_unix();
+        check(ask(fd, "use acme\n", r, sizeof(r)) > 0 && add_rows(fd, 1, 41) == 0 && ask(fd, "use beta\n", r, sizeof(r)) > 0
+              && add_rows(fd, 1, 21) == 0, "a tenant server: acme 40 rows, beta 20");
+        check(bin_call(fd, 23, NULL, 0, &st, &rnb, rb) == 0 && st == 0 && rnb < sizeof(rb) && (rb[rnb] = 0, 1)
+              && strstr((char *)rb, "acme\n") && strstr((char *)rb, "beta\n"), "op 23: acme and beta");
+        f = follow(sock_path, ra, NULL);
+        {   char p1[500], r1[500], p2[500], r2[500];
+            sprintf(p1, "%s/acme.vxi", pa); sprintf(r1, "%s/acme.vxi", ra); sprintf(p2, "%s/beta.vxi", pa); sprintf(r2, "%s/beta.vxi", ra);
+            msleep(1200);
+            check(wait_same(p1, r1, 6000) && wait_same(p2, r2, 6000), "-F on a directory: both tenants");
+            stop(f, SIGTERM);
+            sprintf(rpj, "%s.j", r1);
+            if ((kf = fopen(rpj, "ab")) != (FILE *)0) { fwrite("G\377\377\0\0torn", 1, 9, kf); fclose(kf); }
+            check(ask(fd, "use acme\n", r, sizeof(r)) > 0 && add_rows(fd, 41, 61) == 0, "20 more acme rows meanwhile");
+            msleep(1200);
+            f = follow(sock_path, ra, NULL);
+            check(wait_same(p1, r1, 6000), "a torn tail on the replica's journal: cut, and the rest fetched");
+            stop(f, SIGTERM);
+        }
+        close(fd);
+        stop(p, SIGTERM);
+        fr = 0;
+        {   char flog[200], line2[512];
+            FILE *g;
+            sprintf(flog, "%s/follow.log", dir);
+            if ((g = fopen(flog, "r")) != (FILE *)0) { while (fgets(line2, sizeof(line2), g)) if (strstr(line2, "copied")) ++fr; fclose(g); }
+        }
+        check(fr >= 4, "the replica's log: every file it copied");
         serve_path = store_path;
     }
 

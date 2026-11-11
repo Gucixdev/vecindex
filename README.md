@@ -117,14 +117,14 @@ left are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Production readiness
 
-**Embedded first, one machine.** The library runs inside the application, like SQLite; `vserv` puts the same store
-on a socket for other processes and languages. Neither needs a cluster or a cloud: a tenant is a store file, a batch
-of writes goes in whole or not at all, the journal is flushed every second and folded into the file by background
-snapshots, the log records who did what (there are no users and roles), mutual TLS can tie a client to its tenant,
-one setting caps the CPU it takes and another what stays in RAM. A standby is a copy of the file and its journal;
-there is no replication. Every number below is measured: the older rows on a GTX 1050 Ti box (7.8 GB RAM, 12 cores),
-the scale, server and benchmark rows on the 2-core box of the Results section; `./run`, `./run stress`, `./run bench`
-and `./run real_val` reproduce them.
+**Embedded first, one machine.** The library runs inside the application, like SQLite; `vserv` puts the same store on
+a socket for other processes and languages. Neither needs a cluster or a cloud: a tenant is a store file, a batch of
+writes goes in whole or not at all, the journal is flushed every second and folded into the file by background
+snapshots, the log records who did what (there are no users and roles), mutual TLS can tie a client to its tenant, one
+setting caps the CPU it takes and another what stays in RAM. A standby on a second machine follows the primary with
+`vserv -F` (a copy of the file and its journal, never ahead of the primary's last fsync). Every number below is
+measured: the older rows on a GTX 1050 Ti box (7.8 GB RAM, 12 cores), the scale, server and benchmark rows on the
+2-core box of the Results section; `./run`, `./run stress`, `./run bench` and `./run real_val` reproduce them.
 
 | area | status | evidence |
 |---|---|---|
@@ -147,7 +147,7 @@ and `./run real_val` reproduce them.
 | Independent review | **not done** | every test here was written and run by the author of the code |
 | Tenants | a store file per tenant, opened on first use: in the library (`vi_dir_*`) or the server (`vserv DIR`, where `-U` binds a client certificate to its tenant) | in `./run`, passing (2-vCPU Xeon, 2026-11-06): `tests/api_test.c` (`vi_dir_*`), `tests/vserv_test.c` (isolation, the three protocols, the log, a restart, `-U` with a tenant's certificate) |
 | Transactions | write batches: searches see all or none of one, a crash leaves all or none (one CRC-checked journal record), commit with fsync on request (`vi_batch_*`, `begin`/`commit` in `vserv`) | in `./run`, passing (2-vCPU Xeon, 2026-11-06): `tests/store_test.c` (refused and aborted batches, a torn and a damaged batch in the journal, a reader that must never see half of one, durable commits from 4 threads), `tests/api_test.c`, `tests/vserv_test.c` (kill -9 right after `commit sync`) |
-| Users and roles / replication | **not present, on purpose** | access is the socket's file mode, the bound address and client certificates; accountability is the log; a backup or a standby is a copy of the file and its journal ([docs/server.md](docs/server.md)) |
+| Users and roles / multi-primary replication | **not present, on purpose** | access is the socket's file mode, the bound address, client certificates and API keys; accountability is the log; a standby follows with `vserv -F`, one primary per store ([docs/server.md](docs/server.md)) |
 
 ## Documentation
 

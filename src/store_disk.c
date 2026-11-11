@@ -118,9 +118,10 @@ static void store_journal_reset_(RagStore *s, const char *path)
     if (s->jf) { fclose(s->jf); s->jf = (FILE *)0; }
     free(s->jpath); s->jpath = (char *)0;
     s->jf = fopen(jn, "wb");
+    ++s->jgen; s->jdur = 0;
     if (s->jf) {
-        store_jhead_(s->jf, s->dim, s->stamp, s->count, store_file_size_(path));
-        store_fsync_(s->jf);
+        if (store_jhead_(s->jf, s->dim, s->stamp, s->count, store_file_size_(path)) == 0 && store_fsync_(s->jf) == 0)
+            s->jdur = (i64)ftello(s->jf);
         s->jpath = store_jname_(path, "");
     }
     free(jn);
@@ -308,6 +309,7 @@ static void store_journal_replay_(RagStore *s, const char *path)
          * when fopen fails): records appended behind a torn one would never be replayed. */
         if (truncate(use, (off_t)good) == 0) {
             s->jf = fopen(use, "ab");
+            ++s->jgen; s->jdur = good;                           /* read back from the disk: on it */
             if (s->jf) s->jpath = store_jname_(path, "");
         }
     } else
@@ -550,13 +552,17 @@ i32 store_sync(RagStore *s, const char *path)
     if (s->jf && s->jpath && strcmp(s->jpath, path) == 0) {
         int fd[2], i;
         i32 r = 0;
+        u64 gen;
+        i64 sz[2];
         fd[0] = fd[1] = -1;
         pthread_rwlock_wrlock(&s->lock);                         /* adders write these buffers under the same lock */
         if (fflush(s->jf) != 0) r = -1; else fd[0] = dup(fileno(s->jf));
         if (s->jf2) { if (fflush(s->jf2) != 0) r = -1; else fd[1] = dup(fileno(s->jf2)); }
+        gen = store_jmark_(s, sz);
         pthread_rwlock_unlock(&s->lock);
         for (i = 0; i < 2; ++i)
             if (fd[i] >= 0) { if (fsync(fd[i]) != 0) r = -1; close(fd[i]); }
+        if (r == 0) store_jdur_(s, gen, sz);
         return r;
     }
     return store_save(s, path);
@@ -618,6 +624,7 @@ static i32 store_snap_reap_(RagStore *s, i32 block)
             free(jn);
             if (s->jf) fclose(s->jf);
             s->jf = s->jf2;
+            s->jdur = s->jdur2; ++s->jgen;
             free(s->jpath); s->jpath = store_jname_(s->snap_path, "");
             s->stamp = s->snap_stamp;
         } else {
@@ -682,6 +689,7 @@ i32 store_snapshot(RagStore *s, const char *path)
     }
     if (pid > 0) {
         s->jf2 = j2; s->jn2 = jn2;                               /* from here on every record goes to both journals */
+        s->jdur2 = j2 ? (i64)ftello(j2) : 0; ++s->jgen;
         s->snap_pid = (i32)pid; s->snap_stamp = stamp;
         free(s->snap_path); s->snap_path = store_jname_(path, "");
         s->snap_t0_us = store_now_us_();

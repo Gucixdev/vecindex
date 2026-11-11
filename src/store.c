@@ -212,6 +212,8 @@ typedef struct {
     u64      jsynced;       /* the jseq an fsync last covered (under jsync_mu) */
     pthread_mutex_t jsync_mu;   /* one fsync at a time: commits that arrive meanwhile find theirs covered */
     u64      stamp;         /* the stamp of the file the journal belongs to (v7); 0: an older file, or none */
+    i64      jdur, jdur2;   /* bytes of jf / jf2 an fsync has covered: whole records, what a replica may copy (vserv -F) */
+    u64      jgen;          /* bumped whenever jf or jf2 is replaced: an fsync that started before does not move jdur */
     /* background snapshot (store_snapshot): one child process at a time writes the store's image to snap_path */
     pthread_mutex_t snap_mu;/* guards the fields below; store_save / store_build hold it through their compaction */
     i32      snap_pid;      /* the child writing a snapshot; 0: none */
