@@ -95,6 +95,27 @@ cells instead of 4 (+0.15 points, +32% build), checking each centroid's nearest 
 gain, removed), the scan loop unrolled or written with GCC vector extensions (no gain), queries-outer order in the
 batch loop (no gain, reverted).
 
+## Regression check: the store features of November 2026
+
+Did namespaces, numbers, update, grouped search, the lens, the text CRCs and the server's keys, metrics and replica
+slow the engine? `bench/scale.c 1000000 128 --nq 500 --save DIR` (synthetic, 1M rows, d=128, 4-bit codes), the
+commit before them (d68b418) against 070a6a3, both `gcc -O2 -march=native`, 7 runs each, alternating, on the 2-vCPU
+Xeon @ 2.30GHz (AVX-512), 2026-11-11. Median, then min..max:
+
+| stage | before | after | change |
+|---|---|---|---|
+| ingest 1M rows | 1.39 s (1.37..1.45) | 1.38 s (1.27..1.47) | -0.7% |
+| build | 4.81 s (3.62..4.85) | 4.68 s (3.05..4.73) | -2.7% |
+| search, 1 thread | 2099 q/s (1838..2647) | 2152 q/s (1938..2712) | +2.5% |
+| search p50 / p99 | 0.463 / 0.713 ms | 0.453 / 0.740 ms | -2.2% / +3.8% |
+| recall@10 | 0.9246 | 0.9246 | same |
+| save | 2.73 s (1.82..2.85) | 2.67 s (1.89..2.86) | -2.2% |
+| load (mmap) | 1.62 s (0.85..1.68) | 1.63 s (0.86..1.72) | +0.6% |
+| search after load, p50 / p99 | 0.426 / 0.916 ms | 0.429 / 0.923 ms | +0.7% / +0.8% |
+
+Every change is inside the run-to-run spread: no measurable cost on a search without filters. The new filters
+(namespace, number range) have no "before" to compare with. TLS and the replica do not touch the engine.
+
 ## Bottlenecks now
 
 Measured on this host unless noted; ordered by how much of a query (or a build) each one is.
