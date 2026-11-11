@@ -155,6 +155,8 @@ measured: the older rows on a GTX 1050 Ti box (7.8 GB RAM, 12 cores), the scale,
 - [docs/benchmarks.md](docs/benchmarks.md) - GloVe-100 against FAISS and turbovec (the Qdrant runs never finished); scale; the priority table
   of optimisations; bottlenecks; how to reproduce.
 - [docs/server.md](docs/server.md) - `vserv`: sockets, protocols, TLS, live mode.
+- [docs/format.md](docs/format.md) - the file format and what stays compatible: every release's files open in every
+  later one, a newer build's are refused rather than misread, the C API only grows (all tested by `./run`)
 - [docs/store.md](docs/store.md) - the store: the TurboQuant-style scan, IVF, self-tuning, live ingest, rows past
   RAM, stemming, the SQuAD retrieval benchmark.
 - [docs/roadmap.md](docs/roadmap.md) - what is done, what is written but not run, what is open.

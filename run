@@ -191,6 +191,22 @@ fi
     && "./$OUT/api_test_a" > /dev/null && rec "C API static" ok "same checks, static lib" || { echo "  ^ C API (static) FAILED"; fail=1; rec "C API static" FAIL; }
 echo
 
+# ---- compatibility: every release's files open with every value; a newer build's are refused; the API of every
+# release is still declared, word for word (tests/compat, docs/format.md) ----
+"$CC" "${CFLAGS[@]}" -Iinclude -Itests/compat tests/compat_test.c "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/compat_test" \
+    && "./$OUT/compat_test" tests/compat | tee "$OUT/log_compat.txt" | grep -v '^  ok' \
+    && grep -q 'compat: OK' "$OUT/log_compat.txt" \
+    && rec "file compatibility" ok "$(grep -o '([0-9]* stores)' "$OUT/log_compat.txt"): every value, newer files refused" \
+    || { echo "  ^ file compatibility FAILED"; fail=1; rec "file compatibility" FAIL; }
+apimiss=""
+for f in tests/compat/api-*.txt; do
+    m=$(comm -23 "$f" <(tests/compat/api_decls.sh include/vecindex.h)) || true
+    [[ -n $m ]] && apimiss+="$f: $m"$'\n'
+done
+if [[ -z $apimiss ]]; then rec "API compatibility" ok "every declaration of $(ls tests/compat/api-*.txt | sed 's|.*/api-||; s|\.txt||' | paste -sd, -) still in vecindex.h"
+else printf '%s' "$apimiss"; fail=1; rec "API compatibility" FAIL; fi
+echo
+
 # ---- the store's live mode (its own indexing / rebuild thread beside adders and searchers), under the thread sanitizer ----
 echo "store threads (live mode)"
 if "$CC" -std=gnu99 -g -O1 -fsanitize=thread -march=native -Isrc tests/store_test.c -lm -lpthread -o "$OUT/store_tsan" 2>/dev/null; then

@@ -163,7 +163,7 @@ static i32 store_jrec_play_(RagStore *s, FILE *f, u8 op, f32 *vec, char **txt, i
         if (fread(&b, 1, 1, f) != 1 || fread(nm, 1, STORE_LABEL_NAME, f) != STORE_LABEL_NAME || fread(&par, 8, 1, f) != 1) return -1;
         nm[STORE_LABEL_NAME - 1] = 0;
         store_label_set_(s, (i32)b, nm, par);
-    } else return -1;
+    } else { s->jnewer = op; return -3; }                        /* the frame's CRC vouched for it: a newer build's */
     return 0;
 }
 
@@ -183,8 +183,10 @@ static i32 store_jgroup_play_(RagStore *s, FILE *f, f32 *vec, char **txt, i32 *t
     if (fread(g, 1, (size_t)n, f) != (size_t)n) { free(g); return -1; }
     if (store_crc32c_(g, (size_t)n) != crc) { free(g); return -2; }
     if (!(m = fmemopen(g, (size_t)n, "rb"))) { free(g); return -1; }
-    while (fread(&op, 1, 1, m) == 1)                             /* the CRC vouched for the bytes: these are whole */
-        if (store_jrec_play_(s, m, op, vec, txt, txcap) != 0) { r = -2; break; }
+    while (fread(&op, 1, 1, m) == 1) {                          /* the CRC vouched for the bytes: these are whole */
+        i32 q = store_jrec_play_(s, m, op, vec, txt, txcap);
+        if (q != 0) { r = q == -3 ? -3 : -2; break; }
+    }
     fclose(m);
     free(g);
     return r;
@@ -200,7 +202,8 @@ static i32 store_jzeros_(FILE *f)
 
 /* Replays the journal file jn onto a freshly loaded store when it belongs to the file at path. Returns the length of
  * its good part (a torn last record or batch is not in it), -1 when it belongs to another file or cannot be read, -2
- * when its header is damaged. *dmg gets 1 when it stopped at a damaged frame with more journal after it. */
+ * when its header is damaged, -3 when a whole record is of a kind this build does not know (s->jnewer: a newer build
+ * wrote it). *dmg gets 1 when it stopped at a damaged frame with more journal after it. */
 static i64 store_journal_play_(RagStore *s, const char *path, const char *jn, i32 *dmg)
 {
     FILE *f = fopen(jn, "rb");
@@ -239,7 +242,8 @@ static i64 store_journal_play_(RagStore *s, const char *path, const char *jn, i3
         i32 r;
         if (fread(&op, 1, 1, f) != 1) break;
         if (op == 'G') r = store_jgroup_play_(s, f, vec, &txt, &txcap);
-        else r = framed ? -2 : store_jrec_play_(s, f, op, vec, &txt, &txcap);
+        else { r = framed ? -2 : store_jrec_play_(s, f, op, vec, &txt, &txcap); if (r == -3) r = -1; }   /* unframed: torn */
+        if (r == -3) { fclose(f); free(vec); free(txt); return -3; }   /* a newer build's record: touch nothing */
         if (r != 0) { if (r == -2 && !store_jzeros_(f)) *dmg = 1; break; }
         good = (i64)ftello(f);
     }
@@ -287,15 +291,18 @@ static void store_journal_replay_(RagStore *s, const char *path)
     i32 dmg = 0;
     if (s->ro) {                                                 /* read the journals as they are; move, cut, keep nothing */
         good = store_journal_play_(s, path, jn, &dmg);
+        if (good == -3) { free(jn); free(jn2); return; }
         if (good == -2 || dmg) s->jdamaged = 1;
         if (good < 0 && s->stamp && (store_journal_play_(s, path, jn2, &dmg) == -2 || dmg)) s->jdamaged = 1;
         free(jn); free(jn2);
         return;
     }
     good = store_journal_play_(s, path, jn, &dmg);
+    if (good == -3) { free(jn); free(jn2); return; }             /* a newer build's journal: refused, nothing cut or moved */
     if (good == -2) { store_jkeep_(jn, 1); s->jdamaged = 1; good = -1; }   /* its header: moved aside, never overwritten */
     if (good < 0 && s->stamp) {
-        if ((g2 = store_journal_play_(s, path, jn2, &dmg)) == -2) { store_jkeep_(jn2, 1); s->jdamaged = 1; }
+        if ((g2 = store_journal_play_(s, path, jn2, &dmg)) == -3) { free(jn); free(jn2); return; }
+        if (g2 == -2) { store_jkeep_(jn2, 1); s->jdamaged = 1; }
         else if (g2 >= 0) {
             good = g2;
             if (rename(jn2, jn) == 0) store_fsync_dir_(path);
@@ -315,6 +322,16 @@ static void store_journal_replay_(RagStore *s, const char *path)
     } else
         store_journal_reset_(s, path);
     free(jn); free(jn2);
+}
+
+/* a store whose journal holds a newer build's record: refused, with the reason; its files as they were */
+static RagStore *store_jnewer_(RagStore *s)
+{
+    if (!s->jnewer) return s;
+    sprintf(store_lerr_, "its journal was written by a newer vecindex (a change of kind '%c' this build does not know): "
+                         "open it with that version or later", (s->jnewer >= 33 && s->jnewer < 127) ? s->jnewer : '?');
+    store_destroy(s);
+    return (RagStore *)0;
 }
 
 /* v5+ layout: every array starts on a 64-byte boundary, so store_load can map the file and point straight into it
@@ -482,8 +499,9 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
     kind = (u8)(s->idx && all_in && !dead ? 1 : (s->tq && all_in && s->tq->n == live ? 2 : 0));
     f = fopen(tmp, "w+b");                                       /* the old file stays intact until the new one is complete */
     if (!f) return -1;
-    hdr[0] = (i32)STORE_MAGIC; hdr[1] = STORE_VERSION9; hdr[2] = s->dim; hdr[3] = live;
+    hdr[0] = (i32)STORE_MAGIC; hdr[2] = s->dim; hdr[3] = live;
     ext[0] = (s->vbytes == 1 ? 1 : 0) | (s->has_text ? 2 : 0) | (s->nlab ? 4 : 0) | (s->has_num ? 8 : 0) | (s->has_ns ? 16 : 0) | (s->has_text ? 32 : 0); ext[1] = s->metric;   /* v9: 0 cosine, 1 dot, 2 L2 */
+    hdr[1] = (ext[0] & ~STORE_FLAGS_V9) ? STORE_VERSION10 : STORE_VERSION9;   /* the oldest version that holds it */
     ext[2] = (i32)(u32)(stamp & 0xffffffffu); ext[3] = (i32)(u32)(stamp >> 32);
     bad = STORE_W32(f, hdr, 4) || STORE_W32(f, ext, 4) || store_goal_w_(f, &s->goal)
        || store_pad_(f) || store_col_w_live_(f, &s->vec, s->count, dead)
@@ -577,7 +595,7 @@ static u64 store_file_stamp_(const char *path)
     i32 h[8];
     u64 st = 0;
     if (!f) return 0;
-    if (!STORE_R32(f, h, 8) && (u32)h[0] == STORE_MAGIC && (h[1] == STORE_VERSION7 || h[1] == STORE_VERSION8 || h[1] == STORE_VERSION9))
+    if (!STORE_R32(f, h, 8) && (u32)h[0] == STORE_MAGIC && (h[1] == STORE_VERSION7 || h[1] == STORE_VERSION8 || STORE_V9UP(h[1])))
         st = (u64)(u32)h[6] | ((u64)(u32)h[7] << 32);
     fclose(f);
     return st;
@@ -921,7 +939,7 @@ static i32 store_rck_fill_(RagStore *s)
 static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *hdr, i32 ro, u64 dend, u64 ubad, i32 lvl, const SSum *vz)
 {
     RagStore *s;
-    i32 live = hdr[3], dim = hdr[2], ext[4], v7 = hdr[1] == STORE_VERSION7 || hdr[1] == STORE_VERSION8 || hdr[1] == STORE_VERSION9,
+    i32 live = hdr[3], dim = hdr[2], ext[4], v7 = hdr[1] == STORE_VERSION7 || hdr[1] == STORE_VERSION8 || STORE_V9UP(hdr[1]),
         i8rows = hdr[1] == STORE_VERSION_I8, texts = 0, drop_idx = 0;
     struct stat st;
     size_t len, o_vecs, o_vsc = 0, o_ids, o_meta, o_kind, o_txo = 0, o_heap = 0, o_rck = 0, o_nrm = 0, o_num = 0, o_ns = 0, o_tck = 0;
@@ -938,8 +956,13 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     len = (size_t)st.st_size;
     if (dend && dend < (u64)len) len = (size_t)dend;               /* the digests and parity after it are not data */
     if ((v7 || i8rows) && STORE_R32(f, ext, 4)) { fclose(f); return (RagStore *)0; }
-    if (v7) { i8rows = ext[0] & 1; texts = (hdr[1] == STORE_VERSION8 || hdr[1] == STORE_VERSION9) && (ext[0] & 2); stamp = (u64)(u32)ext[2] | ((u64)(u32)ext[3] << 32); }
+    if (v7) { i8rows = ext[0] & 1; texts = (hdr[1] == STORE_VERSION8 || STORE_V9UP(hdr[1])) && (ext[0] & 2); stamp = (u64)(u32)ext[2] | ((u64)(u32)ext[3] << 32); }
     else if (i8rows && ext[0] != 1) { fclose(f); return (RagStore *)0; }
+    if (v7 && (ext[0] & ~STORE_FLAGS_KNOWN)) {                   /* a feature of a newer build: refused, never misread */
+        sprintf(store_lerr_, "was written by a newer vecindex (features 0x%x this build does not know): open it with that version or later",
+                (unsigned)(ext[0] & ~STORE_FLAGS_KNOWN));
+        fclose(f); return (RagStore *)0;
+    }
     s = store_new(a, dim);
     if (!s->addbuf) {                                            /* not even one row of that dimension fits in memory */
         sprintf(store_lerr_, "no memory for one row of %d dimensions", (int)dim);
@@ -953,8 +976,8 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     else o_ids = STORE_AL(o_vecs + (size_t)live * (size_t)dim * 4);
     o_meta = STORE_AL(o_ids + (size_t)live * 8);
     o_kind = o_meta + (size_t)live * 8;
-    if (hdr[1] == STORE_VERSION9) { o_rck = STORE_AL(o_kind); o_kind = o_rck + (size_t)live * 4; }   /* the rows' checks */
-    if (hdr[1] == STORE_VERSION9 && ext[1]) {                    /* a dot or L2 store: the rows' lengths */
+    if (STORE_V9UP(hdr[1])) { o_rck = STORE_AL(o_kind); o_kind = o_rck + (size_t)live * 4; }   /* the rows' checks */
+    if (STORE_V9UP(hdr[1]) && ext[1]) {                    /* a dot or L2 store: the rows' lengths */
         if (ext[1] < 0 || ext[1] > 2) { fclose(f); store_destroy(s); return (RagStore *)0; }
         s->metric = ext[1];
         o_nrm = STORE_AL(o_kind); o_kind = o_nrm + (size_t)live * 4;
@@ -970,20 +993,20 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
         o_kind = o_heap + (size_t)hlen;
         s->has_text = 1;
     }
-    if (hdr[1] == STORE_VERSION9 && (ext[0] & 4)) {             /* the label table */
+    if (STORE_V9UP(hdr[1]) && (ext[0] & 4)) {             /* the label table */
         if ((vz && ssum_vouch_(vz, path, ro, (u64)STORE_AL(o_kind), (u64)STORE_LABELS * (STORE_LABEL_NAME + 8)))
             || store_labels_r_(s, f, STORE_AL(o_kind), len) != 0) { fclose(f); store_destroy(s); return (RagStore *)0; }
         o_kind = STORE_AL(o_kind) + (size_t)STORE_LABELS * (STORE_LABEL_NAME + 8);
     }
-    if (hdr[1] == STORE_VERSION9 && (ext[0] & 8)) {             /* the rows' numbers */
+    if (STORE_V9UP(hdr[1]) && (ext[0] & 8)) {             /* the rows' numbers */
         o_num = STORE_AL(o_kind); o_kind = o_num + (size_t)live * 8;
         s->has_num = 1;
     }
-    if (hdr[1] == STORE_VERSION9 && (ext[0] & 16)) {            /* the rows' namespaces */
+    if (STORE_V9UP(hdr[1]) && (ext[0] & 16)) {            /* the rows' namespaces */
         o_ns = STORE_AL(o_kind); o_kind = o_ns + (size_t)live * 8;
         s->has_ns = 1;
     }
-    if (hdr[1] == STORE_VERSION9 && (ext[0] & 32)) {            /* the texts' CRCs */
+    if (STORE_V9UP(hdr[1]) && (ext[0] & 32)) {            /* the texts' CRCs */
         o_tck = STORE_AL(o_kind); o_kind = o_tck + (size_t)live * 4;
     }
     if (o_kind >= len) { fclose(f); store_destroy(s); return (RagStore *)0; }
@@ -1053,7 +1076,7 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     }
     s->stamp = stamp;
     store_journal_replay_(s, path);
-    return s;
+    return store_jnewer_(s);
 }
 
 static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
@@ -1076,10 +1099,14 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
     sums = store_sum_load_(path, ro, lvl == 3 ? 1 : lvl, &z, &bad, &fixed, &ubad);
     if (sums < 0) { strcpy(store_lerr_, "some blocks could not be read to check them"); return (RagStore *)0; }
     if (!(f = fopen(path, "rb"))) { free(z.tab); return (RagStore *)0; }
-    if (STORE_R32(f, hdr, 4) || (u32)hdr[0] != STORE_MAGIC
-        || (hdr[1] != 4 && hdr[1] != STORE_VERSION && hdr[1] != STORE_VERSION_I8 && hdr[1] != STORE_VERSION7
-            && hdr[1] != STORE_VERSION8 && hdr[1] != STORE_VERSION9)) { fclose(f); free(z.tab); return (RagStore *)0; }
-    if (hdr[1] == STORE_VERSION9 && !sums && lvl > 0) {
+    if (STORE_R32(f, hdr, 4) || (u32)hdr[0] != STORE_MAGIC) { fclose(f); free(z.tab); return (RagStore *)0; }
+    if (hdr[1] > STORE_VERSION10) {                              /* a newer format: refused, never misread */
+        sprintf(store_lerr_, "was written by a newer vecindex (file version %d; this build reads 4 to %d)", (int)hdr[1], STORE_VERSION10);
+        fclose(f); free(z.tab); return (RagStore *)0;
+    }
+    if (hdr[1] != 4 && hdr[1] != STORE_VERSION && hdr[1] != STORE_VERSION_I8 && hdr[1] != STORE_VERSION7
+        && hdr[1] != STORE_VERSION8 && !STORE_V9UP(hdr[1])) { fclose(f); free(z.tab); return (RagStore *)0; }
+    if (STORE_V9UP(hdr[1]) && !sums && lvl > 0) {
         strcpy(store_lerr_, "neither copy of its checksums can be read (VECINDEX_VERIFY=0 loads it unchecked)");
         fclose(f);
         return (RagStore *)0;
@@ -1132,7 +1159,7 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
     }
     store_journal_replay_(s, path);
     store_lerr_[0] = 0;
-    return s;
+    return store_jnewer_(s);
 }
 
 RagStore *store_load(Arena *a, const char *path) { return store_load_impl_(a, path, 0); }

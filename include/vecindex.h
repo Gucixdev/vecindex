@@ -47,7 +47,7 @@ typedef int64_t vi_i64;
 
 typedef struct vi_db vi_db;
 
-#define VI_VERSION "0.3.0"
+#define VI_VERSION "0.4.0"
 
 /* flags for vi_open. By default rows are indexed as they come and the index is rebuilt as it ages, by a thread of the
  * store's own: there is no vi_build to forget. VI_MANUAL turns that off (then vi_build indexes what was added; until

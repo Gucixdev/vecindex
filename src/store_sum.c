@@ -438,11 +438,11 @@ const char *store_load_error(void) { return store_lerr_; }
  * at level 1), damaged ones rebuilt and written back unless ro. 1 when the file has checksums (*z: its layout, z->tab
  * kept for the caller; *bad, *fixed, *ubad as ssum_check_), 0 when it has none that can be read, -1 when they could
  * not all be checked. */
-/* 1 when the file open as fd says it is a v9 store in its header */
+/* 1 when the file open as fd says it is a v9 (or v10) store in its header */
 static i32 ssum_v9_(int fd)
 {
     u8 hd[8];
-    return ssum_read_(fd, hd, 8, 0) == 0 && ssum_get_(hd, 4) == STORE_MAGIC && ssum_get_(hd + 4, 4) == STORE_VERSION9;
+    return ssum_read_(fd, hd, 8, 0) == 0 && ssum_get_(hd, 4) == STORE_MAGIC && STORE_V9UP(ssum_get_(hd + 4, 4));
 }
 
 static i32 store_sum_load_(const char *path, i32 ro, i32 lvl, SSum *z, i64 *bad, i64 *fixed, u64 *ubad)

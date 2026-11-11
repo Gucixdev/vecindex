@@ -173,6 +173,12 @@ static void store_prefetch_row_(const f32 *row, i32 dim)
                                      * store that holds texts */
 #define STORE_VERSION9 9            /* v9: the v7/v8 layout (texts: flags bit 1), then block digests, Reed-Solomon
                                      * parity and two copies of the table of digests and its trailer (store_sum.c) */
+#define STORE_VERSION10 10          /* v10: v9 with features a v9 reader does not know (flags 8 numbers, 16 namespaces, 32
+                                     * text CRCs) and would misread: so that it refuses the file. A store without them is
+                                     * still written as v9, which every reader since v9 opens (docs/format.md) */
+#define STORE_FLAGS_V9 7            /* the flags a v9 reader knows: int8 rows, texts, labels */
+#define STORE_FLAGS_KNOWN 63        /* every flag this build reads: a file with another is from a newer build, refused */
+#define STORE_V9UP(v) ((v) == STORE_VERSION9 || (v) == STORE_VERSION10)   /* the v9 layout, with its digests and parity */
 #define STORE_LABELS 64             /* labels: names for the 64 bits of a row's tag (store_label.c) */
 #define STORE_LABEL_NAME 64         /* bytes of a label's name, its 0 included */
 #define STORE_SUM_K 32              /* data blocks a parity group, by default */
@@ -306,6 +312,7 @@ typedef struct {
     i32      vreads;        /* test every row a search uses against its check (store_set_check_reads; default on) */
     i64      rot_rows, rot_healed;   /* rows that failed their check and stayed out, and those rebuilt from parity */
     i32      jdamaged;      /* the journal had a damaged record or header: its copy is PATH.j.damaged */
+    i32      jnewer;        /* the op of a whole journal record this build does not know: a newer build's, the load refused */
 
     i32      idmap_ok;      /* 0: nsorted / ids_h / dup are rebuilt on the next lookup (after a load or a compaction) */
     i32      nsorted;       /* rows [0, nsorted) carry strictly increasing ids: found by binary search, nothing stored */
