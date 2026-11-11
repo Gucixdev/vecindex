@@ -247,12 +247,12 @@ static i32 store_jsync_(RagStore *s, u64 seq)
         fd[0] = fd[1] = -1;
         pthread_rwlock_wrlock(&s->lock);
         at = s->jseq;
-        if (s->jf) { if (fflush(s->jf) != 0) r = -1; else fd[0] = dup(fileno(s->jf)); }
-        if (s->jf2) { if (fflush(s->jf2) != 0) r = -1; else fd[1] = dup(fileno(s->jf2)); }
+        if (s->jf) { if (fflush(s->jf) != 0) r = -1; else fd[0] = store_fd_dup_(fileno(s->jf)); }
+        if (s->jf2) { if (fflush(s->jf2) != 0) r = -1; else fd[1] = store_fd_dup_(fileno(s->jf2)); }
         gen = store_jmark_(s, sz);
         pthread_rwlock_unlock(&s->lock);
         for (i = 0; i < 2; ++i)
-            if (fd[i] >= 0) { if (fsync(fd[i]) != 0) r = -1; close(fd[i]); }
+            if (fd[i] >= 0) { if (fsync(fd[i]) != 0) r = -1; store_fd_drop_(fd[i]); }
         if (r == 0) { s->jsynced = at; store_jdur_(s, gen, sz); }
     }
     pthread_mutex_unlock(&s->jsync_mu);

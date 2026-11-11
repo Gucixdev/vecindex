@@ -77,6 +77,9 @@
 #define _FILE_OFFSET_BITS 64    /* 64-bit file offsets on 32-bit CPUs too: the journal and the spill file can grow past 2 GB */
 #endif
 #define ARENA_FLAT_RESERVE_BYTES ((size_t)1 << (sizeof(size_t) > 4 ? 34 : 28))  /* 16 GB of address space; 256 MB on 32-bit */
+#if defined(__wasi__) && !defined(ARENA_BACKEND)
+#define ARENA_BACKEND 0                 /* WebAssembly has no address space to reserve: regions from malloc */
+#endif
 #define ENGINE_THREADS
 #define ENGINE_SERIALIZE
 #define PRINT_IMPLEMENTATION
@@ -91,11 +94,25 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#ifdef __wasi__
+#include "wasi_shim.h"                                           /* WebAssembly: no processes, no signals (bindings/js) */
+#else
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
+#endif
 #include <errno.h>
 #include <sched.h>
+
+/* A descriptor to fsync outside the lock: a copy (dup), closed after. WASI has no dup, and one thread: the
+ * descriptor itself, left open. */
+#ifdef __wasi__
+static int store_fd_dup_(int fd) { return fd; }
+static void store_fd_drop_(int fd) { (void)fd; }
+#else
+static int store_fd_dup_(int fd) { return dup(fd); }
+static void store_fd_drop_(int fd) { close(fd); }
+#endif
 #include "hdict.c"
 #include "lex.c"
 #include "tq.c"
