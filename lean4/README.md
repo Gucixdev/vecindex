@@ -30,7 +30,7 @@ four links, and each is either proved or checked by a program:
    top-k insertion. The C side is built three times (`-march=native`, `haswell`, `x86-64`), so the AVX-512, AVX2
    and scalar kernels and both CRC paths (SSE4.2 and the table) meet the same oracle.
 4. **Does the test catch a wrong kernel?** `mutants` breaks the C code on purpose, one small change at a time in a
-   copy of `src/`, and checks that the step covering it fails. 23 of 25 mutants are caught; the two that survive change
+   copy of `src/`, and checks that the step covering it fails. 25 of 27 mutants are caught; the two that survive change
    code no input reaches: the row swap of `gf_invert_`, and the replica walk's cap on a frame's length, which only a
    journal past 1 GB could exercise (see Findings).
 
@@ -61,7 +61,7 @@ On a 2-vCPU Xeon with AVX-512, 2026-11-11:
 =================== lean4 summary ===================
   STEP                   RESULT  WHAT IT CHECKED
   lake build             ok      2743 jobs, proofs and oracle
-  axiom audit            ok      705 theorems (250 written in the sources)
+  axiom audit            ok      733 theorems (253 written in the sources)
   source scan            ok      no sorry, admit, native_decide, bv_decide or axiom
   gen/trustlean.c        ok      printed by TrustLean from the proved programs
   gf native              ok      260 lines: every table entry and product, the coefficients hashed
@@ -77,7 +77,8 @@ On a 2-vCPU Xeon with AVX-512, 2026-11-11:
   tenant                 ok      2666 cases: edges of ids, ranges, tenants, numbers in the key file; and random, seed 20261111
   journal                ok      300 cases: journals torn, flipped, past the cap, wrong stamp: random, seed 20261111
   rate                   ok      300 cases: runs of 200 requests, f64 exact: random, seed 20261111
-  34 steps, all ok   (52 s)
+  ... nsset (3000 random cases) on every -march as well ...
+  37 steps, all ok   (122 s)
 ```
 
 The nine checks in C alone (`c/diff.c props`): `tq_code_` counts the boundaries below the value (random values,
@@ -109,6 +110,7 @@ m + 1 is reported as damaged, not passed off as rebuilt.
 | `vs_in_`, `vs_out_`, `vs_rin_`, `vs_own_`, the tenant number of `vs_keys_load_` (`vserv_keys.c`) | `Tenant.lean` | `out_in`: a wire id comes back as itself; `in_inj`: no two tenants share a store id; `in_fits`: tenant << 44 stays positive inside i64; `rin_exact`, `rin_none`: a tenant's range reaches exactly its own ids in the range; `own_iff`: the hybrid post-filter keeps exactly the tenant's rows; `parse_iff`: the key file takes a tenant number exactly when it is digits of a value 1 to 524287, `parse_bound`: no intermediate value past 5242879 |
 | `vs_rjtrim_` (`vserv_repl.c`), the frame of `store_jframe_` (`store_batch.c`) | `Journal.lean` | `walk_frames`: a journal of whole frames is kept whole; `walk_take`, `good_take`, `trim_take`: any prefix of the primary's journal (a replica killed mid-write) keeps exactly the frames that arrived whole - the primary's header and first k frames, never a piece of a record; `resume`: the rest from that offset gives the primary's journal back. For any checksum into u32 |
 | `vs_bucket_` (`vserv_keys.c`) | `Rate.lean` | `step_inv`: the tokens stay in [0, qps]; `window`: of any run of requests from t1 to t2 at most qps + qps (t2 - t1) get through, whatever came before; `wait_ok`: after 1/qps of quiet a request is let through |
+| `tq_in_set_` (`tq.c`), the namespace set of `store_search_nss` | `NsSet.lean` | `inSet_iff`: on a set sorted ascending without repeats, the branchless lower bound answers exactly membership; `go_lt`: it reads only inside the set |
 
 ## TrustLean and AMO-Lean
 

@@ -39,6 +39,8 @@ mutants=(
 "replica walk: the header's CRC not checked@vserv_repl.c@s/store_crc32c_(h + 4, 12) == vs_le32_(h + 16)/1/@native@journal@caught"
 "replica walk: a length past STORE_BATCH_MAX taken (only a journal past 1 GB holds such a frame whole; in the test files the bytes run out first, the same stop)@vserv_repl.c@s/if ((size_t)n > STORE_BATCH_MAX) break;/if (0) break;/@native@journal@survives"
 "bucket: never above qps + 1 instead of qps@vserv_keys.c@s/if (\*tokens > qps) \*tokens = qps;/if (*tokens > qps + 1.0) *tokens = qps + 1.0;/@native@rate@caught"
+"namespace set: the probe one to the right@tq.c@s/b += (b\[h - 1\] < v) ? h : 0;/b += (b[h] < v) ? h : 0;/@native@nsset@caught"
+"namespace set: <= instead of <@tq.c@s/b += (b\[h - 1\] < v) ? h : 0;/b += (b[h - 1] <= v) ? h : 0;/@native@nsset@caught"
 "bucket: a request needs more than one token@vserv_keys.c@s/ok = \*tokens >= 1.0;/ok = *tokens > 1.0;/@native@rate@caught"
 )
 
@@ -60,7 +62,7 @@ for row in "${mutants[@]}"; do
         gf|digits|vd|layout|chunks)
             "$ORACLE" "$check" > "$d/want"; "$bin" "$check" > "$d/got" || true
             cmp -s "$d/want" "$d/got" || caught=1 ;;
-        crc|block|topk|tenant|journal|rate)
+        crc|block|topk|nsset|tenant|journal|rate)
             "$bin" "cases-$check" 300 1 > "$d/in"
             "$ORACLE" "$check" < "$d/in" > "$d/want"; "$bin" "$check" < "$d/in" > "$d/got" || true
             cmp -s "$d/want" "$d/got" || caught=1 ;;

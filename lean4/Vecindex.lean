@@ -21,3 +21,4 @@ import Vecindex.CodeGen
 import Vecindex.Tenant
 import Vecindex.Journal
 import Vecindex.Rate
+import Vecindex.NsSet

@@ -11,6 +11,7 @@
     vecindex-oracle crc       stdin: messages as hex lines; out: their CRC-32C
     vecindex-oracle block     stdin: cases "vd, 16 vd code bytes, 16 vd table bytes"; out: the 32 row sums
     vecindex-oracle topk      stdin: cases "k n, then n (id score)"; out: the kept (id score) pairs
+    vecindex-oracle nsset     stdin: cases "n v, then n sorted values"; out: tq_in_set_'s answer
     vecindex-oracle tenant    stdin: "in TN X", "out TN Y", "rin TN LO HI", "own TN Y", "parse HEX"; out: the results
     vecindex-oracle journal   stdin: "journal STAMP HEX" (the stamp of the file beside it, the journal's bytes);
                               out: the good part vs_rjtrim_ keeps
@@ -106,6 +107,12 @@ partial def topkOut (xs : List Int) : IO Unit := do
     topkOut (rest.drop (2 * n.toNat))
   | _ => pure ()
 
+partial def nssetOut (xs : List Int) : IO Unit := do
+  match xs with
+  | n :: v :: rest =>
+    IO.println ("nsset " ++ (if NsSet.inSet (rest.take n.toNat) v then "1" else "0"))
+    nssetOut (rest.drop n.toNat)
+  | _ => pure ()
 
 def showOpt (o : Option Int) : String := match o with | some v => toString v | none => "none"
 
@@ -171,7 +178,8 @@ def main (args : List String) : IO UInt32 := do
   | ["crc"] => crcOut (← (← IO.getStdin).readToEnd); pure 0
   | ["block"] => blockOut (numbers (← (← IO.getStdin).readToEnd)); pure 0
   | ["topk"] => topkOut (ints (← (← IO.getStdin).readToEnd)); pure 0
+  | ["nsset"] => nssetOut (ints (← (← IO.getStdin).readToEnd)); pure 0
   | ["tenant"] => tenantOut (← (← IO.getStdin).readToEnd); pure 0
   | ["journal"] => journalOut (← (← IO.getStdin).readToEnd); pure 0
   | ["rate"] => rateOut (← (← IO.getStdin).readToEnd); pure 0
-  | _ => IO.eprintln "usage: vecindex-oracle gen|gf|digits|vd|layout|chunks|crc|block|topk|tenant|journal|rate"; pure 2
+  | _ => IO.eprintln "usage: vecindex-oracle gen|gf|digits|vd|layout|chunks|crc|block|topk|nsset|tenant|journal|rate"; pure 2

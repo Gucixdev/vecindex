@@ -595,6 +595,18 @@ VI_API int vi_search_ns(vi_db *db, vi_i64 ns, const float *query, int k, vi_i64 
     return n;
 }
 
+VI_API int vi_search_in(vi_db *db, const vi_i64 *ns, int n, const float *query, int k, vi_i64 *ids, float *scores)
+{
+    int r;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    if (n < 1 || !ns) return vi_fail_(-1, "no namespace to search in", (const char *)0, (const char *)0);
+    r = store_search_nss(db->s, (const i64 *)ns, (i32)n, query, (i32)k, (i64 *)ids, scores);
+    if (r < 0) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    vi_cos_(db, scores, r);
+    return r;
+}
+
 VI_API vi_i64 vi_delete_ns(vi_db *db, vi_i64 ns)
 {
     if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);

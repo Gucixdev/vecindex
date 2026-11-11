@@ -213,6 +213,38 @@ static void cases_topk_(i32 n)
     }
 }
 
+/* the namespace set of a search over several (tq_in_set_): cases "n v a1 .. an", the set sorted without repeats */
+static void nsset_in_(void)
+{
+    i64 n, v, a[64];
+    i32 i;
+    while (read_i_(&n) && read_i_(&v)) {
+        for (i = 0; i < n; ++i) if (!read_i_(&a[i])) return;
+        printf("nsset %d\n", (int)tq_in_set_(a, (i32)n, v));
+    }
+}
+
+static void cases_nsset_(i32 n)
+{
+    i32 c, i, m;
+    i64 a[64], v;
+    for (c = 0; c < n * 10; ++c) {
+        m = 1 + (i32)(rnd32_() % 40u);
+        a[0] = (c % 7 == 0) ? -(i64)(((u64)1 << 62) - 1) * 2 - 2 : (i64)(rnd32_() % 41u) - 20;   /* i64's minimum, at times */
+        for (i = 1; i < m; ++i) a[i] = a[i - 1] + 1 + (i64)(rnd32_() % 5u);
+        if (c % 11 == 0) a[m - 1] = (i64)(((u64)1 << 63) - 1);                                   /* ... and maximum */
+        switch (rnd32_() % 4u) {
+        case 0: v = a[rnd32_() % (u32)m]; break;                                                  /* a member */
+        case 1: v = a[0] > -(i64)(((u64)1 << 62)) ? a[0] - 1 - (i64)(rnd32_() % 3u) : a[0]; break;   /* below, or the least */
+        case 2: v = a[m - 1] == (i64)(((u64)1 << 63) - 1) ? a[m - 1] : a[m - 1] + 1; break;       /* above, or the most */
+        default: v = a[rnd32_() % (u32)m] + 1; break;                                             /* next to one */
+        }
+        printf("%d ", (int)m); put_i64_(v);
+        for (i = 0; i < m; ++i) { putchar(' '); put_i64_(a[i]); }
+        putchar('\n');
+    }
+}
+
 /* ---- checked in C alone ---- */
 
 static i32 count_below_(f32 v) { i32 i, c = 0; for (i = 0; i < 15; ++i) c += v > TQ_B[i]; return c; }
@@ -402,9 +434,11 @@ int main(int argc, char **argv)
     else if (!strcmp(cmd, "crc")) crc_in_();
     else if (!strcmp(cmd, "block")) block_in_();
     else if (!strcmp(cmd, "topk")) topk_in_();
+    else if (!strcmp(cmd, "nsset")) nsset_in_();
     else if (!strcmp(cmd, "cases-crc")) cases_crc_(n);
     else if (!strcmp(cmd, "cases-block")) cases_block_(n);
     else if (!strcmp(cmd, "cases-topk")) cases_topk_(n);
+    else if (!strcmp(cmd, "cases-nsset")) cases_nsset_(n);
     else if (!strcmp(cmd, "props")) {
         props_codes_(n * 1000);
         props_trustlean_(n);

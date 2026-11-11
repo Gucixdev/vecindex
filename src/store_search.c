@@ -37,7 +37,7 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
     memset(&tf, 0, sizeof(tf));
     if (filtered) { tf.meta = &mcol; tf.all = all_bits; tf.any = any_bits; }
     if (cnf && cnf->num && s->has_num) { ncol = store_tqcol_(&s->numc); tf.num = &ncol; tf.lo = cnf->lo; tf.hi = cnf->hi; }
-    if (cnf && cnf->ns_on && s->has_ns) { scol = store_tqcol_(&s->nsc); tf.ns = &scol; tf.nsv = cnf->ns; }
+    if (cnf && cnf->ns_on && s->has_ns) { scol = store_tqcol_(&s->nsc); tf.ns = &scol; tf.nsv = cnf->ns; tf.nss = cnf->nss; tf.nns = cnf->nns; }
 
     exact = store_ns_exact_(s, cnf, qn, qlen, k, out_doc_ids, out_scores, &have);   /* a small namespace: its own rows */
     if (exact) {}

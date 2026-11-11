@@ -1776,7 +1776,7 @@ void store_build(RagStore *s)
 
 /* conditions of a search: every mask of any[0..n) shared by the row's tag, none of none; with num, the row's number
  * in [lo, hi] (a store without numbers: every row's is 0) */
-typedef struct { i32 n; u64 any[16]; u64 none; i32 num; i64 lo, hi; i32 ns_on; i64 ns; } StoreCnf;   /* ns_on: the row's
+typedef struct { i32 n; u64 any[16]; u64 none; i32 num; i64 lo, hi; i32 ns_on; i64 ns; const i64 *nss; i32 nns; } StoreCnf;   /* ns_on: the row's
                                                                   * namespace is ns */
 static i32 store_cnf_ok_(const RagStore *s, const StoreCnf *c, i32 row)
 {
@@ -1785,7 +1785,7 @@ static i32 store_cnf_ok_(const RagStore *s, const StoreCnf *c, i32 row)
     if (m & c->none) return 0;
     for (i = 0; i < c->n; ++i) if (!(m & c->any[i])) return 0;
     if (c->num) { i64 v = s->has_num ? STORE_NUM(s, row) : 0; if (v < c->lo || v > c->hi) return 0; }
-    if (c->ns_on && STORE_NSOF(s, row) != c->ns) return 0;
+    if (c->ns_on) { i64 v = STORE_NSOF(s, row); if (c->nns ? !tq_in_set_(c->nss, c->nns, v) : v != c->ns) return 0; }
     return 1;
 }
 

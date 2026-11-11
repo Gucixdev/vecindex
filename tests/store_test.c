@@ -621,6 +621,41 @@ static i32 sd_nums_(Arena *a)
         }
         print_cstr(iso && okr ? "  namespaces: a big one through the IVF scan - 10 of its 50 rows in 20000, none of another; with a range its one row\n" : "  namespaces in the scan FAILED\n");
         if (!iso || !okr) ok = 0;
+        {   /* several at once (store_search_nss): through the scan, only rows of the set and of both namespaces; exact
+             * (the lists small enough together), the merge of the namespaces' own exact searches, whatever the order,
+             * repeats or unknown namespaces in the set */
+            i64 set1[2], set2[5], ia[10], ib[10], m2[20];
+            f32 sa[10], sb[10], ms[20];
+            i32 inset = 1, both7 = 0, both9 = 0, same = 1, na, nb, z, h;
+            set1[0] = 9; set1[1] = 7;
+            set2[0] = 7; set2[1] = 12345; set2[2] = 9; set2[3] = 7; set2[4] = -3;
+            for (i = 200; i < SDC_N; i += 400) if (store_set_ns(s, i, 7) != 0) inset = 0;
+            for (q = 0; q < 30; ++q) {
+                nn = store_search_nss(s, set1, 2, x + (size_t)(q * 97 + 3) * SDC_DIM, 10, ids, sc);
+                if (nn != 10) inset = 0;
+                for (j = 0; j < nn; ++j) { if (ids[j] % 400 == 0) ++both9; else if (ids[j] % 400 == 200) ++both7; else inset = 0; }
+            }
+            store_ns_exact_max_ = keepx;
+            for (q = 0; q < 30; ++q) {
+                const f32 *qv = x + (size_t)(q * 89 + 11) * SDC_DIM;
+                nn = store_search_nss(s, set2, 5, qv, 10, ids, sc);
+                na = store_search_ns(s, 9, qv, 10, ia, sa);
+                nb = store_search_ns(s, 7, qv, 10, ib, sb);
+                for (z = h = 0; z < na; ++z) { m2[h] = ia[z]; ms[h++] = sa[z]; }
+                for (z = 0; z < nb; ++z) { m2[h] = ib[z]; ms[h++] = sb[z]; }
+                for (z = 0; z < h; ++z) {                        /* best first: a selection sort of at most 20 */
+                    i32 b2 = z, y;
+                    for (y = z + 1; y < h; ++y) if (ms[y] > ms[b2]) b2 = y;
+                    { i64 ti = m2[z]; f32 ts = ms[z]; m2[z] = m2[b2]; ms[z] = ms[b2]; m2[b2] = ti; ms[b2] = ts; }
+                }
+                if (nn != (h < 10 ? h : 10)) same = 0;
+                for (j = 0; same && j < nn; ++j) if (ids[j] != m2[j]) same = 0;
+            }
+            print_cstr(inset && both7 && both9 && same ? "  several namespaces: through the scan only rows of the set, of both; exact, the merge of each one's exact search\n"
+                                                       : "  several namespaces FAILED\n");
+            if (!inset || !both7 || !both9 || !same) ok = 0;
+            for (i = 200; i < SDC_N; i += 400) store_set_ns(s, i, 0);
+        }
         store_ns_exact_max_ = keepx;
         store_set_cascade(s, 1);
     }

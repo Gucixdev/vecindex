@@ -116,15 +116,24 @@ static i32 store_ns_exact_(RagStore *s, const StoreCnf *cnf, const f32 *qn, f32 
     StoreNs *x;
     StoreNsL *l;
     i32 i;
-    if (!cnf || !cnf->ns_on || !cnf->ns) return 0;
+    i32 j, nl = cnf && cnf->nns ? cnf->nns : 1;
+    i64 tot = 0;
+    if (!cnf || !cnf->ns_on || (!cnf->nns && !cnf->ns)) return 0;
+    if (cnf->nns && tq_in_set_(cnf->nss, cnf->nns, 0)) return 0;   /* 0 (no namespace) has no list: scan */
     if (!s->has_ns) { *have = 0; return 1; }                     /* no namespaces yet: none has a row */
     if (!(x = store_ns_get_(s))) return 0;
-    if (!(l = store_ns_slot_(x, cnf->ns, 0))) { *have = 0; return 1; }
-    if (l->n > store_ns_exact_max_) return 0;
-    for (i = 0; i < l->n; ++i) {
-        i32 r = l->rows[i];
-        if (r < 0 || r >= s->count || STORE_DEAD(s, r) || !store_cnf_ok_(s, cnf, r) || store_row_bad_(s, r)) continue;
-        eng_topk_(rows, sc, k, have, (i64)r, store_score_(s, qn, qlen, r));
+    for (j = 0; j < nl; ++j) {                                   /* several: exact when their lists together are small */
+        l = store_ns_slot_(x, cnf->nns ? cnf->nss[j] : cnf->ns, 0);
+        if (l && (tot += l->n) > store_ns_exact_max_) return 0;
+    }
+    *have = 0;
+    for (j = 0; j < nl; ++j) {
+        if (!(l = store_ns_slot_(x, cnf->nns ? cnf->nss[j] : cnf->ns, 0))) continue;
+        for (i = 0; i < l->n; ++i) {
+            i32 r = l->rows[i];
+            if (r < 0 || r >= s->count || STORE_DEAD(s, r) || !store_cnf_ok_(s, cnf, r) || store_row_bad_(s, r)) continue;
+            eng_topk_(rows, sc, k, have, (i64)r, store_score_(s, qn, qlen, r));
+        }
     }
     return 1;
 }

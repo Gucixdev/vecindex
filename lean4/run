@@ -72,7 +72,7 @@ for arch in native haswell x86-64; do
             rec "$t $arch" ok "$(wc -l < "$OUT/out/$t.lean") lines: ${WHAT[$t]}"
         else diff "$OUT/out/$t.lean" "$OUT/out/$t.$arch" | head -5; rec "$t $arch" FAIL; fi
     done
-    for t in crc block topk; do
+    for t in crc block topk nsset; do
         "$bin" "cases-$t" "$N" "$SEED" > "$OUT/out/$t.in"
         "$ORACLE" "$t" < "$OUT/out/$t.in" > "$OUT/out/$t.lean"
         "$bin" "$t" < "$OUT/out/$t.in" > "$OUT/out/$t.$arch"

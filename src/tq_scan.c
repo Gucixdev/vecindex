@@ -291,7 +291,10 @@ static void *tq_job_(void *arg)
                     i64 v = *(const i64 *)(const void *)TQ_AT(j->f->num, row);
                     if (v < j->f->lo || v > j->f->hi) continue;
                 }
-                if (j->f->ns && *(const i64 *)(const void *)TQ_AT(j->f->ns, row) != j->f->nsv) continue;
+                if (j->f->ns) {
+                    i64 v = *(const i64 *)(const void *)TQ_AT(j->f->ns, row);
+                    if (j->f->nns ? !tq_in_set_(j->f->nss, j->f->nns, v) : v != j->f->nsv) continue;
+                }
             }
             tq_res_push_(&j->res, ((u64)sc[k] << 32) | (u64)(u32)(j->slots ? blk * 32 + k : row));
         }

@@ -627,6 +627,33 @@ int main(void)
             check(hit * 10 >= tot * 8, "vi_search_ns, a namespace of 30000: recall@10 against its own rows at least 0.8");
             vec_(300004, v);
             check(db && vi_search_ns(db, 3, v, 3, got2, sc2) == 3 && got2[0] == 300004, "vi_search_ns, a namespace of 10: the query's own row first");
+            {   /* several namespaces: 1 and 3 together (60 rows) exactly - the 10 nearest of their rows, in order; 1, 2 and
+                 * 0 through the scan: only rows of the three; one namespace is vi_search_ns; none is refused */
+                vi_i64 s13[3], s120[4], g3[10];
+                float c3[10];
+                int q, m3, okin = 1, okex = 1, ok1 = 1;
+                s13[0] = 3; s13[1] = 1; s13[2] = 3;
+                s120[0] = 2; s120[1] = 0; s120[2] = 1; s120[3] = 2;
+                for (j = 0; db && j < 20; ++j) {
+                    vec_(600000 + j, v);
+                    m3 = vi_search_in(db, s13, 3, v, 10, g3, c3);
+                    na = vi_search(db, v, 33000, all, as);
+                    for (q = want = 0; q < na && want < 10; ++q)
+                        if ((all[q] >= 100000 && all[q] < 100050) || (all[q] >= 300000 && all[q] < 300010))   /* 100008 moves to 3: still in */
+                            okex &= want < m3 && all[q] == g3[want++];
+                    okex &= m3 == 10 && want == 10;
+                    m3 = vi_search_in(db, s120, 4, v, 10, g3, c3);
+                    for (q = 0; q < m3; ++q) okin &= (g3[q] >= 100000 && g3[q] < 100050) || (g3[q] >= 200000 && g3[q] < 230000) || g3[q] >= 400000;
+                    okin &= m3 == 10;
+                    m3 = vi_search_in(db, s13 + 1, 1, v, 10, g3, c3);
+                    n1 = vi_search_ns(db, 1, v, 10, got2, sc2);
+                    ok1 &= m3 == n1;
+                    for (q = 0; q < m3 && q < n1; ++q) ok1 &= g3[q] == got2[q];
+                }
+                check(okex, "vi_search_in {3, 1, 3}: the exact 10 nearest of the two namespaces' rows, in order");
+                check(okin, "vi_search_in {2, 0, 1, 2}: only rows of those namespaces (1, 2 and none)");
+                check(ok1 && db && vi_search_in(db, s13, 0, v, 10, g3, c3) == -1, "vi_search_in of one namespace is vi_search_ns; of none, refused");
+            }
             if (pass == 0) {
                 vec_(100007, w); w[0] += 0.01f;
                 check(db && vi_add(db, 100007, w) == 0 && vi_get_ns(db, 100007, &tag) == 0 && tag == 1 && vi_count_ns(db, 1) == 50,

@@ -206,6 +206,10 @@ VI_API int vi_add_ns(vi_db *db, vi_i64 ns, vi_i64 id, const float *vec, const ch
 VI_API int vi_set_ns(vi_db *db, vi_i64 id, vi_i64 ns);
 VI_API int vi_get_ns(vi_db *db, vi_i64 id, vi_i64 *ns);
 VI_API int vi_search_ns(vi_db *db, vi_i64 ns, const float *query, int k, vi_i64 *ids, float *scores);
+/* vi_search_ns over several namespaces at once: the rows of any of ns[0, n) (any order, repeats allowed; a name is
+ * vi_key(name, -1)), the k best of all of them. The set is tested inside the scan (log2 n steps a candidate), and
+ * namespaces small enough together are searched exactly over their own rows. */
+VI_API int vi_search_in(vi_db *db, const vi_i64 *ns, int n, const float *query, int k, vi_i64 *ids, float *scores);
 VI_API vi_i64 vi_delete_ns(vi_db *db, vi_i64 ns);
 VI_API vi_i64 vi_count_ns(vi_db *db, vi_i64 ns);
 

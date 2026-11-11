@@ -188,3 +188,22 @@ i32 store_search_ns(RagStore *s, i64 ns, const f32 *query, i32 k, i64 *ids, f32 
     return store_search_cnf(s, query, k, ids, scores, &c);
 }
 
+/* store_search over the rows of any of the namespaces ns[0, n) (any order, repeats allowed): -1 for n < 1 */
+i32 store_search_nss(RagStore *s, const i64 *ns, i32 n, const f32 *query, i32 k, i64 *ids, f32 *scores)
+{
+    StoreCnf c;
+    i64 *set;
+    i32 i, m, r;
+    if (n < 1) return -1;
+    if (n == 1) return store_search_ns(s, ns[0], query, k, ids, scores);
+    if (!(set = (i64 *)malloc((size_t)n * sizeof(i64)))) return -1;
+    memcpy(set, ns, (size_t)n * sizeof(i64));
+    qsort(set, (size_t)n, sizeof(i64), store_i64_cmp_);
+    for (i = m = 1; i < n; ++i) if (set[i] != set[m - 1]) set[m++] = set[i];
+    memset(&c, 0, sizeof(c));
+    c.ns_on = 1; c.ns = set[0]; c.nss = set; c.nns = m;
+    r = store_search_cnf(s, query, k, ids, scores, &c);
+    free(set);
+    return r;
+}
+
