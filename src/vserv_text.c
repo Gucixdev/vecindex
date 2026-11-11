@@ -19,10 +19,12 @@ static char *vs_txt_(VsWorker *w, i32 need)
 /* upsert with a text (every protocol's add with a text) */
 static i32 vs_put_ns_(VsConn *c, const f32 *v, i64 id, const char *t, i32 n);
 static i32 vs_in_(const VsConn *c, i64 *id);
+static i32 vs_key_room_(const VsConn *c, i64 id);
 static i32 vs_put_text_(VsConn *c, const f32 *v, i64 id, const char *t, i32 n)
 {
     i32 r;
     if (vs_in_(c, &id)) return -2;                               /* a tenant's id: 0 to 2^44 - 1 */
+    if (!vs_key_room_(c, id)) return -3;                         /* the key's row limit */
     if (c->wb) {                                                 /* waits in the open batch, its namespace with it */
         r = store_batch_put_text(c->wb, v, id, 0, t, n);
         return r || !c->tn ? r : store_batch_set_ns(c->wb, id, c->tn);

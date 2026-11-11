@@ -80,3 +80,5 @@
 "&hi="
 "auth "
 "Authorization: Bearer "
+"/metrics"
+"/prometheus"

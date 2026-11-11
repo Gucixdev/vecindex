@@ -23,8 +23,10 @@ static i32 vs_put_(VsConn *c, const f32 *v, i64 id)
 {
     i32 r;
     if (vs_in_(c, &id)) return -2;                               /* a tenant's id: 0 to 2^44 - 1 */
+    if (!vs_key_room_(c, id)) return -3;                         /* the key's row limit */
     if (c->wb) { r = store_batch_put(c->wb, v, id, 0); return r || !c->tn ? r : store_batch_set_ns(c->wb, id, c->tn); }
     r = c->tn ? vs_put_ns_(c, v, id, (const char *)0, 0) : store_put(c->t->s, v, id, 0);
+    if (!r) VS_M_ADD(vs_m_write, 1);
     if (vs_logging_()) vs_log_(c, r != 0, "add id=%ld %s", (long)id, r == 0 ? "ok" : "refused (NaN or Inf)");
     return r;
 }
@@ -36,6 +38,7 @@ static i32 vs_del_(VsConn *c, i64 lo, i64 hi)
     if (vs_rin_(c, &lo, &hi)) return 0;                          /* a tenant's ids only */
     if (c->wb) { if (lo == hi) store_batch_delete(c->wb, lo); else store_batch_delete_range(c->wb, lo, hi); return 0; }
     n = lo == hi ? store_delete(c->t->s, lo) : store_delete_range(c->t->s, lo, hi);
+    VS_M_ADD(vs_m_write, 1);
     if (vs_logging_()) {
         if (lo == hi) vs_log_(c, 0, "del id=%ld removed=%d", (long)lo, n);
         else vs_log_(c, 0, "del lo=%ld hi=%ld removed=%d", (long)lo, (long)hi, n);
@@ -92,6 +95,7 @@ static i32 vs_snapshot_(VsConn *c)
 
 static void vs_logsearch_(VsConn *c, i32 k, i32 got, double t0)
 {
+    vs_m_search_(vs_now_() - t0);
     if (vs_log_all) vs_log_(c, 0, "search k=%d hits=%d us=%.0f", k, got, (vs_now_() - t0) * 1e6);
 }
 
@@ -156,6 +160,7 @@ static i32 vs_update_(VsConn *c, const f32 *v, i64 id)
     if (vs_in_(c, &id)) return -2;
     if (c->wb) return store_batch_update(c->wb, v, id);
     r = store_update(c->t->s, v, id);
+    if (!r) VS_M_ADD(vs_m_write, 1);
     if (vs_logging_()) vs_log_(c, r != 0, "update id=%ld %s", (long)id, r == 0 ? "ok" : "refused (no such id, NaN or Inf)");
     return r;
 }
@@ -167,6 +172,7 @@ static i32 vs_setnum_(VsConn *c, i64 id, i64 num)
     if (vs_in_(c, &id)) return -2;
     if (c->wb) return store_batch_set_num(c->wb, id, num);
     r = store_set_num(c->t->s, id, num);
+    if (!r) VS_M_ADD(vs_m_write, 1);
     if (vs_logging_()) vs_log_(c, r != 0, "num id=%ld num=%ld %s", (long)id, (long)num, r == 0 ? "ok" : "refused (no such id)");
     return r;
 }
@@ -199,7 +205,8 @@ static i32 vs_setnum_(VsConn *c, i64 id, i64 num)
  *   op 19 get a number     payload: i64 id              reply: i64 number (status 1: no row)
  *   op 20 auth             payload: an API key (-K); status 1 with the reason when refused. Until a TCP connection to
  *                          a server with keys shows one, every other op answers status 6. A keyed connection gets
- *                          status 1 for build, save and snapshot (the server's housekeeping) */
+ *                          status 1 for build, save and snapshot (the server's housekeeping); status 7: the key's
+ *                          requests a second are used up */
 
 /* a reply whose payload sits elsewhere (a text): the header, then the payload as it is */
 static void vs_bin_reply_at_(VsWorker *w, VsConn *c, u8 status, u16 count, const char *payload, u32 nbytes)
@@ -253,6 +260,7 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
         return (i32)(8 + nb);
     }
     if (vs_need_key_(c)) { vs_bin_reply_(w, c, 6, 0, (const char *)0, 0); return (i32)(8 + nb); }   /* no key shown yet */
+    if (!vs_key_take_(c)) { vs_bin_reply_(w, c, 7, 0, (const char *)0, 0); return (i32)(8 + nb); }   /* over the key's QPS */
     if (!vs_admin_(c) && (op == 4 || op == 5 || op == 7)) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); return (i32)(8 + nb); }
     if (op == 14) {                                              /* use a tenant: the payload is its name */
         const char *why = nb <= VS_TNAME ? vs_use_(c, (const char *)b, (i32)nb) : "a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -";
@@ -489,6 +497,7 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
         if (why) VS_LINE_ERR(why);
         else vs_line_reply_(w, c, o, vs_str_(o, "ok"));
     } else if (vs_need_key_(c) && !VS_CMD("ping") && !VS_CMD("help") && !VS_CMD("quit")) VS_LINE_ERR("auth KEY first");
+    else if (!vs_key_take_(c)) VS_LINE_ERR("rate limit: the key's requests a second are used up");
     else if (VS_CMD("use")) {                                    /* a tenant server: the store later lines go to */
         const char *e, *f, *why;
         while (*a == ' ' || *a == '\t') ++a;
@@ -511,7 +520,9 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
         }
     } else if (VS_CMD("add")) {
         if (!(a = vs_wint_(a, &x)) || vs_wvec_(w, a) != 0) VS_LINE_ERR("usage: add ID X1 .. XD (D numbers)");
-        else if (vs_put_(c, w->vec, x) != 0) VS_LINE_ERR(c->wb ? "vector has NaN or Inf: the batch will be refused, abort it" : "vector has NaN or Inf");
+        else if ((got = vs_put_(c, w->vec, x)) != 0)
+            VS_LINE_ERR(got == -3 ? "the key's row limit is reached" : (got == -2 ? "a tenant's id is 0 to 2^44 - 1"
+                        : (c->wb ? "vector has NaN or Inf: the batch will be refused, abort it" : "vector has NaN or Inf")));
         else vs_line_reply_(w, c, o, vs_str_(o, c->wb ? "ok queued" : "ok"));
     } else if (VS_CMD("get")) {
         if (!(a = vs_wint_(a, &x)) || *vs_word_(a)) VS_LINE_ERR("usage: get ID");
@@ -588,7 +599,8 @@ static i32 vs_line_(VsWorker *w, VsConn *c)
         i32 n;
         if (!(a = vs_wint_(a, &x)) || !(t = vs_wnums_(w, a)) || (*t != ' ' && *t != '\t')) VS_LINE_ERR("usage: addt ID X1 .. XD TEXT");
         else if (!(buf = vs_txt_(w, (i32)(nl - t))) || (n = vs_unesc_(t + 1, nl, buf)) < 0) VS_LINE_ERR("bad escape in the text (\\n \\r \\t \\0 \\\\)");
-        else if (vs_put_text_(c, w->vec, x, buf, n) != 0) VS_LINE_ERR(c->wb ? "vector has NaN or Inf, or the text is too long: the batch will be refused, abort it" : "vector has NaN or Inf, or the text is too long");
+        else if ((got = vs_put_text_(c, w->vec, x, buf, n)) == -3 || got == -2) VS_LINE_ERR(got == -3 ? "the key's row limit is reached" : "a tenant's id is 0 to 2^44 - 1");
+        else if (got != 0) VS_LINE_ERR(c->wb ? "vector has NaN or Inf, or the text is too long: the batch will be refused, abort it" : "vector has NaN or Inf, or the text is too long");
         else vs_line_reply_(w, c, o, vs_str_(o, c->wb ? "ok queued" : "ok"));
     } else if (VS_CMD("text")) {
         char *t, *r;
@@ -746,12 +758,17 @@ static i32 vs_json_vec_(VsWorker *w, const char *p, i32 n)
 static void vs_http_reply_(VsWorker *w, VsConn *c, const char *status, const char *body, i32 blen, i32 keep);
 #define VS_HTTP_LIT(w, c, status, lit, keep) vs_http_reply_(w, c, status, lit, (i32)sizeof(lit) - 1, keep)   /* a literal body */
 
+static void vs_http_reply_t_(VsWorker *w, VsConn *c, const char *status, const char *type, const char *body, i32 blen, i32 keep);
 static void vs_http_reply_(VsWorker *w, VsConn *c, const char *status, const char *body, i32 blen, i32 keep)
+{
+    vs_http_reply_t_(w, c, status, "application/json", body, blen, keep);
+}
+static void vs_http_reply_t_(VsWorker *w, VsConn *c, const char *status, const char *type, const char *body, i32 blen, i32 keep)
 {
     char head[256], *p = head;
     i32 hn;
     p = vs_str_(p, "HTTP/1.1 "); p = vs_str_(p, status);
-    p = vs_str_(p, "\r\nContent-Type: application/json\r\nContent-Length: ");
+    p = vs_str_(p, "\r\nContent-Type: "); p = vs_str_(p, type); p = vs_str_(p, "\r\nContent-Length: ");
     p = vs_i64_(p, blen);
     p = vs_str_(p, keep ? "\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
     hn = (i32)(p - head);
@@ -830,8 +847,25 @@ static i32 vs_http_(VsWorker *w, VsConn *c)
             return he + clen;
         }
     }
-    if (c->key && (VS_IS("POST", "/build") || VS_IS("POST", "/save") || VS_IS("POST", "/snapshot"))) {
+    if (!vs_key_take_(c)) {
+        VS_HTTP_LIT(w, c, "429 Too Many Requests", "{\"error\":\"rate limit: the key's requests a second are used up\"}", keep);
+        return he + clen;
+    }
+    if (!vs_admin_(c) && (VS_IS("POST", "/build") || VS_IS("POST", "/save") || VS_IS("POST", "/snapshot"))) {
         VS_HTTP_LIT(w, c, "403 Forbidden", "{\"error\":\"the server's housekeeping is not for a key\"}", keep);
+        return he + clen;
+    }
+    if (VS_IS("GET", "/metrics") || VS_IS("GET", "/prometheus")) {   /* the operator's: every store, no tenant prefix */
+        VsSb sb;
+        memset(&sb, 0, sizeof(sb));
+        if (!vs_admin_(c)) {
+            VS_HTTP_LIT(w, c, "403 Forbidden", "{\"error\":\"the server's numbers are the operator's\"}", keep);
+            return he + clen;
+        }
+        vs_metrics_(&sb, t[1] == 'p');
+        if (sb.bad || !sb.p) VS_HTTP_LIT(w, c, "500 Internal Server Error", "{\"error\":\"out of memory\"}", keep);
+        else vs_http_reply_t_(w, c, "200 OK", t[1] == 'p' ? "text/plain; version=0.0.4" : "application/json", sb.p, (i32)sb.n, keep);
+        free(sb.p);
         return he + clen;
     }
     if (vs_dir && c->key && !(tn > 3 && !memcmp(t, "/t/", 3))) {}   /* a key's tenant: chosen already, /t/NAME/ optional */

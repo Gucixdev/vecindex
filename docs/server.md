@@ -80,6 +80,16 @@ vserv -K keys.tsv -c cert.pem -k key.pem -p 8443 data.vxi
 curl -H 'Authorization: Bearer k_9f2c41d07e3a4b55a1f0' -d '[0.1, 0.2, ...]' https://host:8443/search?k=10
 ```
 
+A line may add limits: `KEY TENANT ROWS QPS` - at most ROWS rows (counted once a second; replacing a row the tenant
+has is never refused) and QPS requests a second (past it: `err rate limit`, binary status 7, HTTP 429); 0 or nothing
+is no limit. A key with `*` for its tenant is the operator's: the whole store, any tenant, the housekeeping.
+
+**Numbers:** `GET /metrics` answers JSON, `GET /prometheus` the Prometheus text format - the same numbers in both:
+uptime, searches, writes, refused requests, search latency in buckets (0.5 ms to 1 s), and for every open store its
+rows, rows not indexed yet, memory (hot, cold), blocks checked, damaged and rebuilt, rows that failed their check
+and were healed, the journal, snapshots and the lens. Only for the operator: no `-K`, the `*` key, or the Unix
+socket; a tenant's key gets 403. A Prometheus scrape with keys sends the `*` key (`authorization: credentials:`).
+
 **Binary** (`0xB5` first): little-endian frames, nothing to parse - `u8 0xB5, u8 op, u16 k, u32 nbytes, payload`.
 Ops: 1 search, 2 add, 3 delete, 4 build, 5 save, 6 stats, 7 snapshot, 8 get, 9 delete a range of ids, 10 add with a
 text, 11 get a text, 12 the ids in a range, 13 hybrid search, 14 use a tenant, 15 grouped search (`u32 shift`, then

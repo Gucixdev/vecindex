@@ -45,7 +45,8 @@
  *     -K FILE   API keys, a line each: KEY TENANT (vserv_keys.c). A TCP client shows its key first (auth KEY, binary
  *               op 20, or Authorization: Bearer KEY on every HTTP request) and reaches only its tenant: with one
  *               store, a namespace of it with ids of its own (TENANT a number, 1 to 524287); with DIR, the tenant's
- *               file (TENANT its name). Keys cannot build, save, snapshot or scrub; the Unix socket needs none
+ *               file (TENANT its name); KEY TENANT ROWS QPS adds limits, KEY * is the operator's key. Keys
+ *               cannot build, save, snapshot or scrub, nor read /metrics or /prometheus; the Unix socket needs none
  *
  * The store is opened with store_load (mmap: ready in milliseconds whatever its size). Every socket speaks three
  * protocols, told apart by the first byte of a request (vserv_proto.c has the details):
@@ -57,7 +58,7 @@
  *   HTTP/1.1 (anything else), for curl and friends; keep-alive, Content-Length bodies:
  *     GET /health | GET /stats | GET /get?id=N | GET /text?id=N | GET /range?lo=A&hi=B | POST /search?k=10 |
  *     POST /hybrid?k=10 | POST /add?id=N | POST /delete?id=N (or ?lo=A&hi=B) | POST /build | POST /save |
- *     POST /snapshot; vectors as a JSON array ([0.1, -0.2, ...]), {"vector": [...], "text": "..."}, or raw
+ *     POST /snapshot | GET /metrics (JSON) | GET /prometheus (the Prometheus text format); vectors as a JSON array ([0.1, -0.2, ...]), {"vector": [...], "text": "..."}, or raw
  *     little-endian f32 with Content-Type: application/octet-stream; replies are JSON.
  * An add replaces the row with the same id in every protocol: one row per id. A tenant server first needs the
  * tenant: "use NAME" (lines), op 14 (binary), or a path under /t/NAME/ (HTTP: /t/acme/search?k=10); tenants share
@@ -137,7 +138,7 @@ typedef struct VsConn {
     const struct VsKey *key;                    /* the API key it showed (vserv_keys.c); NULL: none */
     i64 tn;                                     /* one store with keys: its tenant (a namespace, ids tn << 44 | id); 0: all */
 } VsConn;
-struct VsKey { char key[129]; i32 klen; i64 tn; char name[65]; };   /* an API key (vserv_keys.c) */
+struct VsKey { char key[129]; i32 klen, admin; i64 tn, rows, qps; char name[65]; };   /* an API key (vserv_keys.c) */
 
 
 typedef struct { i32 fd, tcp; } VsListen;       /* epoll data for a listening socket */
@@ -339,7 +340,7 @@ static const char *vs_use_(VsConn *c, const char *name, i32 n)
         return "a batch is open: commit or abort it first";
     if (n < 1 || n > VS_TNAME) return "a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -";
     for (i = 0; i < n; ++i) if (!vs_tname_ok_(name[i])) return "a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -";
-    if (c->key && (strlen(c->key->name) != (size_t)n || memcmp(c->key->name, name, (size_t)n) != 0)) {
+    if (c->key && !c->key->admin && (strlen(c->key->name) != (size_t)n || memcmp(c->key->name, name, (size_t)n) != 0)) {
         vs_log_(c, 1, "use %.*s refused: the key is for another tenant", (int)n, name);
         return "your key is for another tenant";
     }
@@ -549,6 +550,7 @@ static void vs_stats_(VsConn *c, i64 *v)
     v[2] = c->key ? 0 : store_pending(c->t->s); v[3] = c->key ? 1 : store_built(c->t->s);
 }
 
+#include "vserv_metrics.c"
 #include "vserv_keys.c"
 #include "vserv_proto.c"
 
@@ -994,6 +996,7 @@ int main(int argc, char **argv)
     vs_aggr = aggr;
     if (nth <= 0) { nth = (i32)(aggr * (f32)store_cpus_avail_() + 0.5f); if (nth < 1) nth = 1; }
 
+    vs_m_t0 = vs_now_();
     t0 = vs_now_();
     if (!vs_dir) {                                               /* one store */
         vs_one.path = path;

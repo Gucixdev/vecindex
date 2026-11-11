@@ -501,7 +501,11 @@ int main(int argc, char **argv)
         FILE *kf;
         sprintf(kpath, "%s/keys.tsv", dir); sprintf(kstore, "%s/keys.vxi", dir);
         kf = fopen(kpath, "w");
-        if (kf) { fprintf(kf, "# key tenant\n%s\t7\n%s   9\n", k7, k9); fclose(kf); }
+        if (kf) {
+            fprintf(kf, "# key tenant [rows [qps]]\n%s\t7\n%s   9\nk_admin_0123456789abcd *\n", k7, k9);
+            fprintf(kf, "k_rows_0123456789abcde 11 5\nk_rate_0123456789abcde 12 0 3\n");
+            fclose(kf);
+        }
         serve_path = kstore;
         p = start("-K", kpath, NULL);
         f7 = connect_tcp(); f9 = connect_tcp(); fa = connect_unix();
@@ -564,6 +568,27 @@ int main(int argc, char **argv)
         sprintf(hreq, "POST /save HTTP/1.1\r\nAuthorization: Bearer %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", k9);
         check(http(hreq, r, sizeof(r)) > 0 && strstr(r, "403 Forbidden"), "HTTP /save with a key -> 403");
         check(http("GET /health HTTP/1.1\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0 && strstr(r, "200 OK"), "HTTP /health needs no key");
+        sprintf(hreq, "GET /metrics HTTP/1.1\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n", k7);
+        check(http(hreq, r, sizeof(r)) > 0 && strstr(r, "403 Forbidden"), "GET /metrics with a tenant's key -> 403");
+        check(http("GET /prometheus HTTP/1.1\r\nAuthorization: Bearer k_admin_0123456789abcd\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0
+              && strstr(r, "Content-Type: text/plain; version=0.0.4") && strstr(r, "vserv_rows{store=\"default\"} 40\n")
+              && strstr(r, "# TYPE vserv_search_seconds histogram") && strstr(r, "vserv_search_seconds_bucket{le=\"+Inf\"}"),
+              "GET /prometheus with the * key: the text format, rows 40, the search histogram");
+        check(http("GET /metrics HTTP/1.1\r\nAuthorization: Bearer k_admin_0123456789abcd\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0
+              && strstr(r, "application/json") && strstr(r, "\"stores\":[{\"store\":\"default\",\"rows\":40,") && strstr(r, "\"searches\":"),
+              "GET /metrics with the * key: the same numbers as JSON");
+        {   int fr = connect_tcp(), fq = connect_tcp(), okr = 1, nq = 0;
+            ask(fr, "auth k_rows_0123456789abcde\n", r, sizeof(r));
+            for (i = 0; i < 6; ++i) { vline(line, "add", 500 + i, 9100 + i); ask(fr, line, r, sizeof(r)); okr &= i < 5 ? !strcmp(r, "ok") : !strcmp(r, "err the key's row limit is reached"); }
+            vline(line, "add", 502, 9200);
+            check(okr && ask(fr, line, r, sizeof(r)) > 0 && !strcmp(r, "ok"), "a key of 5 rows: the 6th is refused, a replacement is not");
+            ask(fq, "auth k_rate_0123456789abcde\n", r, sizeof(r));
+            for (i = 0; i < 10; ++i) if (ask(fq, "stats\n", r, sizeof(r)) > 0 && !strncmp(r, "err rate limit", 14)) ++nq;
+            check(nq >= 6, "a key of 3 requests a second: most of 10 at once refused");
+            msleep(1100);
+            check(ask(fq, "stats\n", r, sizeof(r)) > 0 && !strncmp(r, "ok count=", 9), "a second later: it answers again");
+            close(fr); close(fq);
+        }
         close(f7); close(f9); close(fa);
         msleep(1500);                                             /* -f 1: on the disk within a second */
         stop(p, SIGKILL);                                         /* the journal: rows, ids and namespaces */
