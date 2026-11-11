@@ -24,7 +24,7 @@ def check(cond, what):
 
 
 def start(store=None, extra=()):
-    p = subprocess.Popen([VSERV, "-s", SOCK, "-p", str(PORT), "-t", "2", "-d", str(DIM), "-x", *extra, store or STORE], stderr=subprocess.PIPE)
+    p = subprocess.Popen([VSERV, "-s", SOCK, "-p", str(PORT), "-P", "-t", "2", "-d", str(DIM), "-x", *extra, store or STORE], stderr=subprocess.PIPE)
     for _ in range(200):
         if os.path.exists(SOCK):
             try:

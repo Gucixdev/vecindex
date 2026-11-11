@@ -68,6 +68,7 @@ static pid_t start(const char *extra1, const char *extra2, const char *extra3)
         int n = 0;
         argv[n++] = getenv("VSERV"); argv[n++] = "-s"; argv[n++] = sock_path; argv[n++] = "-p"; argv[n++] = ports;
         argv[n++] = "-t"; argv[n++] = "2"; argv[n++] = "-d"; argv[n++] = "8"; argv[n++] = "-l"; argv[n++] = log_path;
+        argv[n++] = "-P";                        /* plaintext on TCP beside the automatic TLS: these checks speak it */
         if (extra1) argv[n++] = extra1;
         if (extra2) argv[n++] = extra2;
         if (extra3) argv[n++] = extra3;
@@ -549,6 +550,24 @@ int main(int argc, char **argv)
         int f7, f9, fa, ok, q, m;
         FILE *kf;
         sprintf(kpath, "%s/keys.tsv", dir); sprintf(kstore, "%s/keys.vxi", dir);
+        {   /* a line past the reader's 511 bytes: once its tail was read as a line of its own, so a long comment could
+             * carry a key ("# xxx...x injected_key_0123456789 7") - now the file is refused */
+            char lp[300];
+            int st2 = 0, t;
+            pid_t q;
+            sprintf(lp, "%s/long.tsv", dir);
+            if ((kf = fopen(lp, "w")) != (FILE *)0) {
+                fputc('#', kf);
+                for (t = 0; t < 510; ++t) fputc('x', kf);
+                fprintf(kf, " injected_key_0123456789 7\nk_good_0123456789abcde 3\n");
+                fclose(kf);
+            }
+            q = fork();
+            if (q == 0) { if (!freopen("/dev/null", "w", stderr)) {} execl(getenv("VSERV"), getenv("VSERV"), "-s", sock_path, "-d", "8", "-K", lp, kstore, (char *)0); _exit(127); }
+            for (t = 0; t < 100 && waitpid(q, &st2, WNOHANG) == 0; ++t) msleep(50);
+            if (t == 100) stop(q, SIGTERM);
+            check(t < 100 && WIFEXITED(st2) && WEXITSTATUS(st2) != 0, "-K: a line longer than 510 bytes -> the key file is refused (no key from a comment's tail)");
+        }
         kf = fopen(kpath, "w");
         if (kf) {
             fprintf(kf, "# key tenant [rows [qps]]\n%s\t7\n%s   9\nk_admin_0123456789abcd *\n", k7, k9);
@@ -808,6 +827,118 @@ int main(int argc, char **argv)
         }
         check(fr >= 4, "the replica's log: every file it copied");
         serve_path = store_path;
+    }
+
+    /* TLS with nothing to configure: a key and a self-signed certificate made at the first start, kept after it, its
+     * fingerprint printed; plaintext refused on TCP without -P; curl with the pin gets in, with another pin not; a
+     * replica pins the key on its first connection and refuses the primary once its key changed; a key others can
+     * read stops the start (TLS builds; skipped when the server makes no key) */
+    {
+        char adir[300], apath[400], kpath[400], cpath[400], elog[400], cmd[3000], pin[128] = "", pin2[128] = "", ports[16];
+        char rdir2[400], rpath[500], flog2[400];
+        struct stat sb;
+        FILE *g;
+        int stat_k;
+        sprintf(adir, "%s/auto", dir); mkdir(adir, 0700);
+        sprintf(apath, "%s/a.vxi", adir); sprintf(kpath, "%s/vserv.key", adir); sprintf(cpath, "%s/vserv.crt", adir);
+        sprintf(elog, "%s/auto.err", dir);
+        port += 1;
+        sprintf(ports, "%d", port);
+#define AUTO_START() do { p = fork(); if (p == 0) { if (!freopen(elog, "a", stderr)) {} \
+            execl(getenv("VSERV"), getenv("VSERV"), "-p", ports, "-s", sock_path, "-t", "2", "-d", "8", apath, (char *)0); _exit(127); } \
+            for (i = 0; i < 300 && (fd = connect_unix()) < 0; ++i) { msleep(20); } \
+            if (fd >= 0) close(fd); } while (0)
+        AUTO_START();
+        stat_k = stat(kpath, &sb);
+        if (stat_k != 0) {
+            printf("  (no automatic TLS key: a build without TLS - automatic TLS checks skipped)\n");
+            stop(p, SIGTERM);
+        } else {
+            check((sb.st_mode & 0777) == 0600 && stat(cpath, &sb) == 0, "automatic TLS: vserv.key (0600) and vserv.crt made at the first start");
+            if ((g = fopen(elog, "r")) != (FILE *)0) {
+                char l2[1024], *q;
+                while (fgets(l2, sizeof(l2), g)) if ((q = strstr(l2, "TLS key sha256//")) != (char *)0) { sscanf(q + 8, "%127[^ ]", pin); break; }
+                fclose(g);
+            }
+            check(strlen(pin) == 52 && !strncmp(pin, "sha256//", 8), "the key's fingerprint on stderr (sha256//, 44 base64 characters)");
+            check(http("GET /health HTTP/1.1\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0 && strstr(r, "this port speaks TLS"),
+                  "plaintext HTTP on the TCP port -> refused (no -P)");
+            if (system("command -v openssl >/dev/null") == 0) {
+                sprintf(cmd, "openssl verify -x509_strict -CAfile %s %s >/dev/null 2>&1 && "
+                             "test \"sha256//$(openssl x509 -in %s -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)\" = '%s'",
+                        cpath, cpath, cpath, pin);
+                check(system(cmd) == 0, "openssl -x509_strict: the certificate verifies, and its key hashes to the printed fingerprint");
+            }
+            if (system("command -v python3 >/dev/null") == 0) {
+                char pyf[420];
+                sprintf(pyf, "%s/strict.py", dir);
+                if ((g = fopen(pyf, "w")) != (FILE *)0) {
+                    fprintf(g, "import socket, ssl, sys\nc = ssl.create_default_context(cafile=sys.argv[1])\n"
+                               "s = c.wrap_socket(socket.create_connection(('localhost', int(sys.argv[2]))), server_hostname='localhost')\n"
+                               "s.sendall(b'GET /health HTTP/1.1\\r\\nConnection: close\\r\\n\\r\\n')\nb = b''\n"
+                               "while True:\n    d = s.recv(4096)\n    if not d: break\n    b += d\nsys.exit(0 if b'\"ok\":true' in b else 1)\n");
+                    fclose(g);
+                }
+                sprintf(cmd, "python3 %s %s %d >/dev/null 2>&1", pyf, cpath, port);
+                check(system(cmd) == 0, "Python's ssl, strict, with vserv.crt as its CA file and the name localhost");
+            }
+            if (system("command -v curl >/dev/null") == 0) {
+                sprintf(cmd, "curl -s -k --pinnedpubkey '%s' https://127.0.0.1:%d/health | grep -q '\"ok\":true'", pin, port);
+                check(system(cmd) == 0, "curl -k --pinnedpubkey with the fingerprint gets in");
+                sprintf(cmd, "curl -s -k --pinnedpubkey 'sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' https://127.0.0.1:%d/health >/dev/null 2>&1", port);
+                check(system(cmd) != 0, "curl with another fingerprint is refused");
+            }
+            fd = connect_unix();
+            check(add_rows(fd, 1, 21) == 0, "20 rows on the automatic-TLS primary");
+            close(fd);
+            msleep(1200);
+            sprintf(rdir2, "%s/rauto", dir); mkdir(rdir2, 0700); sprintf(rpath, "%s/a.vxi", rdir2);
+            {   char addr[64];
+                pid_t f;
+                sprintf(addr, "127.0.0.1:%d", port);
+                f = follow(addr, rpath, NULL);
+                check(wait_same(apath, rpath, 6000), "-F over automatic TLS: the replica pins the key and copies");
+                sprintf(cmd, "%s/vserv.pin", rdir2);
+                if ((g = fopen(cmd, "r")) != (FILE *)0) { if (!fgets(pin2, sizeof(pin2), g)) pin2[0] = 0; fclose(g); pin2[strcspn(pin2, "\n")] = 0; }
+                check(!strcmp(pin, pin2), "vserv.pin beside the replica holds the primary's fingerprint");
+                stop(f, SIGTERM);
+                stop(p, SIGTERM);
+                AUTO_START();
+                pin2[0] = 0;
+                if ((g = fopen(elog, "r")) != (FILE *)0) {
+                    char l2[1024], *q, last[128] = "";
+                    while (fgets(l2, sizeof(l2), g)) if ((q = strstr(l2, "TLS key sha256//")) != (char *)0) sscanf(q + 8, "%127[^ ]", last);
+                    fclose(g); strcpy(pin2, last);
+                }
+                check(!strcmp(pin, pin2), "a restart keeps the key: the same fingerprint");
+                stop(p, SIGTERM);
+                sprintf(cmd, "%s.old", kpath); rename(kpath, cmd);       /* a new key, as after a reinstall */
+                AUTO_START();
+                f = follow(addr, rpath, NULL);
+                {   int st2 = 0, t;
+                    for (t = 0; t < 100 && waitpid(f, &st2, WNOHANG) == 0; ++t) msleep(50);
+                    if (t == 100) stop(f, SIGTERM);
+                    check(t < 100 && WIFEXITED(st2) && WEXITSTATUS(st2) == 1, "the primary's key changed: the replica stops (exit 1)");
+                }
+                sprintf(flog2, "%s/follow.log", dir);
+                {   int hit = 0;
+                    char l2[2048];
+                    if ((g = fopen(flog2, "r")) != (FILE *)0) { while (fgets(l2, sizeof(l2), g)) if (strstr(l2, "shows another TLS key")) hit = 1; fclose(g); }
+                    check(hit, "... and says which key it pinned and which it was shown");
+                }
+                stop(p, SIGTERM);
+            }
+            chmod(kpath, 0644);
+            p = fork();
+            if (p == 0) { if (!freopen(elog, "a", stderr)) {}
+                execl(getenv("VSERV"), getenv("VSERV"), "-p", ports, "-s", sock_path, "-t", "2", "-d", "8", apath, (char *)0); _exit(127); }
+            {   int st2 = 0, t;
+                for (t = 0; t < 100 && waitpid(p, &st2, WNOHANG) == 0; ++t) msleep(50);
+                if (t == 100) stop(p, SIGTERM);
+                check(t < 100 && WIFEXITED(st2) && WEXITSTATUS(st2) != 0, "a key file others can read (0644): the server does not start");
+            }
+        }
+#undef AUTO_START
     }
 
     /* mutual TLS: the name in the client's certificate goes into the log (needs openssl and curl; skipped without) */

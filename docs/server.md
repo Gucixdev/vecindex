@@ -151,7 +151,7 @@ journal. For a copy that keeps up by itself, see the replica below.
 
 ```sh
 # on the standby: copy everything the primary has flushed, every second, until stopped
-vserv -F 10.0.0.5:8077 /srv/vx/docs.vxi          # a one-store primary (plaintext TCP: -P if it has TLS)
+vserv -F 10.0.0.5:8077 /srv/vx/docs.vxi          # a one-store primary, over TLS
 vserv -F /run/vx/primary.sock /srv/vx/           # a tenant server: every tenant, NAME.vxi in the directory
 VSERV_KEY=op_key_... vserv -F 10.0.0.5:8077 ...  # the operator's key, when the primary has -K
 ```
@@ -171,8 +171,9 @@ and checks exactly that. Never run a replica and a server on the same files at o
 the replica is a standby, not a second place to write.
 
 The primary side is three binary ops (21 journal, 22 file, 23 the tenants), refused to tenant keys: the Unix socket
-or the operator's key (`*` in `-K`). The replica speaks plaintext. Across machines either let the primary's TCP port
-take plaintext on a private network (`-P` with TLS, or no TLS) or carry the Unix socket over ssh, which encrypts it:
+or the operator's key (`*` in `-K`). Over TCP the replica speaks TLS and pins the primary's key on its first
+connection (see TLS below); `-F ... -P` speaks plaintext to a primary that allows it. A Unix socket carried over ssh
+works as well:
 
 ```sh
 ssh -N -L /run/vx/primary.sock:/srv/vx/vecindex.sock vx@primary &   # a local socket that is the primary's
@@ -201,7 +202,7 @@ file holds. Pick one:
 What else holds the data and must be on the same encrypted layer: the snapshot's temporary file (`NAME.vxi.snap`, in
 the same directory), the replica's files and every backup copy (encrypted only if where they land is), swap (encrypt
 it, or keep the store in RAM with `-m`), and core dumps (`LimitCORE=0` in the unit). In transit there is TLS (`-c`/`-k`
-below) for clients and ssh for the replica.
+below) for clients and the replica.
 
 ## Memory: hot codes in RAM, cold rows on the disk
 
@@ -271,11 +272,34 @@ decide who connects.
 
 ## TLS
 
-`-c`/`-k`: TLS 1.2 through the vendored [BearSSL](https://bearssl.org) 0.6 (MIT, unmodified, no crypto code of our
-own): ECDHE only (forward secrecy), AEAD suites only (AES-GCM with AES-NI, ChaCha20-Poly1305), EC or RSA keys,
-sessions resumed from one cache shared by every worker, keys wiped when a connection closes. `-a CA` requires client
-certificates (mutual TLS). TLS is sniffed per connection (`0x16`): the TCP port takes only TLS (`-P` lets plaintext in
-too); the Unix socket takes TLS or, for local tools, plaintext (`-T`: TLS only).
+On by default for TCP, with nothing to configure. The first start of a server with a port makes an EC P-256 key and
+a self-signed certificate around it, `vserv.key` (mode 0600; a key others can read stops the start) and `vserv.crt`
+next to the store or in the tenant directory, and every start prints the key's fingerprint:
+
+```
+vserv: TLS key sha256//rb6eC07nZ3DVmE91EIqYTgvfjWTzCz/NZc4k18aztC0= (curl -k --pinnedpubkey sha256//...; a replica remembers it)
+curl -k --pinnedpubkey 'sha256//rb6eC07nZ3DVmE91EIqYTgvfjWTzCz/NZc4k18aztC0=' https://10.0.0.5:8077/health
+```
+
+There is no outside CA: clients pin the key, the way ssh pins a host key. `-k` skips curl's CA check and the pin
+replaces it (curl refuses the connection when the key differs). The certificate is also its own CA and names
+`localhost`, `127.0.0.1`, `::1` and the machine's host name, so a copy of `vserv.crt` works as the CA file wherever
+that is easier: `curl --cacert vserv.crt https://HOSTNAME:8077/...`, `ssl.create_default_context(cafile="vserv.crt")`
+in Python (strict checks on). For any other name or address, pin. A replica
+(`-F`) pins the key it sees on its first connection in `vserv.pin` beside its files, and stops with an error when the
+primary later shows another one: after a reinstall that is expected (move `vserv.pin` away), otherwise someone is in
+between. What this does not cover: the very first connection is trusted as it comes - compare the fingerprint the
+replica prints with the primary's, or copy it there first as `$VSERV_PIN`. Back up `vserv.key` with the store and keep
+it as private as the data: whoever has it can pose as the server.
+
+`-c`/`-k` use a certificate of your own instead (from your CA, or Let's Encrypt for a public name). Either way: TLS 1.2
+through the vendored [BearSSL](https://bearssl.org) 0.6 (MIT, unmodified; the certificate above is assembled here,
+signed with BearSSL's ECDSA): ECDHE only (forward secrecy), AEAD suites only (AES-GCM with AES-NI,
+ChaCha20-Poly1305), EC or RSA keys, sessions resumed from one cache shared by every worker, keys wiped when a
+connection closes. `-a CA` requires client certificates (mutual TLS). TLS is sniffed per connection (`0x16`): the TCP
+port takes only TLS (`-P` lets plaintext in too, for old clients on a private network); the Unix socket takes TLS or,
+for local tools, plaintext (`-T`: TLS only). API keys (`-K`) travel inside the TLS session, so nobody on the network
+reads them.
 
 ## Measured
 

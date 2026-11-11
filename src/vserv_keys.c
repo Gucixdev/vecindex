@@ -52,6 +52,10 @@ static i32 vs_keys_load_(const char *path)
         size_t kl, tl, l3, l4, i;
         VsKey *e;
         ++ln;
+        if (!strchr(line, '\n') && !feof(f)) {                   /* the rest would read as a line of its own */
+            fprintf(stderr, "vserv: %s:%d: a line is at most %d bytes\n", path, (int)ln, (int)sizeof(line) - 2);
+            fclose(f); return -1;
+        }
         while (*p == ' ' || *p == '\t') ++p;
         if (!*p || *p == '\n' || *p == '#') continue;
         for (k = p; *p && *p != ' ' && *p != '\t' && *p != '\n'; ++p) {}
@@ -150,6 +154,20 @@ static i32 vs_need_key_(const VsConn *c) { return vs_nkeys > 0 && c->tcp && !c->
 /* a keyed connection may not do the server's housekeeping (build, save, snapshot, scrub), unless the operator's */
 static i32 vs_admin_(const VsConn *c) { return !c->key || c->key->admin; }
 
+/* The token bucket of one key at time now: refilled qps a second, never above qps; a request takes one token. 1 it
+ * may go on, 0 over the limit. lean4/Vecindex/Rate.lean proves that it lets through at most qps + qps * t requests
+ * in any t seconds. */
+static i32 vs_bucket_(f64 *tokens, f64 *last, f64 now, f64 qps)
+{
+    i32 ok;
+    *tokens += (now - *last) * qps;
+    if (*tokens > qps) *tokens = qps;
+    *last = now;
+    ok = *tokens >= 1.0;
+    if (ok) *tokens -= 1.0;
+    return ok;
+}
+
 /* one request of a keyed connection against its key's QPS: 1 it may go on, 0 over the limit */
 static i32 vs_key_take_(const VsConn *c)
 {
@@ -160,11 +178,7 @@ static i32 vs_key_take_(const VsConn *c)
     k = &vs_kst[c->key - vs_keys];
     pthread_mutex_lock(&k->mu);
     now = vs_now_();
-    k->tokens += (now - k->last) * (f64)c->key->qps;
-    if (k->tokens > (f64)c->key->qps) k->tokens = (f64)c->key->qps;
-    k->last = now;
-    ok = k->tokens >= 1.0;
-    if (ok) k->tokens -= 1.0;
+    ok = vs_bucket_(&k->tokens, &k->last, now, (f64)c->key->qps);
     pthread_mutex_unlock(&k->mu);
     if (!ok) VS_M_ADD(vs_m_refused, 1);
     return ok;

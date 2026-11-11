@@ -4,7 +4,7 @@
  *   vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-g AGGRESSION] [-m TIER] [-C] [-d DIM] [-x] [-L] [-r RECALL]
  *         [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT.pem -k KEY.pem [-a CA.pem] [-P] [-T]] [-U] [-K KEYS]
  *         STORE.vxi | DIR
- *   vserv -F HOST:PORT|SOCK [-f SECONDS] [-l DEST] REPLICA.vxi | DIR      (a replica on a second machine)
+ *   vserv -F HOST:PORT|SOCK [-P] [-f SECONDS] [-l DEST] REPLICA.vxi | DIR      (a replica on a second machine)
  *     STORE.vxi one store; DIR: a store per tenant, DIR/NAME.vxi, opened on a client's first "use NAME" (created
  *               there when it does not exist yet; -d gives every tenant's dimension and is required) and kept open
  *     -s PATH   Unix socket, created mode 0600 (default ./vecindex.sock when -p is not given)
@@ -36,9 +36,11 @@
  *     -l DEST   log connections, every write and every refusal, with who made it (vserv_log.c): syslog, - (stderr)
  *               or a file
  *     -A        log every search as well
- *     -c, -k    TLS: certificate chain and private key (PEM, EC or RSA). The TCP port then takes only TLS: HTTPS,
- *               or the binary protocol inside TLS (-P lets plaintext in too). The Unix socket takes TLS as well and
- *               still accepts plaintext from local clients, unless -T
+ *     -c, -k    TLS: certificate chain and private key (PEM, EC or RSA). Without them a server with a TCP port makes
+ *               its own the first time (vserv_tls_auto.c): vserv.key (0600) and vserv.crt next to the store, a
+ *               self-signed EC P-256 certificate, its fingerprint printed at every start for clients to pin. Either
+ *               way the TCP port takes only TLS: HTTPS, or the binary protocol inside TLS (-P lets plaintext in
+ *               too). The Unix socket takes TLS as well and still accepts plaintext from local clients, unless -T
  *     -a FILE   mutual TLS: a client must present a certificate that chains to one of the CA certificates in FILE
  *               (or is one of them), else the handshake fails; its name goes into the log
  *     -U        with DIR and -a: a client certificate's name is the one tenant it may use - the CA, not the server,
@@ -48,10 +50,11 @@
  *               store, a namespace of it with ids of its own (TENANT a number, 1 to 524287); with DIR, the tenant's
  *               file (TENANT its name); KEY TENANT ROWS QPS adds limits, KEY * is the operator's key. Keys
  *               cannot build, save, snapshot or scrub, nor read /metrics or /prometheus; the Unix socket needs none
- *     -F ADDR   be a replica of the primary at ADDR (HOST:PORT, plaintext, or a Unix socket - an ssh tunnel to it
- *               for another machine): copy its file and journal into REPLICA.vxi (or every tenant into DIR) every -f
- *               seconds, until SIGTERM; it serves nothing. $VSERV_KEY: the operator's key of a primary with -K.
- *               Failover: stop it, start vserv on REPLICA (vserv_repl.c)
+ *     -F ADDR   be a replica of the primary at ADDR (HOST:PORT over TLS - -P: plaintext - or a Unix socket): copy
+ *               its file and journal into REPLICA.vxi (or every tenant into DIR) every -f seconds, until SIGTERM;
+ *               it serves nothing. The primary's TLS key is pinned in vserv.pin beside the replica on the first
+ *               connection ($VSERV_PIN gives it instead), and a primary that shows another key is refused.
+ *               $VSERV_KEY: the operator's key of a primary with -K. Failover: stop it, start vserv on REPLICA
  *
  * The store is opened with store_load (mmap: ready in milliseconds whatever its size). Every socket speaks three
  * protocols, told apart by the first byte of a request (vserv_proto.c has the details):
@@ -555,6 +558,7 @@ static void vs_stats_(VsConn *c, i64 *v)
     v[2] = c->key ? 0 : store_pending(c->t->s); v[3] = c->key ? 1 : store_built(c->t->s);
 }
 
+#include "vserv_tls_auto.c"
 #include "vserv_metrics.c"
 #include "vserv_keys.c"
 #include "vserv_proto.c"
@@ -964,7 +968,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "usage: vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-g A] [-m TIER] [-C] [-d DIM] [-x] [-L] [-r RECALL]\n"
                             "             [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT -k KEY [-a CA] [-P] [-T]] [-U] [-K KEYS]\n"
                             "             STORE.vxi | DIR\n"
-                            "       vserv -F HOST:PORT|SOCK [-f SECONDS] [-l DEST] REPLICA.vxi | DIR\n");
+                            "       vserv -F HOST:PORT|SOCK [-P] [-f SECONDS] [-l DEST] REPLICA.vxi | DIR\n");
             return 2;
         }
     }
@@ -983,10 +987,21 @@ int main(int argc, char **argv)
     }
     if (vs_ten_cn && !vs_dir) { fprintf(stderr, "vserv: -U binds clients to tenants: give a directory\n"); return 2; }
     if (keys && vs_keys_load_(keys) != 0) return 2;              /* after vs_dir: a key names a tenant or a number */
-    if ((cert || key || ca || vs_unix_tls_only) && !(cert && key)) { fprintf(stderr, "vserv: TLS needs both -c CERT and -k KEY\n"); return 2; }
+    if ((cert || key) && !(cert && key)) { fprintf(stderr, "vserv: TLS needs both -c CERT and -k KEY\n"); return 2; }
 #ifdef VSERV_TLS
+    if (!cert && (port || ca || vs_unix_tls_only)) {             /* TLS with nothing to configure (vserv_tls_auto.c) */
+        if (vs_tls_auto_(path, vs_dir != (const char *)0, &cert, &key) != 0) {
+            if (!vs_plain_ok || ca || vs_unix_tls_only) return 1;
+            fprintf(stderr, "vserv: serving plaintext only (-P)\n");
+        }
+    }
     if (cert) {
+        char pin[64];
         if (vs_tls_load_(cert, key, ca)) return 1;
+        if (vs_pin_of_(vs_chain[0].data, vs_chain[0].data_len, pin) == 0) {
+            fprintf(stderr, "vserv: TLS key %s (curl -k --pinnedpubkey %s; a replica remembers it)\n", pin, pin);
+            vs_log_((const VsConn *)0, 0, "tls key=%s", pin);
+        }
         vs_tls_on = 1;
         vs_cache_mem = (unsigned char *)malloc(VS_CACHE_BYTES);
         br_ssl_session_cache_lru_init(&vs_cache.lru, vs_cache_mem, VS_CACHE_BYTES);
@@ -994,7 +1009,7 @@ int main(int argc, char **argv)
         vs_cache.vtable = &vs_cache_class;
     }
 #else
-    if (cert) { fprintf(stderr, "vserv: built without TLS (VSERV_NO_TLS)\n"); return 2; }
+    if (cert || ca || vs_unix_tls_only) { fprintf(stderr, "vserv: built without TLS (VSERV_NO_TLS)\n"); return 2; }
 #endif
     if (!vs_tls_on) vs_plain_ok = 1;
     if (!sock && !port) sock = "vecindex.sock";
