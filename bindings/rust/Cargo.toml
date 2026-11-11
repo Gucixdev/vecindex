@@ -1,0 +1,15 @@
+[package]
+name = "vecindex"
+version = "0.4.0"
+edition = "2018"
+rust-version = "1.56"
+description = "A vector database in one C file: embedded RAG storage that repairs its own damaged blocks"
+license = "MIT"
+repository = "https://github.com/Gucixdev/vecindex"
+keywords = ["vector-database", "rag", "embeddings", "similarity", "embedded"]
+categories = ["database-implementations", "api-bindings"]
+links = "vecindex"
+build = "build.rs"
+include = ["src/**", "tests/**", "build.rs", "Cargo.toml", "README.md", "csrc/**"]
+
+[dependencies]

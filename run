@@ -293,6 +293,37 @@ fi
 "$CC" -std=gnu99 -O2 -Wall -Wextra tests/vserv_test.c -o "$OUT/vserv_line_test" \
     && "$OUT/vserv_line_test" "$OUT/vserv" 2>/dev/null | tee "$OUT/log_vserv_line.txt" && rec "vserv line protocol" ok "$(notes "vserv line protocol")" || { echo "  ^ vserv line protocol FAILED"; fail=1; rec "vserv line protocol" FAIL; }
 
+# ---- the packages for other languages (bindings/): each built and tested when its toolchain is here ----
+echo; echo "bindings (bindings/python, bindings/rust, bindings/js)"
+if command -v python3 >/dev/null && python3 -c 'import setuptools, ctypes' 2>/dev/null; then
+    pyd=$OUT/py; rm -rf "$pyd"; mkdir -p "$pyd"
+    if VECINDEX_PORTABLE=1 python3 -m pip wheel -q --no-deps --no-build-isolation -w "$pyd/wheel" bindings/python > "$pyd/log.txt" 2>&1 \
+        && python3 -m pip install -q --no-deps --target "$pyd/site" "$pyd"/wheel/*.whl >> "$pyd/log.txt" 2>&1 \
+        && (cd bindings/python/tests && PYTHONPATH="$PWD/../../../$pyd/site" python3 -W error -m unittest -q test_vecindex) >> "$pyd/log.txt" 2>&1; then
+        echo "  ok   python: $(basename "$pyd"/wheel/*.whl), $(grep -o 'Ran [0-9]* tests' "$pyd/log.txt")"
+        rec "python package" ok "$(basename "$pyd"/wheel/*.whl): $(grep -o 'Ran [0-9]* tests' "$pyd/log.txt"), python $(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+    else tail -20 "$pyd/log.txt"; echo "  ^ python package FAILED"; fail=1; rec "python package" FAIL; fi
+else rec "python package" skip "no python3 with setuptools"; fi
+if command -v cargo >/dev/null; then
+    if (cd bindings/rust && CARGO_TARGET_DIR="$PWD/../../$OUT/rust" cargo test --offline -q) > "$OUT/log_rust.txt" 2>&1; then
+        echo "  ok   rust: $(grep -o '[0-9]* passed' "$OUT/log_rust.txt" | awk '{s += $1} END {print s}') tests"
+        rec "rust crate" ok "$(grep -o '[0-9]* passed' "$OUT/log_rust.txt" | awk '{s += $1} END {print s}') tests (store on disk, filters, four threads), $(rustc --version | cut -d' ' -f1-2)"
+    else tail -20 "$OUT/log_rust.txt"; echo "  ^ rust crate FAILED"; fail=1; rec "rust crate" FAIL; fi
+else rec "rust crate" skip "no cargo"; fi
+if command -v node >/dev/null; then
+    js=bindings/js
+    if [[ -n ${WASI_SDK:-} ]]; then "$js/build.sh" > "$OUT/log_wasm.txt" 2>&1 || { cat "$OUT/log_wasm.txt"; fail=1; rec "wasm build" FAIL; }; fi
+    jsnote=""
+    [[ $("$js/build.sh" --srchash .) == "$(cat "$js/vecindex.wasm.src" 2>/dev/null)" ]] \
+        || jsnote=" - vecindex.wasm is older than src/ (WASI_SDK=... ./run rebuilds it)"
+    if "$CC" "${CFLAGS[@]}" -Iinclude "$js/test/probe.c" "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/wasm_probe" \
+        && VECINDEX_NATIVE_PROBE="$PWD/$OUT/wasm_probe" node "$js/test/test.mjs" > "$OUT/log_js.txt" 2>&1; then
+        echo "  ok   js: $(tail -1 "$OUT/log_js.txt")$jsnote"
+        rec "js (wasm) package" ok "$(grep -o '[0-9]* tests, .*' "$OUT/log_js.txt" | tr -d ')')$jsnote"
+    else tail -20 "$OUT/log_js.txt"; echo "  ^ js package FAILED"; fail=1; rec "js (wasm) package" FAIL; fi
+else rec "js (wasm) package" skip "no node"; fi
+echo
+
 if [[ $mode == all ]]; then
     echo; echo "cross-built tests (tools/cross; a target without its compiler and qemu is skipped)"
     cro=$(tools/cross | tee /dev/stderr) && { rec "cross builds" ok "$(grep -c '^  ok' <<<"$cro") test runs ok on $(grep -c '^==' <<<"$cro") of 4 CPUs (aarch64 armv7 riscv64 s390x), $(grep -c 'skipped' <<<"$cro") skipped"; } || { echo "  ^ cross FAILED"; fail=1; rec "cross builds" FAIL; }
