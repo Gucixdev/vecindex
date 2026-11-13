@@ -85,6 +85,28 @@ static void store_index_locked_(RagStore *s)
     tq_add_free(&ad);
 }
 
+#ifndef STORE_SPLIT_X
+#define STORE_SPLIT_X 2.0       /* a cluster is split once it holds this many times the store's cluster size */
+#endif
+#ifndef STORE_SPLIT_STEP
+#define STORE_SPLIT_STEP 4      /* clusters split per maintenance step (each holds the write lock a millisecond or two) */
+#endif
+
+/* The clusters that outgrew STORE_SPLIT_X times the store's cluster size (its rows over store_nclusters_), split in
+ * place (tq_split_big), STORE_SPLIT_STEP at most. Under the write lock, mt_mu held. Returns how many. */
+static i32 store_split_(RagStore *s)
+{
+    Tq *t = s->tq;
+    i32 nc = store_nclusters_(s->live), lim, done;
+    TqCol sc, col;
+    if (!s->split_on || !t || t->nc <= 1 || s->idx || nc <= 1 || t->n != s->built_upto) return 0;
+    lim = (i32)(STORE_SPLIT_X * (f64)s->live / (f64)nc);
+    col = store_vcol_(s, &sc);
+    done = tq_split_big(t, &col, s->dead, lim, STORE_SPLIT_STEP);
+    if (done) { s->tuned_n = 0; store_stat_add_(&s->n_splits, done); }   /* re-tune on the new clusters */
+    return done;
+}
+
 /* Rebuild the scan index over every row there is, without stopping anything: the clustering and the codes are
  * computed on a snapshot of the rows (tombstones left out) while searches go on with the old index and the live thread
  * keeps adding new rows to it; then the new index catches up on those rows privately and is swapped in under the
@@ -163,8 +185,9 @@ static i32 store_rebuild_(RagStore *s, i32 nth)
 /* Why the index should be rebuilt now, 0 if it should not: 1 there is none yet, 2 the store grew into IVF size, 3 it
  * grew by live_grow since the build, 4 a window of added rows sat STORE_LIVE_DRIFT times farther from their centroids
  * than the built rows (store_fit_: the data moved), 5 a quarter of the index is tombstones, 6 the added rows piled into
- * a few clusters (tq_skew up by STORE_LIVE_SKEW: every query near them scans those big clusters). Nothing changed since the last
- * rebuild: 0. Under the read lock. */
+ * a few clusters (tq_skew up by STORE_LIVE_SKEW: every query near them scans those big clusters; not with splits, which
+ * cut such clusters in place), 7 splits left a quarter of the slots as holes. With splits on, growth (3) rebuilds only
+ * at 8 times live_grow. Nothing changed since the last rebuild: 0. Under the read lock. */
 static i32 store_due_(const RagStore *s)
 {
     const Tq *t = s->tq;
@@ -173,10 +196,12 @@ static i32 store_due_(const RagStore *s)
     if (!t) return s->live >= STORE_LIVE_MIN ? 1 : 0;
     if (s->live_grow <= 0.0f) return 0;
     if (t->nc <= 1) return store_nclusters_(s->live) > 1 ? 2 : 0;
-    if ((f64)t->nadd >= (f64)s->live_grow * (f64)(t->nbuilt > 0 ? t->nbuilt : 1)) return 3;
+    /* with splits the clusters keep their size as rows come, so only a far larger growth rebuilds */
+    if ((f64)t->nadd >= (f64)s->live_grow * (s->split_on ? 8.0 : 1.0) * (f64)(t->nbuilt > 0 ? t->nbuilt : 1)) return 3;
     if (s->drifted) return 4;
     if ((i64)dead * 4 > (i64)t->n) return 5;
-    if (t->csize && t->skew0 > 0.0 && tq_skew(t) > STORE_LIVE_SKEW * t->skew0) return 6;
+    if (!s->split_on && t->csize && t->skew0 > 0.0 && tq_skew(t) > STORE_LIVE_SKEW * t->skew0) return 6;
+    if ((i64)t->holes * 4 > (i64)t->n) return 7;                 /* splits left a quarter of the slots empty */
     return 0;
 }
 
@@ -207,6 +232,11 @@ static i32 store_step_(RagStore *s, i32 async)
     i32 did = 0, tune = 0, go = 0, nth = store_bg_threads_(s);
     pthread_mutex_lock(&s->mt_mu);
     if (store_index_pending_(s, nth) > 0) did |= 1;
+    if (s->split_on && !store_stat_get_(&s->rebuilding)) {     /* not while a rebuild may swap the index */
+        pthread_rwlock_wrlock(&s->lock);
+        if (store_split_(s) > 0) did |= 8;
+        pthread_rwlock_unlock(&s->lock);
+    }
     pthread_rwlock_rdlock(&s->lock);
     if (!store_stat_get_(&s->rebuilding)) {
         if (store_due_(s)) { store_stat_set_(&s->rebuilding, 1); go = 1; }
@@ -225,9 +255,10 @@ static i32 store_step_(RagStore *s, i32 async)
 }
 
 /* One maintenance step, now, by hand (what the live thread runs again and again, here with the rebuild in this
- * thread): index the pending rows, rebuild if the index has aged, re-tune if a target recall is set and the index
- * changed. Searches go on throughout (the work takes half the cores); an add waits at most while a chunk of rows is
- * placed or an index swapped. Returns what it did: 1 indexed, 2 rebuilt, 4 tuned. */
+ * thread): index the pending rows, split clusters that outgrew their size, rebuild if the index has aged, re-tune if a
+ * target recall is set and the index changed. Searches go on throughout (the work takes half the cores); an add waits
+ * at most while a chunk of rows is placed, a few clusters split or an index swapped. Returns what it did: 1 indexed,
+ * 2 rebuilt, 4 tuned, 8 split. */
 i32 store_maintain(RagStore *s) { return store_step_(s, 0); }
 
 static void *store_live_main_(void *p)
@@ -281,6 +312,17 @@ void store_set_live(RagStore *s, i32 on, f32 grow)
         }
     } else if (!on) store_live_stop_(s);
 }
+
+/* splits on (default) or off: whether live mode cuts outgrown clusters in place (store_split_) or rebuilds instead */
+void store_set_split(RagStore *s, i32 on)
+{
+    pthread_mutex_lock(&s->mt_mu);
+    s->split_on = on ? 1 : 0;
+    pthread_mutex_unlock(&s->mt_mu);
+}
+
+/* clusters split in place so far */
+i64 store_splits(RagStore *s) { return store_stat_get_(&s->n_splits); }
 
 /* what maintenance has done: rows indexed after a build, rebuilds, seconds the last rebuild took (any may be NULL) */
 void store_live_stats(RagStore *s, i64 *indexed, i64 *rebuilds, f64 *last_rebuild_s)

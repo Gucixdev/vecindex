@@ -132,6 +132,12 @@ typedef struct {
     f64   skew0;            /* tq_skew when the clusters were made (or first counted) */
     i32   cold;             /* 1: mapped codes larger than RAM can be counted on to hold, so the load did not read
                              * them in: a search pages in its probed clusters (measured: bench/cold.c) */
+    /* clusters split in place (tq_split.c) */
+    i32   cent_own;         /* cent and cstart were copied out of a file mapping to grow: tq_free frees them */
+    i32   holes;            /* slots a split emptied (rows moved to another cluster): scanned, never returned */
+    i32   nsplit;           /* clusters split since the build */
+    u32   sgen;             /* bumped whenever a built slot loses its row: what a cache of slot-order facts checks */
+    i32   pnc, pnp;         /* nc and nprobe when the probe count was last set: nprobe follows nc as clusters split */
 } Tq;
 
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512F__)
@@ -1274,7 +1280,10 @@ void tq_free(Tq *t)
 {
     if (!t) return;
     if (!t->mapped) { free(t->s1); free(t->s2); free(t->perm); free(t->codes); free(t->cent); free(t->cstart); free(t->slot_row); }
-    else if (t->slot_own) free(t->slot_row);
+    else {
+        if (t->slot_own) free(t->slot_row);
+        if (t->cent_own) { free(t->cent); free(t->cstart); }
+    }
     free(t->ct); free(t->c8); free(t->c8b); free(t->c8s);
     free(t->xcodes); free(t->xslot); free(t->xnext); free(t->xhead); free(t->xtail); free(t->csize);
     if (t->c1_own) free(t->codes1);
@@ -1293,7 +1302,10 @@ static i64 tq_ram_(const Tq *t)
         b += (i64)t->nblk * t->vd * 16 + (i64)t->dpad * 12;
         if (t->slot_row) b += (i64)t->nblk * 32 * 4;
         if (t->nc > 1) b += (i64)t->nc * t->dim * 4 + (i64)(t->nc + 1) * 4;
-    } else if (t->slot_own) b += (i64)t->nblk * 32 * 4;
+    } else {
+        if (t->slot_own) b += (i64)t->nblk * 32 * 4;
+        if (t->cent_own) b += (i64)t->nc * t->dim * 4 + (i64)(t->nc + 1) * 4;
+    }
     if (t->xcap) b += (i64)t->xcap * ((i64)t->vd * 16 + 32 * 4 + 4) + (i64)(t->nc > 1 ? t->nc : 1) * 8;
     if (t->c1_own) b += (i64)t->nblk * t->vd1 * 16;
     if (t->xcodes1) b += (i64)t->xcap * t->vd1 * 16;
@@ -1411,5 +1423,7 @@ i32 tq_cascade_on(Tq *t, i32 nth)
 #include "tq_scan.c"
 
 #include "tq_add.c"
+
+#include "tq_split.c"
 
 #endif /* TQ_C */

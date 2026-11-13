@@ -113,10 +113,12 @@ static const u8 *store_ex_errs_(RagStore *s, i32 upto, u8 *emax, const u8 **serr
         tq_par_(store_ex_job_, &j, (i64)upto - c->n, nth);          /* one thread below 4096 rows */
         for (; c->n < upto; ++c->n) if (e[c->n] > c->emax) c->emax = e[c->n];
     }
+    if (c && c->serr && c->sgen != s->tq->sgen) { free(c->serr); c->serr = (u8 *)0; }   /* a split emptied built slots */
     if (c && serr && !c->serr && s->tq->nblk > 0) {
         const Tq *t = s->tq;
         i32 i, row;
         c->serr = (u8 *)malloc((size_t)t->nblk * 32);
+        c->sgen = t->sgen;
         if (c->serr) for (i = 0; i < t->nblk * 32; ++i) {
             row = tq_srow_(t, i / 32, i % 32);
             c->serr[i] = row >= 0 && row < t->n && row < c->n ? c->err[row] : (u8)STORE_EX_NONE;

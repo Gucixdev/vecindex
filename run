@@ -120,9 +120,10 @@ notes() {
         "vserv line protocol") echo "$(okn "$OUT/log_vserv_line.txt") checks ok" ;;
         emeans)  echo "$(okn "$OUT/log_emeans.txt") checks, $(ex "$OUT/log_emeans.txt" 'e-means error [0-9.]+ < Lloyd.s 8 rounds [0-9.]+')" ;;
         exact)   echo "$(okn "$OUT/log_exact.txt") checks: search with a proof == every row scored, bound held on every row" ;;
+        split)   echo "$(okn "$OUT/log_split.txt") checks: clusters split in place, invariants, recall, save/load, live" ;;
     esac
 }
-for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd emeans engine store exact ${more[@]+"${more[@]}"}; do
+for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd emeans engine store exact split ${more[@]+"${more[@]}"}; do
     bin="$OUT/$name"
     src="tests/${name}_test.c"
     def=()
@@ -137,6 +138,7 @@ for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd emeans engine store
         simd)   deps=(src/tq*.c src/vsimd.h src/base.h) ;;
         emeans) deps=("${STORE[@]}") ;;
         exact)  deps=("${STORE[@]}") ;;
+        split)  deps=("${STORE[@]}") ;;
         engine) deps=("${ENG[@]}"); def=(-DENGINE_SERIALIZE) ;;   # exercise the .vxi round-trip in the test
         store)  deps=("${STORE[@]}") ;;
         bench)  src=bench/bench.c; def=(-DBENCH); deps=("${ENG[@]}") ;;

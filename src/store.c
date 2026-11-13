@@ -230,7 +230,7 @@ typedef struct {
 
 /* the error bytes of search with a proof (store_exact.c): one a row, for one index and one row order */
 typedef struct StoreCertOld { u8 *err; struct StoreCertOld *next; } StoreCertOld;
-typedef struct { const void *tq; u32 gen; i32 n, cap; u8 *err; u8 emax; u8 *serr; StoreCertOld *old; } StoreCert;
+typedef struct { const void *tq; u32 gen, sgen; i32 n, cap; u8 *err; u8 emax; u8 *serr; StoreCertOld *old; } StoreCert;
 
 typedef struct {
     FILE    *jf;            /* write-ahead journal of adds/deletes since the last full save (store_sync) */
@@ -284,6 +284,8 @@ typedef struct {
     f64      win_sum;       /* the added rows' squared distances to their centroids, this window */
     i32      win_n, drifted;            /* rows in the window; windows that sat too far since the build */
     i64      n_indexed, n_rebuilds, rebuild_us;   /* what maintenance did (store_live_stats) */
+    i32      split_on;      /* live mode splits clusters past twice their size in place instead of rebuilding (default 1) */
+    i64      n_splits;      /* clusters split in place (store_live_stats2) */
     i64      rebuilding;    /* 1 while a live rebuild runs */
     Tq      *tq;            /* fast mode: the TurboQuant-style index */
     i32      fast;          /* 1: store_build skips the auto-tuner (engine_build_fast) */
@@ -898,6 +900,7 @@ RagStore *store_new(Arena *a, i32 dim)
     s->qlog_rng = 0x9e3779b9u;
     pthread_mutex_init(&s->qlog_mu, (const pthread_mutexattr_t *)0);
     s->live_grow = 1.0f;
+    s->split_on = 1;
     pthread_mutex_init(&s->mt_mu, (const pthread_mutexattr_t *)0);
     pthread_mutex_init(&s->rb_mu, (const pthread_mutexattr_t *)0);
     pthread_mutex_init(&s->mt_cmu, (const pthread_mutexattr_t *)0);
