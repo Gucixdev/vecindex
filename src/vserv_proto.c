@@ -153,6 +153,23 @@ static i32 vs_search_by_(VsWorker *w, VsConn *c, i32 k, i32 shift, i32 rng, i64 
     return n;
 }
 
+/* search with a proof (store_search_exact): the k best by exact score, as scoring every row; with rng only the rows
+ * whose number is in [lo, hi]. *chk gets how many rows were scored exactly. Scored as vs_search_ */
+static i32 vs_search_exact_(VsWorker *w, VsConn *c, i32 k, i32 rng, i64 lo, i64 hi, i64 *chk)
+{
+    StoreCnf cn;
+    i32 n, i;
+    memset(&cn, 0, sizeof(cn));
+    *chk = 0;
+    if (rng) { cn.num = 1; cn.lo = lo; cn.hi = hi; }
+    if (c->tn) { cn.ns_on = 1; cn.ns = c->tn; }
+    n = rng && lo > hi ? 0 : store_search_exact(c->t->s, w->vec, k, w->ids, w->sc, rng || c->tn ? &cn : (const StoreCnf *)0, chk);
+    if (n < 0) n = 0;
+    for (i = 0; i < n; ++i) w->sc[i] = store_score_out(c->t->s, w->sc[i]);
+    vs_out_(c, w->ids, n);
+    return n;
+}
+
 /* a new vector for id, its tag, number and text kept (store_update); queued in an open batch. 0, or -1: no such row */
 static i32 vs_update_(VsConn *c, const f32 *v, i64 id)
 {
@@ -208,6 +225,8 @@ static i32 vs_setnum_(VsConn *c, i64 id, i64 num)
  *                          a server with keys shows one, every other op answers status 6. A keyed connection gets
  *                          status 1 for build, save and snapshot (the server's housekeeping); status 7: the key's
  *                          requests a second are used up
+ *   op 24 search with a proof  payload: dim x f32   reply: count x { i64 id, f32 score }, then i64 rows scored
+ *                          exactly - the k best by exact score, the same as scoring every row (store_search_exact)
  *   op 21 journal, op 22 file, op 23 tenants: a replica following this server (vserv -F, vserv_repl.c); the
  *                          operator's only. status 8: the stamp changed, the payload is the new one */
 
@@ -266,7 +285,7 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
     }
     if (vs_need_key_(c)) { vs_bin_reply_(w, c, 6, 0, (const char *)0, 0); return (i32)(8 + nb); }   /* no key shown yet */
     if (!vs_key_take_(c)) { vs_bin_reply_(w, c, 7, 0, (const char *)0, 0); return (i32)(8 + nb); }   /* over the key's QPS */
-    if (!vs_admin_(c) && (op == 4 || op == 5 || op == 7 || op >= 21)) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); return (i32)(8 + nb); }
+    if (!vs_admin_(c) && (op == 4 || op == 5 || op == 7 || (op >= 21 && op <= 23))) { vs_bin_reply_(w, c, 1, 0, (const char *)0, 0); return (i32)(8 + nb); }
     if (op == 14) {                                              /* use a tenant: the payload is its name */
         const char *why = nb <= VS_TNAME ? vs_use_(c, (const char *)b, (i32)nb) : "a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -";
         if (why) vs_bin_reply_(w, c, 1, 0, why, (u32)strlen(why));
@@ -374,6 +393,20 @@ static i32 vs_binary_(VsWorker *w, VsConn *c)
         {   char *o = w->out + 8;
             for (i = 0; i < got; ++i) { vs_put64_(o, w->ids[i]); vs_put32_(o + 8, vs_fbits_(w->sc[i])); o += 12; }
             vs_bin_reply_(w, c, 0, (u16)got, w->out + 8, (u32)got * 12u); }
+        vs_logsearch_(c, k, got, t0);
+        break; }
+    case 24: {
+        double t0 = vs_now_();
+        i64 chk;
+        if (nb != (u32)vs_dim * 4) { vs_bin_reply_(w, c, 2, 0, (const char *)0, 0); break; }
+        vs_getf_(w->vec, b, vs_dim);
+        if (k < 1) k = 10;
+        if (k > VS_MAXK) k = VS_MAXK;
+        got = vs_search_exact_(w, c, k, 0, 0, 0, &chk);
+        {   char *o = w->out + 8;
+            for (i = 0; i < got; ++i) { vs_put64_(o, w->ids[i]); vs_put32_(o + 8, vs_fbits_(w->sc[i])); o += 12; }
+            vs_put64_(o, chk);
+            vs_bin_reply_(w, c, 0, (u16)got, w->out + 8, (u32)got * 12u + 8u); }
         vs_logsearch_(c, k, got, t0);
         break; }
     case 17:
@@ -931,24 +964,28 @@ static i32 vs_http_(VsWorker *w, VsConn *c)
     } else if (VS_IS("POST", "/search")) {
         char *p = o;
         double t0 = vs_now_();
-        i64 kq = vs_qparam_(t, tn, "k", 10, &qbad), gs = vs_qparam_(t, tn, "group", 0, &qbad);
+        i64 kq = vs_qparam_(t, tn, "k", 10, &qbad), gs = vs_qparam_(t, tn, "group", 0, &qbad), chk = -1;
+        i64 ex = vs_qparam_(t, tn, "exact", 0, &qbad);
         i64 lo = vs_qparam_(t, tn, "lo", (i64)((u64)1 << 63), &qbad), hi = vs_qparam_(t, tn, "hi", (i64)(((u64)1 << 63) - 1), &qbad);
         i32 rng = vs_qparam_(t, tn, "lo", 0, &qbad) == vs_qparam_(t, tn, "lo", 1, &qbad)        /* lo= or hi= there */
                || vs_qparam_(t, tn, "hi", 0, &qbad) == vs_qparam_(t, tn, "hi", 1, &qbad);
         if (qbad) VS_BADQ();
-        else if (gs < 0 || gs > 63 || (gs && rng) || lo > hi)
-            VS_HTTP_LIT(w, c, "400 Bad Request", "{\"error\":\"group is 1 to 63, lo <= hi, and not group with lo/hi\"}", keep);
+        else if (gs < 0 || gs > 63 || (gs && (rng || ex)) || lo > hi || ex < 0 || ex > 1)
+            VS_HTTP_LIT(w, c, "400 Bad Request", "{\"error\":\"group is 1 to 63, lo <= hi, exact is 0 or 1, and group goes with neither lo/hi nor exact\"}", keep);
         else if (raw ? clen != vs_dim * 4 : vs_json_vec_(w, body, clen) != 0) {
             VS_HTTP_LIT(w, c, "400 Bad Request", "{\"error\":\"expected a vector of the store's dimension\"}", keep);
         } else {
             if (raw) vs_getf_(w->vec, (const u8 *)body, vs_dim);
             k = kq < 1 ? 1 : (kq > VS_MAXK ? VS_MAXK : (i32)kq);
-            got = gs || rng ? vs_search_by_(w, c, k, (i32)gs, rng, lo, hi) : vs_search_(w, c, w->vec, k);
+            got = ex ? vs_search_exact_(w, c, k, rng, lo, hi, &chk)
+                : gs || rng ? vs_search_by_(w, c, k, (i32)gs, rng, lo, hi) : vs_search_(w, c, w->vec, k);
             p = vs_str_(p, "{\"ids\":[");
             for (i = 0; i < got; ++i) { if (i) *p++ = ','; p = vs_i64_(p, w->ids[i]); }
             p = vs_str_(p, "],\"scores\":[");
             for (i = 0; i < got; ++i) { if (i) *p++ = ','; p = vs_f32_(p, w->sc[i]); }
-            p = vs_str_(p, "]}");
+            *p++ = ']';
+            if (ex) { p = vs_str_(p, ",\"checked\":"); p = vs_i64_(p, chk); }
+            *p++ = '}';
             vs_http_reply_(w, c, "200 OK", o, (i32)(p - o), keep);
             vs_logsearch_(c, k, got, t0);
         }

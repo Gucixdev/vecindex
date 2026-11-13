@@ -59,6 +59,7 @@ pub mod ffi {
         pub fn vi_search_hybrid(db: *mut ViDb, q: *const c_float, text: *const c_char, tlen: c_int, k: c_int,
                                 ids: *mut i64, sc: *mut c_float) -> c_int;
         pub fn vi_search_grouped(db: *mut ViDb, q: *const c_float, k: c_int, shift: c_int, ids: *mut i64, sc: *mut c_float) -> c_int;
+        pub fn vi_search_exact(db: *mut ViDb, q: *const c_float, k: c_int, ids: *mut i64, sc: *mut c_float, checked: *mut i64) -> c_int;
         pub fn vi_build(db: *mut ViDb);
         pub fn vi_save(db: *mut ViDb, path: *const c_char) -> c_int;
         pub fn vi_sync(db: *mut ViDb) -> c_int;
@@ -340,6 +341,23 @@ impl Db {
             return Err(last("search"));
         }
         Ok(ids.into_iter().zip(sc).take(n as usize).collect())
+    }
+
+    /// The `k` rows with the highest exact score - the same as scoring every row - and how many rows were scored
+    /// exactly: the fast scan's error bound (proved in `lean4/Vecindex/Exact.lean`) rules the others out.
+    pub fn search_exact(&self, query: &[f32], k: usize) -> Result<(Vec<(i64, f32)>, i64)> {
+        self.check(query)?;
+        if k == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let mut ids = vec![0i64; k];
+        let mut sc = vec![0.0f32; k];
+        let mut chk = 0i64;
+        let n = unsafe { ffi::vi_search_exact(self.db, query.as_ptr(), k as c_int, ids.as_mut_ptr(), sc.as_mut_ptr(), &mut chk) };
+        if n < 0 {
+            return Err(last("search_exact"));
+        }
+        Ok((ids.into_iter().zip(sc).take(n as usize).collect(), chk))
     }
 
     /// Indexes what was added (rows are indexed as they come by default; this does it now).

@@ -15,6 +15,7 @@ for (const [id, score] of db.search(query, 5)) console.log(id, score, db.text(id
 db.search(query, 5, { ns: ['alice', 'shared'] });   // several namespaces at once
 db.search(null, 5, { text: 'invoice 4417' });       // words alone (with a vector: fused with it)
 db.search(query, 5, { group: 20 });                 // one hit a document, ids doc << 20 | chunk
+const { hits, checked } = db.searchExact(query, 5); // the exact 5 best, with a proof; checked: rows scored exactly
 db.close();
 ```
 

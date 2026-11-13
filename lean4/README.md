@@ -55,13 +55,13 @@ first build. Without it lake compiles the part of Mathlib these files need, with
 modules, which took about 30 minutes on the 2 vCPUs used here. `./run all` runs `lean4/run` too when `lake` is
 installed.
 
-On a 2-vCPU Xeon with AVX-512, 2026-11-11:
+On a 2-vCPU Xeon with AVX-512, 2026-11-13:
 
 ```
 =================== lean4 summary ===================
   STEP                   RESULT  WHAT IT CHECKED
-  lake build             ok      2743 jobs, proofs and oracle
-  axiom audit            ok      743 theorems (260 written in the sources)
+  lake build             ok      2785 jobs, proofs and oracle
+  axiom audit            ok      753 theorems (270 written in the sources)
   source scan            ok      no sorry, admit, native_decide, bv_decide or axiom
   gen/trustlean.c        ok      printed by TrustLean from the proved programs
   gf native              ok      260 lines: every table entry and product, the coefficients hashed
@@ -112,6 +112,7 @@ m + 1 is reported as damaged, not passed off as rebuilt.
 | `vs_bucket_` (`vserv_keys.c`) | `Rate.lean` | `step_inv`: the tokens stay in [0, qps]; `window`: of any run of requests from t1 to t2 at most qps + qps (t2 - t1) get through, whatever came before; `wait_ok`: after 1/qps of quiet a request is let through |
 | `tq_in_set_` (`tq.c`), the namespace set of `store_search_nss` | `NsSet.lean` | `inSet_iff`: on a set sorted ascending without repeats, the branchless lower bound answers exactly membership; `go_lt`: it reads only inside the set |
 | `tq_em_update_`, `tq_em_revive_`, `tq_em_alpha_` (`tq.c`, e-means) | `Emeans.lean` | `pos_eq_ratio`: the C code's position-and-mass update equals the paper's running count and sum, ((1-a) S + a s) / ((1-a) N + a n); `lloyd_step`: a step of 1 makes a centroid the mean of its batch, one Lloyd round on a batch of every row; `weight_mem`, `pos_between`: for 0 < a <= 1 a step moves a centroid towards its batch mean and never past it; `mass_pos`: the mass stays positive; `split_mass`: a revival halves the donor's mass; `alpha_mem`: every step of the schedule lies in [a0 / 10, a0] for any cosine in [-1, 1]. Over any ordered field: the f32 code is held to it by `tests/emeans_test.c`, the whole algorithm to Meta's reference by `tests/emeans_ref.py` |
+| `store_search_exact`, `store_ex_b_`, `store_ex_byte_` (`store_exact.c`, search with a proof) | `Exact.lean` | `dot_split`, `cs_abs`: a row's cosine is the code's part plus q·e, and \|q·e\| <= \|q\| \|e\| (Cauchy-Schwarz); `byte_covers`: the error byte, ceil(\|e\| / step), covers \|e\|; `round_sum`, `table_sum`: u8 table entries each within 1/2 of exact add up to within n / (2 sc) of the exact sum; `est_bound`: together, \|cosine - estimate\| <= (n / (2 sc) + \|q\| byte step) / dim + margin; `skip_sound`: every metric's score is a line a c + b0 with a >= 0, so a row whose line at estimate + bound is under the threshold scores under it; `skipped_not_topk`: such a row has k rows strictly better; `answer_top`: the k best of the rows scored exactly, every other row skipped under a threshold each answer row reaches, is the store's exact top k; `full_or_all`: an answer short of k means no row was skipped. Over any ordered field: `tests/exact_test.c` checks each term of the bound on every row, from codes decoded apart from the encoder, and the answer against every row scored |
 
 ## TrustLean and AMO-Lean
 

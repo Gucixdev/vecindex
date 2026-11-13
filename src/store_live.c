@@ -142,6 +142,7 @@ static i32 store_rebuild_(RagStore *s, i32 nth)
         nt->nprobe = np < 1 ? 1 : (np > nt->nc ? nt->nc : np);
     }
     if (nt->codes1 && !s->cascade) tq_cascade_off(nt);         /* turned off while this was building */
+    store_ex_reap_(s);
     s->tq = nt;
     s->built_upto = nt->n;                                       /* rows beyond it (if any) pend, as usual */
     s->tuned_n = 0;

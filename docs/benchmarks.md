@@ -160,6 +160,47 @@ to 0.974 recall@10 over 15 runs against 0.937 to 0.974 with Lloyd's - although a
 ahead on that data too (1,000 held-out queries, 3 seeds, 50 and 93 clusters: +0.3 to +3.7 points). The tuner
 trusting easy traffic is the real issue; the test's bound went from 0.92 to 0.88 with that written next to it.
 
+## Search with a proof (2026-11-13)
+
+`vi_search_exact` returns the k best rows by exact score - the same set as scoring every row - and says how many rows
+it scored. The 4-bit scan gives every row an estimate and a bound on its error (the u8 tables' rounding plus
+Cauchy-Schwarz on the coding error, with one byte a row holding the error's length rounded up); the best 64
+estimates are scored exactly, their 10th best score is the bar, and a row whose estimate plus bound stays under the
+bar is out. `lean4/Vecindex/Exact.lean` proves each step and that the answer is exact; `tests/exact_test.c` checks
+every term of the bound on every row, in 12 configurations (2- and 1-bit codes, int8 rows, dot and L2, deletes,
+live adds, filters, a reload), and the answer against every row scored.
+
+`bench/exact.c` on GloVe-Twitter-100 (1,183,514 rows, the 10,000 held-out queries of the e-means section above),
+k = 10, the 2-vCPU Xeon @ 2.10GHz, `gcc -O2 -march=native`, commit after 41ff704. "Every row" is the store's own
+SIMD dot over every f32 row, one thread, on the first 200 queries.
+
+| | vi_search | vi_search_exact | every row |
+|---|---|---|---|
+| recall@10 against the ground truth | 0.9594 | 1.0000 | 1.0000 |
+| top 10 scores equal to every row's (1e-5) | - | 200 / 200 | - |
+| latency, median / p99 | 0.62 / 1.34 ms | 6.86 / 14.86 ms | 47.8 / 68.0 ms |
+| rows scored exactly, median / mean / p99 / max | - | 1,169 / 1,602 / 5,960 / 11,268 (0.14% mean) | 1,183,514 |
+
+So the exact answer costs about 11 times vi_search and a seventh of scoring every row. The time is mostly the scan
+of every code (~3.5 ms on 2 threads: 59 MB of codes, no cluster skipped); the first 2,000 queries, frequent words,
+re-score a median 277 rows and take 4.3 ms. On those 2,000: the first version tested every row on its own
+bound (20 ms); comparing each u16 sum with one cut for the store's largest error byte first, 5.6 ms; picking the
+best 64 inside the scan threads, and a cut per error byte read in slot order, no measurable change; skipping a block
+of 32 by its biggest sum, 4.3 ms. The first exact search
+after a build computes every row's error byte (about 0.4 s here); later ones reuse them until the index changes.
+
+What the proof covers and what it does not: the theorems are over an ordered field; the C computes in f32 and f64,
+and `STORE_EX_MARGIN` (1e-4 in cosine units, against rounding of about 1e-6) covers that step, which is tested, not
+proved. Mutants of `src/store_exact.c` that the tests catch: no table-rounding term, an error byte rounded down, the
+L2 line's sign, an error byte of 255 taken as a value, wrong 2-bit levels, a scaled query length, no reset on
+compaction, the slot-order bytes or the largest byte wrong, a block's biggest sum over half the block, the cut or the
+skip test off by one at the boundary. Survivors: no float margin (the f32 error here is far below the bound's
+slack), the bar never raised or the cuts not refreshed when it rises, the first 64 picked before the list is full
+(each only slower: any bar from rows scored exactly is a valid bar), the generation check without the reset and no
+reset on the live swap (the index pointer covers both); and one that is a real hole the tests cannot reach: the
+block test called with the cut plus one would skip a block whose biggest sum equals the cut exactly - the test
+itself is checked at that boundary, the call site only by reading it.
+
 ## Bottlenecks now
 
 Measured on this host unless noted; ordered by how much of a query (or a build) each one is.
@@ -191,4 +232,6 @@ gcc -std=c89 -O2 -march=native -D_POSIX_C_SOURCE=200112L -Isrc bench/kmeans.c -l
 zcat glove-twitter-100.gz | .build/kmeans prep KM_DIR   # github.com/RaRe-Technologies/gensim-data, release glove-twitter-100
 VECINDEX_KMEANS=lloyd TQ_VERBOSE=1 .build/kmeans run KM_DIR 1   # and emeans:2, emeans:3; seeds 1 2 3
 EMEANS_REF=FAISS/contrib GLOVE_TRAIN=KM_DIR/train.bin ./run      # e-means against Meta's reference
+gcc -std=c89 -O2 -march=native -D_POSIX_C_SOURCE=200112L -Isrc -Iinclude bench/exact.c -lm -lpthread -o .build/exact
+.build/exact KM_DIR                                              # search with a proof against vi_search and every row
 ```

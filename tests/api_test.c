@@ -120,6 +120,32 @@ int main(void)
     sprintf(line, "vi_search_batch == vi_search on %d/100 queries", same);
     check(same == 100, line);
 
+    {   /* vi_search_exact against every live row scored here from vi_get: the same k best cosines */
+        float top[10], *q, c, qq;
+        vi_i64 chk = -1, tchk = 0;
+        int j, t, bad = 0;
+        for (i = 0; i < 40; ++i) {
+            q = qs + (size_t)(i * 37) * DIM;
+            for (j = 0; j < 10; ++j) top[j] = -2.0f;
+            for (qq = 0.0f, j = 0; j < DIM; ++j) qq += q[j] * q[j];
+            qq = (float)sqrt((double)qq);
+            for (t = 0; t < N; ++t) {
+                if (vi_get(db, 1000 + t, w) != 0) continue;
+                for (c = 0.0f, j = 0; j < DIM; ++j) c += w[j] * q[j] / qq;
+                for (j = 9; j >= 0 && top[j] < c; --j) if (j < 9) top[j + 1] = top[j];
+                if (j < 9) top[j + 1] = c;
+            }
+            n = vi_search_exact(db, q, 10, got, sc, &chk);
+            tchk += chk;
+            for (j = 0; j < 10; ++j) if (n != 10 || fabs((double)(sc[j] - top[j])) > 1e-4) bad = 1;
+            for (j = 0; j < n; ++j) if (vi_get(db, got[j], w) != 0) bad = 1;
+        }
+        sprintf(line, "vi_search_exact == every row scored on 40 queries (%d rows scored exactly a query)", (int)(tchk / 40));
+        check(!bad && tchk < (vi_i64)40 * N, line);
+        check(vi_search_exact(db, q, 0, got, sc, &chk) == -1 && vi_search_exact(db, q, 3, got, sc, (vi_i64 *)0) == 3,
+              "vi_search_exact: k 0 refused, checked may be NULL");
+    }
+
     check(vi_snapshot(db, (const char *)0) == 0, "vi_snapshot starts a background snapshot of the store's file");
     for (i = 0; i < 200; ++i) { vec_(N + i, v); vi_add(db, 1000 + N + i, v); }
     check(vi_snapshot_wait(db, 1) == 0, "vi_snapshot_wait: written");

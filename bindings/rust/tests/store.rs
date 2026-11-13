@@ -126,6 +126,32 @@ fn grouped_and_threads() {
 }
 
 #[test]
+fn exact() {
+    let cos = |a: &[f32], b: &[f32]| {
+        let d: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        d / (a.iter().map(|x| x * x).sum::<f32>() * b.iter().map(|x| x * x).sum::<f32>()).sqrt()
+    };
+    let db = Db::memory(DIM).unwrap();
+    for i in 1..=2000i64 {
+        db.add(i, &vec(i)).unwrap();
+    }
+    db.build();
+    for i in 5000..5010i64 {
+        let q = vec(i);
+        let (hits, checked) = db.search_exact(&q, 10).unwrap();
+        let mut best: Vec<f32> = (1..=2000i64).map(|r| cos(&q, &vec(r))).collect();
+        best.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert_eq!(hits.len(), 10);
+        for (h, b) in hits.iter().zip(&best) {
+            assert!((h.1 - b).abs() < 1e-4, "{} vs {}", h.1, b);
+        }
+        assert!((10..=2000).contains(&checked));
+    }
+    assert_eq!(db.search_exact(&vec(1), 0).unwrap(), (Vec::new(), 0));
+    assert!(db.search_exact(&[0.0; DIM - 1], 3).is_err());
+}
+
+#[test]
 fn version_and_key() {
     assert_eq!(vecindex::version(), env!("CARGO_PKG_VERSION"));
     assert_eq!(key("acme"), key("acme"));

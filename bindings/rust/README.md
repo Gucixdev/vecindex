@@ -21,6 +21,7 @@ for (id, score) in db.search(&query, 5)? {
 db.search_where(Some(&query), 5, Some(Filter::AnyNs(&[key("alice"), key("shared")])))?;
 db.search_where(None, 5, Some(Filter::Text("invoice 4417")))?;   // words alone; with a vector, fused
 db.search_where(Some(&query), 5, Some(Filter::Group(20)))?;      // one hit a document (ids doc << 20 | chunk)
+let (hits, checked) = db.search_exact(&query, 5)?;               // the exact 5 best, with a proof
 ```
 
 Errors are `vecindex::Error` with the library's reason. `vecindex::ffi` is the raw C API, for what the safe one does

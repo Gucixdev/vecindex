@@ -81,6 +81,7 @@ _sig("vi_search_range", ctypes.c_int, _vp, _f32p, ctypes.c_int, _i64, _i64, _i64
 _sig("vi_search_labeled", ctypes.c_int, _vp, _f32p, ctypes.c_int, _cp, _cp, _cp, _i64p, _f32p)
 _sig("vi_search_hybrid", ctypes.c_int, _vp, _f32p, _cp, ctypes.c_int, ctypes.c_int, _i64p, _f32p)
 _sig("vi_search_grouped", ctypes.c_int, _vp, _f32p, ctypes.c_int, ctypes.c_int, _i64p, _f32p)
+_sig("vi_search_exact", ctypes.c_int, _vp, _f32p, ctypes.c_int, _i64p, _f32p, _i64p)
 _sig("vi_build", None, _vp)
 _sig("vi_save", ctypes.c_int, _vp, _cp)
 _sig("vi_sync", ctypes.c_int, _vp)
@@ -319,6 +320,21 @@ class DB:
         if n < 0:
             raise _err("search")
         return [(ids[i], sc[i]) for i in range(n)]
+
+    def search_exact(self, vec, k=10):
+        """The k rows with the highest exact score - the same as scoring every row - as ([(id, score)], checked):
+        the fast scan's error bound (proved in lean4/Vecindex/Exact.lean) rules the other rows out, and checked is
+        how many rows were scored exactly."""
+        k = int(k)
+        if k <= 0:
+            return [], 0
+        ids = (_i64 * k)()
+        sc = (ctypes.c_float * k)()
+        chk = _i64(0)
+        n = _L.vi_search_exact(self._h(), self._vec(vec), k, ids, sc, ctypes.byref(chk))
+        if n < 0:
+            raise _err("search_exact")
+        return [(ids[i], sc[i]) for i in range(n)], chk.value
 
     # -- the file --
     def build(self):

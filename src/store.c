@@ -228,6 +228,10 @@ typedef struct {
     i64      used;          /* the next free byte */
 } STx;
 
+/* the error bytes of search with a proof (store_exact.c): one a row, for one index and one row order */
+typedef struct StoreCertOld { u8 *err; struct StoreCertOld *next; } StoreCertOld;
+typedef struct { const void *tq; u32 gen; i32 n, cap; u8 *err; u8 emax; u8 *serr; StoreCertOld *old; } StoreCert;
+
 typedef struct {
     FILE    *jf;            /* write-ahead journal of adds/deletes since the last full save (store_sync) */
     char    *jpath;
@@ -361,7 +365,12 @@ typedef struct {
     i64      txlive;        /* bytes of the live rows' texts */
     Lex     *lex;           /* BM25 over the live rows' texts: built by the first hybrid search, kept up to date after */
     pthread_mutex_t lex_mu; /* that first build */
+    StoreCert *cert;        /* search with a proof: each row's error byte, built on the first such search */
+    pthread_mutex_t cert_mu; /* building or extending it */
+    u32      cert_gen;      /* moved on every new index or row order: a cert of an older one starts over */
 } RagStore;
+static void store_ex_reap_(RagStore *s);
+static void store_ex_free_(RagStore *s);
 
 /* row accessors (also for tests and tools) */
 #define STORE_VEC(s, r)  ((f32 *)(void *)SCOL_AT(&(s)->vec, r))      /* f32 stores only (vbytes == 4) */
@@ -900,6 +909,7 @@ RagStore *store_new(Arena *a, i32 dim)
     pthread_mutex_init(&s->heal_mu, (const pthread_mutexattr_t *)0);
     pthread_mutex_init(&s->lens_mu, (const pthread_mutexattr_t *)0);
     pthread_mutex_init(&s->ns_mu, (const pthread_mutexattr_t *)0);
+    pthread_mutex_init(&s->cert_mu, (const pthread_mutexattr_t *)0);
     pthread_cond_init(&s->lens_cv, (const pthread_condattr_t *)0);
     s->snap_last = 2;
     s->spill_fd = -1;
@@ -970,6 +980,7 @@ void store_destroy(RagStore *s)
     arena_free(&s->idx_arena);
     scol_free_(&s->vec); scol_free_(&s->idc); scol_free_(&s->metac); scol_free_(&s->vsc); scol_free_(&s->txo); scol_free_(&s->tck); scol_free_(&s->rck); scol_free_(&s->nrm); scol_free_(&s->numc); scol_free_(&s->nsc);
     store_ns_free_(s); pthread_mutex_destroy(&s->ns_mu);
+    store_ex_free_(s); pthread_mutex_destroy(&s->cert_mu);
     if (s->msum) { store_msum_free_(s->msum); s->msum = (void *)0; }
     free(s->vbits); s->vbits = (u64 *)0; free(s->vmem); s->vmem = (u8 *)0;
     pthread_mutex_destroy(&s->lens_mu); pthread_cond_destroy(&s->lens_cv);
@@ -1338,6 +1349,7 @@ void store_set_fast(RagStore *s, f32 target_recall)
     s->fast = 1; s->fast_target = target_recall > 0.0f ? target_recall : 0.9f;
     if (!s->tq && s->count > 0 && s->built_upto == s->count) {   /* a loaded, already-built store */
         s->idx = (EngIndex *)0;
+        store_ex_reap_(s);
         s->tq = store_tq_build_(s, s->count);
     }
     pthread_rwlock_unlock(&s->lock);
@@ -1725,6 +1737,7 @@ static i32 store_compact_(RagStore *s)
         for (x = 0; x <= words; ++x) { pre[x] = acc; if (x < words) acc += tq_pop64_(s->dead[x]); }
         bu = s->built_upto - store_dead_before_(s, pre, s->built_upto);
         if (s->tq) tq_remap(s->tq, s->dead, pre, bu);
+        store_ex_reap_(s);                                       /* rows renumbered: their error bytes too */
         if (s->idx) { s->idx = (EngIndex *)0; arena_reset(&s->idx_arena); bu = 0; }
         s->built_upto = bu;
         s->dead_built = 0;
@@ -1781,6 +1794,7 @@ void store_build(RagStore *s)
     pthread_rwlock_wrlock(&s->lock);
     if (s->mem_tier >= 1) store_tq_pin_(s, s->tq, 0, 0);         /* its pages in the file go back to the kernel */
     tq_free(s->tq); s->tq = (Tq *)0;                             /* rebuilt below: no use remapping it */
+    store_ex_reap_(s);
     w = store_compact_(s);
     arena_reset(&s->idx_arena);
     s->tuned_n = 0; s->dead_built = 0; s->win_sum = 0.0; s->win_n = 0; s->drifted = 0;
@@ -1819,6 +1833,7 @@ static i32 store_cnf_ok_(const RagStore *s, const StoreCnf *c, i32 row)
 
 #include "store_ns.c"
 #include "store_search.c"
+#include "store_exact.c"
 
 #include "store_text.c"
 

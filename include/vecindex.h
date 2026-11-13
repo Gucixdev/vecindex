@@ -242,6 +242,14 @@ VI_API int vi_search_grouped(vi_db *db, const float *query, int k, int shift, vi
  * query, a missing hit has id -1 and score -1. 0, or -1 when an argument or a query is wrong. */
 VI_API int vi_search_batch(vi_db *db, const float *queries, int nq, int k, vi_i64 *ids, float *scores, int threads);
 
+/* vi_search with a proof: the k rows with the highest exact score, the same set as scoring every row, at most a few
+ * times the time of vi_search. The fast scan gives each row an estimate and a bound on its error, proved in
+ * lean4/Vecindex/Exact.lean (Cauchy-Schwarz on the coding error, the table rounding); a row is scored exactly unless
+ * its estimate plus bound is below the k-th best exact score found so far. *checked (NULL: not wanted) gets how many
+ * rows were scored exactly - the rest were ruled out by the bound. Ties at the k-th score may come out either way.
+ * Returns how many hits, or -1 as vi_search. */
+VI_API int vi_search_exact(vi_db *db, const float *query, int k, vi_i64 *ids, float *scores, vi_i64 *checked);
+
 /* Builds the index over every row now (with VI_MANUAL; by default the store's own thread does it as rows come). */
 VI_API void vi_build(vi_db *db);
 

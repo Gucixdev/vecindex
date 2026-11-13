@@ -117,6 +117,15 @@ try:
     check(bin_call(s, 4)[0] == 0, "binary: build")
     st, hits = bin_search(s, vecs[17], 5)
     check(st == 0 and hits and hits[0][0] == 17, "binary: search finds row 17 first %s" % (hits[:2],))
+    def cosv(a, b):
+        return sum(x * y for x, y in zip(a, b)) / (sum(x * x for x in a) * sum(y * y for y in b)) ** 0.5
+    q = [rng.uniform(-1, 1) for _ in range(DIM)]
+    best = sorted(((cosv(q, v), i) for i, v in enumerate(vecs)), reverse=True)[:10]
+    st, cnt, body = bin_call(s, 24, 10, struct.pack("<%df" % DIM, *q))
+    hits = [struct.unpack_from("<qf", body, 12 * i) for i in range(cnt)] if st == 0 else []
+    chk = struct.unpack_from("<q", body, 12 * cnt)[0] if st == 0 and len(body) == 12 * cnt + 8 else -1
+    check(st == 0 and cnt == 10 and all(abs(h[1] - b[0]) < 1e-4 for h, b in zip(hits, best)) and 10 <= chk <= N,
+          "binary: op 24 search with a proof == every row scored (%d of %d rows scored exactly)" % (chk, N))
     st, cnt, body = bin_call(s, 6)
     live = struct.unpack("<4q", body)[0] if body else -1
     check(live == N, "binary: stats live=%d" % live)
@@ -139,6 +148,15 @@ try:
     check(http("POST", "/delete?id=3") == (200, {"removed": 1}), "http: POST /delete?id=3")
     code, r = http("POST", "/search?k=10", vecs[3])
     check(code == 200 and 3 not in r["ids"], "http: deleted row gone")
+    live = {i: v for i, v in enumerate(vecs) if i != 3}
+    live[5000] = newv
+    q = [rng.uniform(-1, 1) for _ in range(DIM)]
+    best = sorted(((cosv(q, v), i) for i, v in live.items()), reverse=True)[:10]
+    code, r = http("POST", "/search?k=10&exact=1", q)
+    check(code == 200 and len(r["scores"]) == 10 and all(abs(x - b[0]) < 1e-4 for x, b in zip(r["scores"], best)) and 10 <= r["checked"] <= N + 1,
+          "http: POST /search?exact=1 == every row scored, checked %s" % (r.get("checked") if code == 200 else code))
+    check(http("POST", "/search?k=5&exact=1&group=20", q)[0] == 400 and http("POST", "/search?exact=2", q)[0] == 400,
+          "http: exact with group, exact=2 -> 400")
     check(http("POST", "/search", [1.0, 2.0])[0] == 400, "http: short vector -> 400")
     check(http("POST", "/search", "nonsense")[0] == 400, "http: not a vector -> 400")
     check(http("GET", "/nope")[0] == 404, "http: unknown path -> 404")

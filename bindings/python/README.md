@@ -21,6 +21,7 @@ with vecindex.open("docs.vxi", dim=384) as db:          # made when it is not th
     db.search(query, k=5, text="invoice 4417")           # words too: BM25 fused with the vector
     db.search(query, k=5, num=(1700000000, 1800000000))  # a range of the rows' numbers (a date, a price)
     db.search(query, k=5, group=20)                      # one hit a document, with ids doc << 20 | chunk
+    hits, checked = db.search_exact(query, k=5)          # the exact 5 best, with a proof; checked: rows scored exactly
 ```
 
 Vectors are any sequence of floats; `array.array("f")` and float32 numpy arrays go in without a per-element copy.

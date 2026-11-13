@@ -162,6 +162,23 @@ try {
     db.close();
   });
 
+  await t('searchExact: the same k best cosines as scoring every row, and how many rows were scored', async () => {
+    const cos = (a, b) => a.reduce((s, x, d) => s + x * b[d], 0) / Math.sqrt(a.reduce((s, x) => s + x * x, 0) * b.reduce((s, x) => s + x * x, 0));
+    const db = await open(null, { dim: DIM });
+    for (let i = 1; i <= 2000; i++) db.add(i, vec(i));
+    db.build();
+    for (let i = 5000; i < 5010; i++) {
+      const q = vec(i), { hits, checked } = db.searchExact(q, 10);
+      const best = Array.from({ length: 2000 }, (_, r) => cos(q, vec(r + 1))).sort((a, b) => b - a).slice(0, 10);
+      assert.strictEqual(hits.length, 10);
+      hits.forEach(([, s], j) => assert.ok(Math.abs(s - best[j]) < 1e-4, `${s} vs ${best[j]}`));
+      assert.ok(checked >= 10 && checked <= 2000);
+    }
+    assert.deepStrictEqual(db.searchExact(vec(1), 0), { hits: [], checked: 0 });
+    assert.throws(() => db.searchExact(new Array(DIM - 1).fill(0), 3));
+    db.close();
+  });
+
   await t('metrics: dot scores are the inner product, L2 scores the distance; an unknown metric refused', async () => {
     const dot = (a, b) => a.reduce((s, x, d) => s + x * b[d], 0);
     const dist = (a, b) => Math.sqrt(a.reduce((s, x, d) => s + (x - b[d]) ** 2, 0));

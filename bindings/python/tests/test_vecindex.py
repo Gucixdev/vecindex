@@ -136,6 +136,25 @@ class Store(unittest.TestCase):
             self.assertEqual(docs[0], 3)
             self.assertEqual(len(set(docs)), 3)
 
+    def test_exact(self):
+        def cos(a, b):
+            return sum(x * y for x, y in zip(a, b)) / math.sqrt(sum(x * x for x in a) * sum(y * y for y in b))
+        with vecindex.open(None, dim=DIM) as db:
+            for i in range(1, 2001):
+                db.add(i, vec(i))
+            db.build()
+            for i in range(5000, 5010):
+                q = vec(i)
+                hits, checked = db.search_exact(q, k=10)
+                best = sorted((cos(q, vec(r)) for r in range(1, 2001)), reverse=True)[:10]
+                self.assertEqual(len(hits), 10)
+                for (_, s), b in zip(hits, best):
+                    self.assertAlmostEqual(s, b, places=4)
+                self.assertTrue(10 <= checked <= 2000)
+            self.assertEqual(db.search_exact(vec(1), k=0), ([], 0))
+            with self.assertRaises(Exception):
+                db.search_exact([0.0] * (DIM - 1))
+
     def test_scores(self):
         def cos(a, b):
             return sum(x * y for x, y in zip(a, b)) / math.sqrt(sum(x * x for x in a) * sum(y * y for y in b))

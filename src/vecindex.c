@@ -620,6 +620,19 @@ VI_API vi_i64 vi_count_ns(vi_db *db, vi_i64 ns)
     return (vi_i64)store_count_ns(db->s, (i64)ns);
 }
 
+VI_API int vi_search_exact(vi_db *db, const float *query, int k, vi_i64 *ids, float *scores, vi_i64 *checked)
+{
+    int n;
+    i64 c = 0;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    n = store_search_exact(db->s, query, (i32)k, (i64 *)ids, scores, (const StoreCnf *)0, &c);
+    if (n < 0) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    vi_cos_(db, scores, n);
+    if (checked) *checked = (vi_i64)c;
+    return n;
+}
+
 VI_API int vi_search(vi_db *db, const float *query, int k, vi_i64 *ids, float *scores)
 {
     int n;

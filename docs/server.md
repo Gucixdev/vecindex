@@ -94,11 +94,13 @@ socket; a tenant's key gets 403. A Prometheus scrape with keys sends the `*` key
 Ops: 1 search, 2 add, 3 delete, 4 build, 5 save, 6 stats, 7 snapshot, 8 get, 9 delete a range of ids, 10 add with a
 text, 11 get a text, 12 the ids in a range, 13 hybrid search, 14 use a tenant, 15 grouped search (`u32 shift`, then
 the vector), 16 a number range (`i64 lo, i64 hi`, then the vector), 17 update (`i64 id`, then the vector), 18 set a
-number (`i64 id, i64 number`), 19 get a number (`i64 id`, reply `i64`).
+number (`i64 id, i64 number`), 19 get a number (`i64 id`, reply `i64`), 24 search with a proof (the vector; the
+reply's hits, then `i64` rows scored exactly - see `vi_search_exact` in api.md).
 
 **HTTP/1.1** (anything else): `GET /health`, `GET /stats`, `GET /get?id=N`, `GET /text?id=N`,
 `GET /range?lo=&hi=&max=`, `GET /num?id=`, `POST /search?k=` (with `&group=SHIFT` one hit a group, with `&lo=&hi=`
-the rows whose number is in the range), `/hybrid?k=`, `/update?id=`, `/num?id=&num=`, `/add?id=`, `/delete?id=` or `/delete?lo=&hi=`, `/build`,
+the rows whose number is in the range, with `&exact=1` the k best by exact score with a proof and `"checked"`, the
+rows scored exactly, in the reply; not with `group`), `/hybrid?k=`, `/update?id=`, `/num?id=&num=`, `/add?id=`, `/delete?id=` or `/delete?lo=&hi=`, `/build`,
 `/save`, `/snapshot`; vectors as a JSON array or raw little-endian f32 (an add's text after the floats), or
 `{"vector": [...], "text": "..."}` for an add with a text and for `/hybrid` (either key); keep-alive, pipelining. The header scan looks for the blank line 16 bytes at a time with SSE2 (the picohttpparser
 idea, cut down to what this server needs).

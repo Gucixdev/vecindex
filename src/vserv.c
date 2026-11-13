@@ -64,7 +64,8 @@
  *   lines (a lowercase letter): "search 10 0.1 0.2 ..." -> "ok 3 42 -0.01 17 -0.12 9 -0.31", one line each way,
  *     for nc, socat and a readline in any language; texts: addt, text, range, hybrid, words
  *   HTTP/1.1 (anything else), for curl and friends; keep-alive, Content-Length bodies:
- *     GET /health | GET /stats | GET /get?id=N | GET /text?id=N | GET /range?lo=A&hi=B | POST /search?k=10 |
+ *     GET /health | GET /stats | GET /get?id=N | GET /text?id=N | GET /range?lo=A&hi=B | POST /search?k=10
+ *     (&exact=1: the k best by exact score with a proof, and "checked": rows scored exactly) |
  *     POST /hybrid?k=10 | POST /add?id=N | POST /delete?id=N (or ?lo=A&hi=B) | POST /build | POST /save |
  *     POST /snapshot | GET /metrics (JSON) | GET /prometheus (the Prometheus text format); vectors as a JSON array ([0.1, -0.2, ...]), {"vector": [...], "text": "..."}, or raw
  *     little-endian f32 with Content-Type: application/octet-stream; replies are JSON.

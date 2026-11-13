@@ -214,6 +214,21 @@ export class DB {
     return this._hits(n);
   }
 
+  /**
+   * The k rows with the highest exact score - the same as scoring every row - as {hits, checked}: the fast scan's
+   * error bound (proved in lean4/Vecindex/Exact.lean) rules the other rows out; checked rows were scored exactly.
+   */
+  searchExact(vec, k = 10) {
+    if (k <= 0) return { hits: [], checked: 0 };
+    this._room(k);
+    const db = this._h(), q = this._vec(vec), c = this.x.malloc(8);
+    try {
+      const n = this.x.vi_search_exact(db, q, k, this.ids, this.sc, c);
+      const hits = this._hits(n);
+      return { hits, checked: Number(new BigInt64Array(this.x.memory.buffer, c, 1)[0]) };
+    } finally { this.x.free(c); }
+  }
+
   /** Indexes what was added (rows are indexed as they are searched by default; this does it now). */
   build() { this.x.vi_build(this._h()); }
   /** Writes the whole store (to path, or its own file) and starts a fresh journal. */

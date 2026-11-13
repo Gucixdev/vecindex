@@ -58,6 +58,8 @@ export class DB {
   addLabels(id: Id, labels: string | string[]): void;
   removeLabels(id: Id, labels: string | string[]): void;
   search(vec: Vector | null, k?: number, opts?: SearchOptions): Hit[];
+  /** The k rows with the highest exact score (the same as scoring every row); checked: rows scored exactly. */
+  searchExact(vec: Vector, k?: number): { hits: Hit[]; checked: number };
   build(): void;
   save(path?: string): void;
   sync(): void;

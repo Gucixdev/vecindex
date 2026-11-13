@@ -303,10 +303,12 @@ static void *tq_job_(void *arg)
 }
 
 /* the query's 16-entry tables, one per code column, quantised to u8 (lut: vd * 16 + 32 bytes; rot, tmp: dpad
- * floats; lf: vd * 16 floats) */
-static void tq_lut_(const Tq *t, const f32 *q, f32 *rot, f32 *tmp, f32 *lf, u8 *lut)
+ * floats; lf: vd * 16 floats). sc, base (may be NULL): what turns a row's u16 sum S back into its estimate - the rotated
+ * query dotted with the row's levels is S / sc + base, within vd / (2 sc) (each table entry rounded to the nearest) */
+static void tq_lut_ex_(const Tq *t, const f32 *q, f32 *rot, f32 *tmp, f32 *lf, u8 *lut, f32 *sc, f64 *base)
 {
     f32 maxr = 0.0f, scale;
+    f64 bs = 0.0;
     i32 d, c, i, lutmax;
     tq_rot_(t, q, rot, tmp);
     for (d = 0; d < t->vd; ++d) {
@@ -325,10 +327,18 @@ static void tq_lut_(const Tq *t, const f32 *q, f32 *rot, f32 *tmp, f32 *lf, u8 *
             for (c = 0; c < 16; ++c) { f32 v = rot[d] * TQ_CENT[c]; lf[d * 16 + c] = v; if (v < mn) mn = v; if (v > mx) mx = v; }
         for (c = 0; c < 16; ++c) lf[d * 16 + c] -= mn;
         if (mx - mn > maxr) maxr = mx - mn;
+        bs += mn;
     }
     lutmax = 65535 / t->vd; if (lutmax > 255) lutmax = 255;
     scale = maxr > 0.0f ? (f32)lutmax / maxr : 1.0f;
     for (i = 0; i < t->vd * 16; ++i) { i32 v = (i32)(lf[i] * scale + 0.5f); lut[i] = (u8)(v > lutmax ? lutmax : v); }
+    if (sc) *sc = scale;
+    if (base) *base = bs;
+}
+
+static void tq_lut_(const Tq *t, const f32 *q, f32 *rot, f32 *tmp, f32 *lf, u8 *lut)
+{
+    tq_lut_ex_(t, q, rot, tmp, lf, lut, (f32 *)0, (f64 *)0);
 }
 
 #if TQ_VNNI
