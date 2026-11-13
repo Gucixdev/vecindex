@@ -249,6 +249,10 @@ VI_API int vi_search_batch(vi_db *db, const float *queries, int nq, int k, vi_i6
  * rows were scored exactly - the rest were ruled out by the bound. Ties at the k-th score may come out either way.
  * Returns how many hits, or -1 as vi_search. */
 VI_API int vi_search_exact(vi_db *db, const float *query, int k, vi_i64 *ids, float *scores, vi_i64 *checked);
+/* vi_search_exact for nq queries (queries: nq x dim), each block of codes read once for up to 16 of them: ids and
+ * scores get k slots a query (a missing hit: id -1, score -1), checked (NULL: not wanted) nq counts. 0, or -1 as
+ * vi_search_batch. */
+VI_API int vi_search_exact_batch(vi_db *db, const float *queries, int nq, int k, vi_i64 *ids, float *scores, vi_i64 *checked);
 
 /* Builds the index over every row now (with VI_MANUAL; by default the store's own thread does it as rows come). */
 VI_API void vi_build(vi_db *db);

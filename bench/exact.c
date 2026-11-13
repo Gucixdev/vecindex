@@ -1,13 +1,14 @@
 /* exact.c - search with a proof (vi_search_exact) against vi_search and against scoring every row, on real embeddings.
  *
  *   gcc -std=c89 -pedantic -Wall -Wextra -D_POSIX_C_SOURCE=200112L -O2 -march=native -Isrc -Iinclude bench/exact.c \
- *       -lm -lpthread -o .build/exact
- *   .build/exact DIR [nq]        DIR/{train,query,gt}.bin from `bench/kmeans prep` (GloVe-100, unit vectors)
+ *       -lm -lpthread -o .build/exact_bench
+ *   .build/exact_bench DIR [nq]  DIR/{train,query,gt}.bin from `bench/kmeans prep` (GloVe-100, unit vectors)
  *
  * One store over every train row (vi_add_batch, vi_build), then per query: vi_search (the default probes and
  * re-score), vi_search_exact, and every row scored in f32 by the store's own SIMD dot (on the first 200 queries). Printed:
  * recall@10 of each against the ground truth, whether vi_search_exact's scores equal the f32 scan's, the latency
- * (median, p99), and how many rows vi_search_exact scored exactly. */
+ * (median, p99), and how many rows vi_search_exact scored exactly. Then all queries again in one vi_search_exact_batch
+ * call: its time a query, and whether every hit equals the one-query call's. */
 #include "vecindex.c"
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,7 +72,9 @@ int main(int argc, char **argv)
     size_t lt, lq, lg;
     float *tr, *qv, sc[EX_K], es[EX_K], bs[EX_K];
     int *gt, n, nq, i, j, k, h1 = 0, h2 = 0, h3 = 0, same = 0, nb;
-    vi_i64 *ids, got[EX_K], eg[EX_K], chk;
+    vi_i64 *ids, got[EX_K], eg[EX_K], chk, *ball, *bchk;
+    float *bsc, *esall;
+    vi_i64 *eall;
     long *chks;
     double *t1, *t2, *t3, t0, mean = 0.0;
     vi_db *db;
@@ -88,6 +91,9 @@ int main(int argc, char **argv)
     t1 = (double *)malloc((size_t)nq * sizeof(double)); t2 = (double *)malloc((size_t)nq * sizeof(double));
     t3 = (double *)malloc((size_t)nb * sizeof(double));
     for (i = 0; i < n; ++i) ids[i] = i;
+    eall = (vi_i64 *)malloc((size_t)nq * EX_K * sizeof(vi_i64)); esall = (float *)malloc((size_t)nq * EX_K * sizeof(float));
+    ball = (vi_i64 *)malloc((size_t)nq * EX_K * sizeof(vi_i64)); bsc = (float *)malloc((size_t)nq * EX_K * sizeof(float));
+    bchk = (vi_i64 *)malloc((size_t)nq * sizeof(vi_i64));
     db = vi_open((const char *)0, EX_DIM, VI_MANUAL);
     t0 = ex_now_();
     if (!db || vi_add_batch(db, n, ids, tr) != n) { fprintf(stderr, "exact: %s\n", vi_error()); return 1; }
@@ -99,6 +105,7 @@ int main(int argc, char **argv)
         h1 += ex_hits_(got, k, gt + (size_t)i * EX_K);
         t0 = ex_now_(); k = vi_search_exact(db, q, EX_K, eg, es, &chk); t2[i] = ex_now_() - t0;
         h2 += ex_hits_(eg, k, gt + (size_t)i * EX_K);
+        for (j = 0; j < EX_K; ++j) { eall[(size_t)i * EX_K + j] = j < k ? eg[j] : -1; esall[(size_t)i * EX_K + j] = j < k ? es[j] : -1.0f; }
         chks[i] = (long)chk; mean += (double)chk;
         if (i < nb) {                                            /* every row, f32, the store's own vectors */
             vi_i64 bi[EX_K];
@@ -128,6 +135,19 @@ int main(int argc, char **argv)
     ex_lat_("vi_search", t1, nq);
     ex_lat_("vi_search_exact", t2, nq);
     ex_lat_("every row, f32", t3, nb);
+    {   int eq = 0;
+        double tt;
+        t0 = ex_now_();
+        if (vi_search_exact_batch(db, qv, nq, EX_K, ball, bsc, bchk) != 0) { fprintf(stderr, "exact: %s\n", vi_error()); return 1; }
+        tt = ex_now_() - t0;
+        for (i = 0; i < nq; ++i) {
+            int ok = 1;
+            for (j = 0; j < EX_K; ++j) if (ball[(size_t)i * EX_K + j] != eall[(size_t)i * EX_K + j] || bsc[(size_t)i * EX_K + j] != esall[(size_t)i * EX_K + j]) ok = 0;
+            eq += ok;
+        }
+        printf("  %-22s %8.3f ms a query (%d queries in one call, %.0f queries/s); hits == one-query calls on %d/%d\n",
+               "vi_search_exact_batch", tt * 1e3 / nq, nq, nq / tt, eq, nq);
+    }
     vi_close(db);
     return 0;
 }

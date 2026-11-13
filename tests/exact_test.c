@@ -86,7 +86,6 @@ static i32 ex_bound_(RagStore *s, const f32 *q, f64 *worst)
     i32 cut[5];
     TqCol sc, col = store_vcol_(s, &sc);
     StoreExQ eq;
-    StoreExScan sj;
     memcpy(qn, q, (size_t)s->dim * sizeof(f32));
     qlen = (f32)eng_sqrt_(eng_ssq_(qn, s->dim));
     store_normalise_(qn, s->dim);
@@ -94,8 +93,18 @@ static i32 ex_bound_(RagStore *s, const f32 *q, f64 *worst)
     tq_rot_(t, qn, qr, tmp);
     {   f64 n2 = 0.0; for (j = 0; j < t->dpad; ++j) n2 += (f64)qr[j] * qr[j];
         if (fabs(eq.qr - sqrt(n2)) > 1e-9 * sqrt(n2)) ++bad; }                         /* |q'| is the rotated query's length */
-    sj.t = t; sj.lut = lut; sj.sums = sums; sj.R = 0;
-    store_ex_scan_(&sj, 0, nb, 0);
+    for (i = 0; i < nb; ++i) tq_block_(tq_bptr_(t, i), lut, t->vd, (u16)0xffff, sums + (size_t)i * 32);
+    for (i = 0; i < nb; ++i) {                                      /* the kernel's lane mask is store_ex_below_, at the edges too */
+        i32 cuts[7], z;
+        u16 sm[32];
+        cuts[0] = 0; cuts[1] = 1; cuts[2] = 65535; cuts[3] = 65536;
+        cuts[4] = sums[(size_t)i * 32 + 5]; cuts[5] = cuts[4] + 1; cuts[6] = sums[(size_t)i * 32 + 30];
+        for (z = 0; z < 7; ++z) {
+            u32 m = store_ex_lanes_(tq_bptr_(t, i), lut, t->vd, cuts[z], sm), want = 0;
+            for (j = 0; j < 32; ++j) want |= (u32)!store_ex_below_(sums[(size_t)i * 32 + j], cuts[z]) << j;
+            if (m != want || memcmp(sm, sums + (size_t)i * 32, sizeof(sm)) != 0) ++bad;
+        }
+    }
     for (j = 0; j < 5; ++j) {                                       /* the cut: the least sum whose bound reaches tau */
         f64 tau = 2.0 * CUTC[j] - 2.0;
         cut[j] = store_ex_cut_(&eq, emax, tau);
@@ -103,6 +112,9 @@ static i32 ex_bound_(RagStore *s, const f32 *q, f64 *worst)
         if (cut[j] > 0 && store_ex_ub_(&eq, 2.0, -2.0, (u16)(cut[j] - 1), emax) >= tau) ++bad;
     }
     for (i = 0; i < s->built_upto; ++i) if (err[i] > emax) ++bad;            /* emax: the largest byte */
+    {   u8 *once = (u8 *)calloc((size_t)(t->n > 0 ? t->n : 1), 1);            /* a row in one slot at most: the pass keeps no seen set */
+        for (i = 0; i < nb * 32; ++i) { i32 row = tq_srow_(t, i / 32, i % 32); if (row >= 0 && row < t->n && once[row]++) ++bad; }
+        free(once); }
     for (i = 0; i < nb * 32; ++i) {
         i32 row = tq_srow_(t, i / 32, i % 32);
         f64 c, est, b, la, lb, qx = 0.0, e = 0.0, sco;
@@ -144,7 +156,7 @@ static i32 ex_same_(RagStore *s, const f32 *x, i32 n, i32 dim, i32 nq, i32 k, co
         na = store_search_exact(s, q, k, ia, sa, cnf, &ch);
         nb2 = ex_brute_(s, q, k, cnf, ib, sb);
         *checked += ch;
-        if (na != nb2) { ++bad; continue; }
+        if (na != nb2 || ch < na) { ++bad; continue; }                  /* every row returned was scored, and counted */
         for (j = 0; j < na; ++j) if (sa[j] != sb[j] || (ia[j] != ib[j] && (j + 1 >= na || sa[j] != sa[j + 1]) && (j == 0 || sa[j] != sa[j - 1]))) { ++bad; break; }
         if (s->tq && (qi & 3) == 0) *bound_bad += ex_bound_(s, q, worst);
     }
@@ -152,7 +164,27 @@ static i32 ex_same_(RagStore *s, const f32 *x, i32 n, i32 dim, i32 nq, i32 k, co
     return bad;
 }
 
-typedef struct { const char *name; i32 dim, n, ivf, bits, i8, metric, del, pend, live, filt, reload; } ExCase;
+typedef struct { const char *name; i32 dim, n, ivf, bits, i8, metric, del, pend, live, filt, reload, maxpct; } ExCase;   /* maxpct: rows re-scored, % at most (0: any) */
+
+/* 21 queries in one store_search_exact_batch call (two passes, one short) == one call each: hits and counts */
+static i32 ex_batch_(RagStore *s, const f32 *x, i32 n, i32 dim, const StoreCnf *cnf)
+{
+    enum { NQ = 21, K = 10 };
+    i64 bi[NQ * K], si[K], bc[NQ], c;
+    f32 bs[NQ * K], ss[K], *q = (f32 *)malloc((size_t)NQ * dim * sizeof(f32));
+    i32 bn[NQ], i, j, sn, bad = 0;
+    u32 r = 99u;
+    for (i = 0; i < NQ * dim; ++i) q[i] = x[(size_t)((i / dim) * 37 % n) * dim + i % dim] + xf_(&r) * 0.2f;
+    if (store_search_exact_batch(s, q, NQ, K, bi, bs, bn, cnf, bc) != 0) bad = NQ;
+    for (i = 0; !bad && i < NQ; ++i) {
+        c = 0;
+        sn = store_search_exact(s, q + (size_t)i * dim, K, si, ss, cnf, &c);
+        if (sn != bn[i]) { ++bad; continue; }
+        for (j = 0; j < sn; ++j) if (si[j] != bi[i * K + j] || ss[j] != bs[i * K + j]) { ++bad; break; }
+    }
+    free(q);
+    return bad;
+}
 
 static void ex_case_(const ExCase *c)
 {
@@ -194,10 +226,12 @@ static void ex_case_(const ExCase *c)
         remove("/tmp/vecindex_exact_test.vxi"); remove("/tmp/vecindex_exact_test.vxi.j"); remove("/tmp/vecindex_exact_test.vxi.jn");
         nq = 88;
     } else bad = ex_same_(s, x, c->n, c->dim, nq, 10, cnf, 7u, &chk, &bb, &worst) + ex_same_(s, x, c->n, c->dim, 20, 40, cnf, 8u, &chk, &bb, &worst), nq += 20;
-    sprintf(msg, "%-34s exact == every row scored: %s; re-scored %.1f%% of %d rows a query%s; bound held on every row (%d broken, tightest %.2f)",
+    bad += ex_batch_(s, x, c->n, c->dim, cnf);
+    sprintf(msg, "%-34s exact == every row scored, batch == one by one: %s; re-scored %.1f%% of %d rows a query%s; bound held on every row (%d broken, tightest %.2f)",
             c->name, bad ? "NO" : "yes", 100.0 * (f64)chk / nq / (c->n + c->pend), c->n + c->pend,
             s->tq ? (s->tq->nc > 1 ? ", clustered" : ", flat") : ", no index", bb, worst);
-    CHECK(bad == 0 && bb == 0, msg);
+    if (s->tq && s->tq->nblk + s->tq->xn >= 256) sprintf(msg + strlen(msg), "; the pass on %d threads", store_ncpu_(s) > 4 ? 4 : store_ncpu_(s));
+    CHECK(bad == 0 && bb == 0 && (!c->maxpct || 100.0 * (f64)chk / nq / (c->n + c->pend) <= c->maxpct), msg);
     store_destroy(s);
     store_ivf_min_ = keep;
     free(x);
@@ -245,18 +279,19 @@ static void ex_threads_(void)
 int main(void)
 {
     static const ExCase cases[] = {
-        { "flat, 4-bit, cosine",              64, 6000, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        { "clustered, 4-bit, cosine",         64, 6000, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
-        { "clustered, odd dim 33",            33, 5000, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
-        { "2-bit codes",                      64, 5000, 1, 2, 0, 0, 0, 0, 0, 0, 0 },
-        { "1-bit codes",                      48, 4000, 0, 1, 0, 0, 0, 0, 0, 0, 0 },
-        { "int8 rows",                        64, 5000, 1, 0, 1, 0, 0, 0, 0, 0, 0 },
-        { "dot product",                      64, 5000, 1, 0, 0, 1, 0, 0, 0, 0, 0 },
-        { "L2",                               64, 5000, 0, 0, 0, 2, 0, 0, 0, 0, 0 },
-        { "deleted + pending rows",           64, 5000, 1, 0, 0, 0, 1, 700, 0, 0, 0 },
-        { "live adds",                        64, 4000, 1, 0, 0, 0, 0, 3000, 1, 0, 0 },
-        { "numbers + namespace filter",       64, 6000, 1, 0, 0, 0, 0, 0, 0, 1, 0 },
-        { "deletes, save, load",              64, 5000, 1, 0, 0, 0, 1, 0, 0, 0, 1 }
+        { "flat, 4-bit, cosine",              64, 6000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15 },
+        { "clustered, 4-bit, cosine",         64, 6000, 1, 0, 0, 0, 0, 0, 0, 0, 0, 16 },
+        { "clustered, odd dim 33",            33, 5000, 1, 0, 0, 0, 0, 0, 0, 0, 0, 15 },
+        { "2-bit codes",                      64, 5000, 1, 2, 0, 0, 0, 0, 0, 0, 0, 80 },
+        { "1-bit codes",                      48, 4000, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { "int8 rows",                        64, 5000, 1, 0, 1, 0, 0, 0, 0, 0, 0, 18 },
+        { "dot product",                      64, 5000, 1, 0, 0, 1, 0, 0, 0, 0, 0, 35 },
+        { "L2",                               64, 5000, 0, 0, 0, 2, 0, 0, 0, 0, 0, 8 },
+        { "deleted + pending rows",           64, 5000, 1, 0, 0, 0, 1, 700, 0, 0, 0, 34 },
+        { "live adds",                        64, 4000, 1, 0, 0, 0, 0, 3000, 1, 0, 0, 15 },
+        { "numbers + namespace filter",       64, 6000, 1, 0, 0, 0, 0, 0, 0, 1, 0, 8 },
+        { "deletes, save, load",              64, 5000, 1, 0, 0, 0, 1, 0, 0, 0, 1, 15 },
+        { "12000 rows: the pass on threads",  32, 12000, 1, 0, 0, 0, 1, 0, 0, 0, 0, 7 }
     };
     i32 i;
     printf("exact_test\n");
@@ -269,12 +304,9 @@ int main(void)
         {   /* the cut is the least sum that reaches tau: that sum and above stay in, below it is out */
             f64 tau = store_ex_ub_(&eq, 2.0, -2.0, (u16)1000, 7);
             i32 c = store_ex_cut_(&eq, 7, tau);
-            u16 blk[32];
-            i32 j;
-            for (j = 0; j < 32; ++j) blk[j] = (u16)(j == 17 ? c : c / 2);
-            CHECK(c == 1000 && !store_ex_below_(c, c) && store_ex_below_(c - 1, c) && !store_ex_below_(store_ex_bmax_(blk), c)
+            CHECK(c == 1000 && !store_ex_below_(c, c) && store_ex_below_(c - 1, c)
                   && store_ex_cut_(&eq, STORE_EX_NONE, tau) == 0 && store_ex_cut_(&eq, 7, 1e9) == 65536,
-                  "the cut: a sum equal to it stays in, one below is out, a block is in by its biggest sum; no bound: nothing out");
+                  "the cut: a sum equal to it stays in, one below is out; no bound: nothing out");
         }
     }
     for (i = 0; i < (i32)(sizeof cases / sizeof cases[0]); ++i) ex_case_(&cases[i]);

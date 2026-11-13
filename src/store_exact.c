@@ -10,21 +10,23 @@
  * (each table entry rounded to the nearest). Cauchy-Schwarz bounds the rest: |q' . e| <= |q'| |e|. A byte a row
  * (store_ex_errs_) keeps |e| rounded up. So every row's cosine lies in [est - b, est + b].
  *
- * The search: one pass over every code (the u16 sums kept, the R best estimates noted), the R best re-scored from
- * their stored vectors, tau = the k-th best of those. A row whose score at est + b stays under tau cannot be among the
- * k best (k rows already reach tau); every other row is re-scored. What comes out is the exact k best by the store's
- * own score - lean4/Vecindex/Exact.lean proves the cut. With the 4-bit codes of GloVe-100 (1.18M rows) a query
- * re-scores a median 277 rows (0.05%); the price is reading every code, so the time grows with the store (no cluster
- * is skipped: in 100 dimensions no bound on a whole cluster excludes it, see docs/benchmarks.md).
+ * The search starts from the store's own approximate answer (the scan of the probed clusters, its best re-scored):
+ * k rows scored exactly, so a bar tau stands before the first block. Then one pass over every code: a row whose score
+ * at est + b stays under tau cannot be among the k best (k rows already reach tau); every other row is re-scored and
+ * may raise the bar. The pass runs on up to 4 threads over ranges of blocks, each with its own bar (any k rows scored
+ * exactly make a valid bar), and the threads' lists are merged. What comes out is the exact k best by the store's own
+ * score - lean4/Vecindex/Exact.lean proves the cut and the answer. With the 4-bit codes of GloVe-100 (1.18M rows) a
+ * query re-scores 0.16% of the rows; the price is reading every code, so the time grows with the store (no cluster is
+ * skipped: in 100 dimensions no bound on a whole cluster excludes it, see docs/benchmarks.md).
  *
  * For the cosine the line is the same for every row, so the cut is a u16 sum per error byte (store_ex_cut_): the
- * second pass skips a block whose biggest sum is below the cut for the store's largest byte, then a row below the cut
- * for its own byte (kept in slot order beside the sums), and runs the per-row test on the rest.
+ * scan kernel's own threshold mask drops the lanes below the cut for the store's largest byte, then a lane below the
+ * cut for its own byte (kept in slot order) is out, and the per-row test runs on the rest. A batch reads each block
+ * once for up to STORE_EX_QB queries while it is in cache.
  *
  * Scores other than the cosine (dot, L2) are a * cos + b per row with a >= 0 (the row's norm, the query's length), so
  * the same bound carries over. */
 
-#define STORE_EX_R      64          /* rows re-scored first, for tau: k at least, this many at most k > 64 */
 #define STORE_EX_MARGIN 1e-4        /* cosine units: f32 rounding of the rotation, the tables and the dots (~1e-6) */
 #define STORE_EX_NONE   255         /* an error byte too big to keep: the row is always re-scored */
 
@@ -196,17 +198,28 @@ static i32 store_ex_cut_(const StoreExQ *eq, u8 e, f64 tau)
     return lo;
 }
 
-/* out by the cut: a sum below it (a block, by its biggest sum - every sum of the block is then below too). One test
- * for both, checked at the boundary by tests/exact_test.c: a sum equal to the cut reaches tau and stays in. */
+/* out by the cut: a sum below it. Checked at the boundary by tests/exact_test.c: a sum equal to the cut reaches tau
+ * and stays in. */
 static i32 store_ex_below_(i32 sum, i32 cut) { return sum < cut; }
 
-/* the biggest of a block's 32 sums (a loop the compiler turns into a few vector max) */
-static i32 store_ex_bmax_(const u16 *sm)
+/* A block's 32 sums into sm, and the lanes not out by the cut as bits: the kernel's own test (sum > thr, in
+ * registers) with thr = cut - 1; cut 0 keeps every lane. tests/exact_test.c holds it to store_ex_below_ lane by lane. */
+static u32 store_ex_lanes_(const u8 *cb, const u8 *lut, i32 vd, i32 cut, u16 *sm)
 {
-    u16 m = 0;
-    i32 l;
-    for (l = 0; l < 32; ++l) m = sm[l] > m ? sm[l] : m;
-    return (i32)m;
+    if (cut <= 0) { tq_block_(cb, lut, vd, (u16)0xffff, sm); return 0xffffffffu; }
+    return tq_block_(cb, lut, vd, (u16)(cut - 1), sm);
+}
+
+/* the lowest set bit of m (m != 0) */
+static i32 store_ex_ctz_(u32 m)
+{
+#if defined(__GNUC__)
+    return __builtin_ctz(m);
+#else
+    i32 i = 0;
+    while (!(m & 1u)) { m >>= 1; ++i; }
+    return i;
+#endif
 }
 
 /* the cut for byte e at the current tau, computed on first use after tau moved (gen: tau's version) */
@@ -223,98 +236,207 @@ static i32 store_ex_ok_(const RagStore *s, const StoreCnf *cnf, i32 row)
     return !cnf || store_cnf_ok_((RagStore *)s, cnf, row);
 }
 
-/* Pass one, a range of blocks: every u16 sum into sums[block * 32 + lane], and (R > 0) the thread's R biggest sums
- * of rows the search may return into rsum/rrow + tid * R, nh[tid] of them, biggest first - read while the block's
- * sums are still in cache. */
-typedef struct { const Tq *t; const u8 *lut; u16 *sums; const RagStore *s; const StoreCnf *cnf; i32 R; i32 *rsum, *rrow, *nh; } StoreExScan;
-static void store_ex_scan_(void *p, i64 a, i64 b, i32 tid)
+/* already among the rows a query started from (k at most: a linear look) */
+static i32 store_ex_in_(const i64 *rows, i32 n, i32 row)
 {
-    StoreExScan *j = (StoreExScan *)p;
-    const Tq *t = j->t;
-    i32 blk, bb = t->vd * 16, R = j->R, n = 0, l, *rs = j->rsum + (size_t)tid * R, *rr = j->rrow + (size_t)tid * R;
-    for (blk = (i32)a; blk < (i32)b; ++blk) {
-        u16 *sm = j->sums + (size_t)blk * 32;
-        if (blk + 2 < (i32)b) tq_prefetch_blk_(tq_bptr_(t, blk + 2), bb);
-        tq_block_(tq_bptr_(t, blk), j->lut, t->vd, (u16)0xffff, sm);
-        if (R > 0 && n == R && store_ex_bmax_(sm) <= rs[R - 1]) continue;   /* no sum of the block makes the list */
-        if (R > 0) for (l = 0; l < 32; ++l) {
-            i32 row, z;
-            if (n == R && (i32)sm[l] <= rs[R - 1]) continue;
-            row = tq_srow_(t, blk, l);
-            if (row >= t->n || !store_ex_ok_(j->s, j->cnf, row)) continue;
-            for (z = n < R ? n++ : R - 1; z > 0 && rs[z - 1] < (i32)sm[l]; --z) { rs[z] = rs[z - 1]; rr[z] = rr[z - 1]; }
-            rs[z] = sm[l]; rr[z] = row;
-        }
-    }
-    if (R > 0) j->nh[tid] = n;
+    i32 i;
+    for (i = 0; i < n; ++i) if (rows[i] == (i64)row) return 1;
+    return 0;
 }
 
-/* The exact k best rows by the store's score among the indexed rows [0, built_upto) that cnf lets through, into
- * rows/scores (have of them); *checked += the rows re-scored from their vectors. -1: out of memory (nothing written).
- * Under the read lock. */
-static i32 store_ex_tq_(RagStore *s, const f32 *qn, f32 qlen, const StoreCnf *cnf, i32 k, i64 *out_rows, f32 *out_scores, i32 *have, i64 *checked)
+/* One query of a pass: its tables, its side of the bound, and the rows it starts from - the store's own approximate
+ * answer re-scored, so a bar stands from the first block on. */
+typedef struct { const f32 *qn; f32 qlen; StoreExQ eq; u8 *lut; i64 *irow; f32 *isc; i32 ni; i64 nchk; } StoreExQy;
+
+/* one thread's state for one query: its k best so far (the start rows among them), its bar, its cuts */
+typedef struct { i64 *row; f32 *sc; i32 have; i32 cut; f64 tau; u32 cgen; i64 nr; i32 ct[256]; u32 ctg[256]; } StoreExTh;
+
+typedef struct { RagStore *s; const StoreCnf *cnf; StoreExQy *qy; StoreExTh *th; i32 nq, k; const u8 *err, *serr; u8 emax; } StoreExPass;
+
+/* a bar of k rows scored exactly: tau and (the cosine) the cut for the store's largest byte */
+static void store_ex_bar_(const RagStore *s, const StoreExQy *y, StoreExTh *h, i32 k, u8 emax)
+{
+    if (h->have < k || (f64)h->sc[k - 1] <= h->tau) return;
+    h->tau = (f64)h->sc[k - 1];
+    ++h->cgen;
+    if (!s->metric) h->cut = store_ex_cut_(&y->eq, emax, h->tau);
+}
+
+/* The pass, a thread's range of blocks: each block's codes read once for every query of the pass, while they are in
+ * cache. A block is out by its biggest sum, a row by its sum against the cut for the largest byte, then for its own
+ * byte (the cosine), then by its own bound; what is left is scored from its vector. */
+static void store_ex_pass_(void *p, i64 a, i64 b, i32 tid)
+{
+    StoreExPass *P = (StoreExPass *)p;
+    RagStore *s = P->s;
+    const Tq *t = s->tq;
+    i32 blk, q, l, k = P->k, bb = t->vd * 16;
+    StoreExTh *th = P->th + (size_t)tid * P->nq;
+    u16 sm[32];
+    for (blk = (i32)a; blk < (i32)b; ++blk) {
+        const u8 *cb = tq_bptr_(t, blk);
+        if (blk + 2 < (i32)b) tq_prefetch_blk_(tq_bptr_(t, blk + 2), bb);
+        for (q = 0; q < P->nq; ++q) {
+            StoreExQy *y = P->qy + q;
+            StoreExTh *h = th + q;
+            u32 in;
+            for (in = store_ex_lanes_(cb, y->lut, t->vd, h->cut, sm); in; in &= in - 1) {   /* the lanes not out for the largest byte */
+                i32 row;
+                l = store_ex_ctz_(in);
+                if (!s->metric && h->have >= k) {                                /* the cosine: its own byte's cut, in slot order */
+                    u8 e = blk < t->nblk ? P->serr[(size_t)blk * 32 + l] : (u8)STORE_EX_NONE;
+                    if (store_ex_below_(sm[l], store_ex_cutat_(&y->eq, h->ct, h->ctg, h->cgen, e, h->tau))) continue;
+                }
+                row = tq_srow_(t, blk, l);
+                if (row >= t->n || !store_ex_ok_(s, P->cnf, row)) continue;
+                if (h->have >= k) {
+                    f64 la, lb;
+                    store_ex_line_(s, y->qlen, row, &la, &lb);
+                    if (store_ex_ub_(&y->eq, la, lb, sm[l], P->err[row]) < h->tau) continue;   /* proved out */
+                }
+                if (store_ex_in_(y->irow, y->ni, row) || store_row_bad_(s, row)) continue;
+                ++h->nr;
+                eng_topk_(h->row, h->sc, k, &h->have, (i64)row, store_score_(s, y->qn, y->qlen, row));
+                store_ex_bar_(s, y, h, k, P->emax);                              /* a better k-th: a higher bar */
+            }
+        }
+    }
+}
+
+/* the rows a query starts from: the store's scan of its probed clusters, the best re-scored (none for a flat
+ * index, where that scan would read every code a second time) */
+typedef struct { RagStore *s; const StoreCnf *cnf; StoreExQy *qy; i32 k, nth; } StoreExAnn;
+static void store_ex_ann_(void *p, i64 a, i64 b, i32 tid)
+{
+    StoreExAnn *A = (StoreExAnn *)p;
+    RagStore *s = A->s;
+    const StoreCnf *cnf = A->cnf;
+    i32 R = s->tq_rerank > 0 ? s->tq_rerank : (A->k * 20 > 256 ? A->k * 20 : 256) * (s->tq->bits == 1 ? 4 : 1) * (s->metric ? 4 : 1);
+    i32 *rows = (i32 *)malloc((size_t)R * sizeof(i32)), m, i;
+    i64 q;
+    TqCol ncol, scol;
+    TqFilt tf;
+    (void)tid;
+    memset(&tf, 0, sizeof(tf));
+    if (cnf && cnf->num && s->has_num) { ncol = store_tqcol_(&s->numc); tf.num = &ncol; tf.lo = cnf->lo; tf.hi = cnf->hi; }
+    if (cnf && cnf->ns_on && s->has_ns) { scol = store_tqcol_(&s->nsc); tf.ns = &scol; tf.nsv = cnf->ns; tf.nss = cnf->nss; tf.nns = cnf->nns; }
+    for (q = a; q < b; ++q) {
+        StoreExQy *y = A->qy + q;
+        y->ni = 0; y->nchk = 0;
+        if (!rows || s->tq->nc <= 1) continue;
+        m = store_scan_(s, y->qn, R, rows, &tf, A->nth, s->tq_probe);
+        for (i = 0; i < m; ++i)                                              /* what store_rescore_ scores */
+            if (rows[i] >= 0 && rows[i] < s->built_upto && (!cnf || store_cnf_ok_(s, cnf, rows[i]))) ++y->nchk;
+        store_rescore_(s, y->qn, y->qlen, cnf, rows, m, A->k, y->irow, y->isc, &y->ni);
+        for (i = 0; i < y->ni; ++i) if (!store_ex_ok_(s, cnf, (i32)y->irow[i])) break;
+        if (i < y->ni) y->ni = 0;                                            /* never: the scan keeps dead rows out; a bar of rows the search may return only */
+    }
+    free(rows);
+}
+
+#define STORE_EX_QB 16              /* queries a pass: each block's codes read once for all of them (1.3x, docs) */
+
+/* The exact k best rows by the store's score among the indexed rows [0, built_upto) that cnf lets through, for nq
+ * queries (qy: qn, qlen, lut, eq set; irow, isc room for k): into rows/scores + q * k (have[q] of them, sorted);
+ * chk[q] += the rows scored from their vectors. -1: out of memory (nothing written). Under the read lock. */
+static i32 store_ex_tq_(RagStore *s, StoreExQy *qy, i32 nq, const StoreCnf *cnf, i32 k, i64 *out_rows, f32 *out_scores, i32 *have, i64 *chk)
 {
     const Tq *t = s->tq;
-    i32 nb = t->nblk + t->xn, nslot = nb * 32, i, z, R = k > STORE_EX_R ? k : STORE_EX_R, nr = 0, nh = 0, cut = 0;
-    i32 nth = nb >= 256 ? (store_ncpu_(s) > 4 ? 4 : store_ncpu_(s)) : 1, nt[4] = { 0, 0, 0, 0 };
-    u8 *lut = (u8 *)malloc((size_t)t->vd * 16 + 32), *seen = (u8 *)calloc((size_t)(s->built_upto > 0 ? s->built_upto : 1), 1), emax = 0;
-    u16 *sums = (u16 *)malloc((size_t)(nslot ? nslot : 1) * sizeof(u16));
-    i32 *rrow = (i32 *)malloc((size_t)R * 5 * sizeof(i32)), *rsum = (i32 *)malloc((size_t)R * 5 * sizeof(i32));
+    i32 nb = t->nblk + t->xn, i, j, q, z, c = store_ncpu_(s), nth = nb >= 256 ? (c > 4 ? 4 : c) : 1;
+    u8 emax = 0;
     const u8 *serr = (const u8 *)0, *err = store_ex_errs_(s, s->built_upto, &emax, &serr);
-    i32 ct[256];
-    u32 ctg[256], cgen = 1;
-    f64 tau;
-    StoreExQ eq;
-    StoreExScan sj;
-    if (!lut || !sums || !rsum || !rrow || !err || !seen || (!serr && t->nblk > 0)) { free(lut); free(sums); free(rsum); free(rrow); free(seen); return -1; }
-    memset(ctg, 0, sizeof(ctg));
+    StoreExTh *th;
+    i64 *trow;
+    f32 *tsc;
+    StoreExPass P;
+    StoreExAnn A;
     if (nth < 1) nth = 1;
-    store_ex_query_(t, qn, lut, &eq);
-    sj.t = t; sj.lut = lut; sj.sums = sums; sj.s = s; sj.cnf = cnf; sj.R = R; sj.rsum = rsum + R; sj.rrow = rrow + R; sj.nh = nt;
-    tq_par2_(store_ex_scan_, &sj, nb, nth);                          /* every code once; each thread's R biggest sums */
-    for (i = 0; i < nth; ++i)                                        /* merged: the R best estimates */
-        for (z = 0; z < nt[i]; ++z) {
-            i32 v = rsum[R + i * R + z], w = rrow[R + i * R + z], y;
-            if (nh == R && v <= rsum[R - 1]) break;                  /* each thread's list is biggest first */
-            for (y = nh < R ? nh++ : R - 1; y > 0 && rsum[y - 1] < v; --y) { rsum[y] = rsum[y - 1]; rrow[y] = rrow[y - 1]; }
-            rsum[y] = v; rrow[y] = w;
+    if (nth > nb) nth = nb > 0 ? nb : 1;
+    th = (StoreExTh *)calloc((size_t)nth * nq, sizeof(StoreExTh));
+    trow = (i64 *)malloc((size_t)nth * nq * k * sizeof(i64));
+    tsc = (f32 *)malloc((size_t)nth * nq * k * sizeof(f32));
+    if (!th || !trow || !tsc || !err || (!serr && t->nblk > 0)) { free(th); free(trow); free(tsc); return -1; }
+    A.s = s; A.cnf = cnf; A.qy = qy; A.k = k;
+    A.nth = nq == 1 ? (s->tq->n >= 150000 ? nth : 1) : 1;
+    tq_par2_(store_ex_ann_, &A, nq, nq == 1 ? 1 : c);               /* one query: its scan on threads; many: a query a thread */
+    for (j = 0; j < nth; ++j)
+        for (q = 0; q < nq; ++q) {
+            StoreExTh *h = th + (size_t)j * nq + q;
+            h->row = trow + ((size_t)j * nq + q) * k; h->sc = tsc + ((size_t)j * nq + q) * k;
+            h->have = qy[q].ni; h->tau = -3e38; h->cgen = 1;
+            memcpy(h->row, qy[q].irow, (size_t)qy[q].ni * sizeof(i64)); memcpy(h->sc, qy[q].isc, (size_t)qy[q].ni * sizeof(f32));
+            store_ex_bar_(s, qy + q, h, k, emax);
         }
-    for (i = 0; i < nh; ++i) {                                       /* re-scored: tau, the k-th best of them */
-        seen[rrow[i]] = 1;
-        if (store_row_bad_(s, rrow[i])) continue;
-        eng_topk_(out_rows, out_scores, k, have, (i64)rrow[i], store_score_(s, qn, qlen, rrow[i]));
-        ++nr;
-    }
-    tau = *have >= k ? (f64)out_scores[k - 1] : -3e38;
-    if (!s->metric && *have >= k) cut = store_ex_cut_(&eq, emax, tau);
-    for (i = 0; i < nslot; ++i) {                                    /* every row whose best case reaches tau */
-        i32 row;
-        if ((i & 31) == 0 && store_ex_below_(store_ex_bmax_(sums + i), cut)) { i += 31; continue; }   /* the whole block is out */
-        if (store_ex_below_(sums[i], cut)) continue;                 /* out for the largest byte, so for its own */
-        if (!s->metric && *have >= k) {                              /* the cosine: its own byte's cut, in slot order */
-            u8 e = i < t->nblk * 32 ? serr[i] : STORE_EX_NONE;
-            if (store_ex_below_(sums[i], store_ex_cutat_(&eq, ct, ctg, cgen, e, tau))) continue;
-        }
-        row = tq_srow_(t, i / 32, i % 32);
-        if (row >= t->n || !store_ex_ok_(s, cnf, row) || seen[row]) continue;
-        if (*have >= k) {
-            f64 la, lb;
-            store_ex_line_(s, qlen, row, &la, &lb);
-            if (store_ex_ub_(&eq, la, lb, sums[i], err[row]) < tau) continue;   /* proved out */
-        }
-        seen[row] = 1;
-        if (store_row_bad_(s, row)) continue;
-        ++nr;
-        eng_topk_(out_rows, out_scores, k, have, (i64)row, store_score_(s, qn, qlen, row));
-        if (*have >= k && (f64)out_scores[k - 1] > tau) {            /* a better k-th: a higher bar for the rest */
-            tau = (f64)out_scores[k - 1];
-            ++cgen;
-            if (!s->metric) cut = store_ex_cut_(&eq, emax, tau);
+    P.s = s; P.cnf = cnf; P.qy = qy; P.th = th; P.nq = nq; P.k = k; P.err = err; P.serr = serr; P.emax = emax;
+    tq_par2_(store_ex_pass_, &P, nb, nth);                          /* every code once, for every query of the pass */
+    for (q = 0; q < nq; ++q) {                                       /* each thread's k best, merged */
+        i64 *ro = out_rows + (size_t)q * k;
+        f32 *so = out_scores + (size_t)q * k;
+        have[q] = 0;
+        chk[q] += qy[q].nchk;
+        for (j = 0; j < nth; ++j) {
+            StoreExTh *h = th + (size_t)j * nq + q;
+            chk[q] += h->nr;
+            for (i = 0; i < h->have; ++i) {
+                for (z = 0; z < have[q] && ro[z] != h->row[i]; ++z) {}
+                if (z == have[q]) eng_topk_(ro, so, k, have + q, h->row[i], h->sc[i]);   /* a start row is in every thread's list */
+            }
         }
     }
-    *checked += nr;
-    free(lut); free(sums); free(rsum); free(rrow); free(seen);
+    free(th); free(trow); free(tsc);
     return 0;
+}
+
+/* store_search_exact for nq queries (queries: nq x dim): the exact k best of each into ids/scores + q * k, n[q] of
+ * them (NULL: not wanted), checked[q] (NULL: not wanted) the rows scored from their vectors for it. Each block of
+ * codes is read once for up to STORE_EX_QB queries. 0, or -1 (a query with a NaN or an infinity, out of memory). */
+i32 store_search_exact_batch(RagStore *s, const f32 *queries, i32 nq, i32 k, i64 *out_ids, f32 *out_scores, i32 *n, const StoreCnf *cnf, i64 *checked)
+{
+    i32 dim = s->dim, q0, q, i, rc = 0, nqb, *hv;
+    f32 *qn, *isc;
+    i64 *irow, *chk;
+    u8 *lut;
+    StoreExQy *qy;
+    if (k < 1 || nq < 1) return 0;
+    for (q = 0; q < nq; ++q) if (!store_finite_(queries + (size_t)q * dim, dim)) return -1;
+    nqb = nq < STORE_EX_QB ? nq : STORE_EX_QB;
+    qn = (f32 *)malloc((size_t)nq * dim * sizeof(f32));
+    qy = (StoreExQy *)calloc((size_t)nqb, sizeof(StoreExQy));
+    irow = (i64 *)malloc((size_t)nqb * k * sizeof(i64)); isc = (f32 *)malloc((size_t)nqb * k * sizeof(f32));
+    hv = (i32 *)calloc((size_t)nq, sizeof(i32)); chk = (i64 *)calloc((size_t)nq, sizeof(i64));
+    pthread_rwlock_rdlock(&s->lock);
+    lut = s->tq ? (u8 *)malloc((size_t)nqb * (s->tq->vd * 16 + 32)) : (u8 *)malloc(1);
+    if (!qn || !qy || !irow || !isc || !hv || !chk || !lut) rc = -1;
+    for (q = 0; rc == 0 && q < nq; ++q) {
+        f32 *v = qn + (size_t)q * dim;
+        memcpy(v, queries + (size_t)q * dim, (size_t)dim * sizeof(f32));
+        store_normalise_(v, dim);
+    }
+    for (q0 = 0; rc == 0 && q0 < nq; q0 += nqb) {
+        i32 m = nq - q0 < nqb ? nq - q0 : nqb;
+        for (q = 0; q < m; ++q) {
+            const f32 *v = queries + (size_t)(q0 + q) * dim;
+            qy[q].qn = qn + (size_t)(q0 + q) * dim;
+            qy[q].qlen = (f32)eng_sqrt_(eng_ssq_(v, dim));
+            qy[q].irow = irow + (size_t)q * k; qy[q].isc = isc + (size_t)q * k;
+            if (s->tq && s->built_upto > 0) { qy[q].lut = lut + (size_t)q * (s->tq->vd * 16 + 32); store_ex_query_(s->tq, qy[q].qn, qy[q].lut, &qy[q].eq); }
+        }
+        if (s->tq && s->built_upto > 0) rc = store_ex_tq_(s, qy, m, cnf, k, out_ids + (size_t)q0 * k, out_scores + (size_t)q0 * k, hv + q0, chk + q0);
+        for (q = 0; rc == 0 && q < m; ++q) {                     /* the rest (no scan index, or the pending tail): every row */
+            i64 *ro = out_ids + (size_t)(q0 + q) * k;
+            f32 *so = out_scores + (size_t)(q0 + q) * k;
+            for (i = s->tq && s->built_upto > 0 ? s->built_upto : 0; i < s->count; ++i) {
+                if (STORE_DEAD(s, i) || (cnf && !store_cnf_ok_(s, cnf, i)) || store_row_bad_(s, i)) continue;
+                ++chk[q0 + q];
+                eng_topk_(ro, so, k, hv + q0 + q, (i64)i, store_score_(s, qy[q].qn, qy[q].qlen, i));
+            }
+            for (i = 0; i < hv[q0 + q]; ++i) ro[i] = STORE_ID(s, ro[i]);
+        }
+    }
+    pthread_rwlock_unlock(&s->lock);
+    if (rc == 0) for (q = 0; q < nq; ++q) { if (n) n[q] = hv[q]; if (checked) checked[q] = chk[q]; }
+    free(qn); free(qy); free(irow); free(isc); free(hv); free(chk); free(lut);
+    return rc;
 }
 
 /* store_search with a proof: the exact k best of every row the filter lets through. Without a scan index (or with an
@@ -322,29 +444,10 @@ static i32 store_ex_tq_(RagStore *s, const f32 *qn, f32 qlen, const StoreCnf *cn
  * vectors. Returns how many (k at most), -1 on a bad query or out of memory. */
 i32 store_search_exact(RagStore *s, const f32 *query, i32 k, i64 *out_ids, f32 *out_scores, const StoreCnf *cnf, i64 *checked)
 {
-    i32 dim = s->dim, have = 0, i, from = 0, rc = 0;
-    f32 *qn, qlen;
-    i64 chk = 0;
-    if (k < 1 || !store_finite_(query, dim)) return k < 1 ? 0 : -1;
-    qn = (f32 *)malloc((size_t)dim * sizeof(f32));
-    if (!qn) return -1;
-    memcpy(qn, query, (size_t)dim * sizeof(f32));
-    qlen = (f32)eng_sqrt_(eng_ssq_(qn, dim));
-    store_normalise_(qn, dim);
-    pthread_rwlock_rdlock(&s->lock);
-    if (s->tq && s->built_upto > 0) {
-        rc = store_ex_tq_(s, qn, qlen, cnf, k, out_ids, out_scores, &have, &chk);
-        from = s->built_upto;
-    }
-    if (rc == 0)
-        for (i = from; i < s->count; ++i) {                          /* the rest (no scan index, or the pending tail): every row */
-            if (STORE_DEAD(s, i) || (cnf && !store_cnf_ok_(s, cnf, i)) || store_row_bad_(s, i)) continue;
-            ++chk;
-            eng_topk_(out_ids, out_scores, k, &have, (i64)i, store_score_(s, qn, qlen, i));
-        }
-    if (rc == 0) for (i = 0; i < have; ++i) out_ids[i] = STORE_ID(s, out_ids[i]);
-    pthread_rwlock_unlock(&s->lock);
-    free(qn);
-    if (checked) *checked = chk;
-    return rc < 0 ? -1 : have;
+    i32 n = 0;
+    i64 c = 0;
+    if (k < 1) return 0;
+    if (store_search_exact_batch(s, query, 1, k, out_ids, out_scores, &n, cnf, &c) != 0) return -1;
+    if (checked) *checked = c;
+    return n;
 }

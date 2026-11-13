@@ -81,7 +81,8 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_search_tagged(db, q, k, all, any, ids, scores)` | the same over rows whose tag has every bit of `all` and one of `any` |
 | `vi_search_grouped(db, q, k, shift, ids, scores)` | at most one hit a group (`id >> shift`): with `shift` 20 and ids `doc << 20 \| chunk`, the best chunk of each of the k nearest documents |
 | `vi_search_batch(db, qs, nq, k, ids, scores, threads)` | many queries on several threads |
-| `vi_search_exact(db, q, k, ids, scores, &checked)` | search with a proof: the k best rows by exact score, the same set as scoring every row; `checked` gets how many rows were scored exactly (the scan's proved error bound, `lean4/Vecindex/Exact.lean`, rules out the rest). GloVe-100, 1.18M rows: ~4 ms against ~46 ms for every row, see benchmarks.md |
+| `vi_search_exact(db, q, k, ids, scores, &checked)` | search with a proof: the k best rows by exact score, the same set as scoring every row; `checked` gets how many rows were scored exactly (the scan's proved error bound, `lean4/Vecindex/Exact.lean`, rules out the rest). GloVe-100, 1.18M rows: ~4 ms against ~50 ms for every row, see benchmarks.md |
+| `vi_search_exact_batch(db, qs, nq, k, ids, scores, checked)` | `vi_search_exact` for nq queries, each block of codes read once for up to 16 of them; k slots a query (a missing hit: id -1, score -1), `checked` nq counts or NULL |
 | `vi_build(db)` | builds the index (searches before it scan the new rows exactly) |
 | `vi_set_recall(db, target)` | keeps recall@10 at `target`: every build picks the fewest probes that reach it |
 | `vi_set_layout(db, code_bits, row_bytes)` | 4-, 2- or 1-bit scan codes (dim/2, dim/4 or dim/8 bytes a row), f32 or int8 rows, before the first row |

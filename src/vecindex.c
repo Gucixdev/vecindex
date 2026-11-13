@@ -633,6 +633,32 @@ VI_API int vi_search_exact(vi_db *db, const float *query, int k, vi_i64 *ids, fl
     return n;
 }
 
+VI_API int vi_search_exact_batch(vi_db *db, const float *queries, int nq, int k, vi_i64 *ids, float *scores, vi_i64 *checked)
+{
+    int q, j;
+    i32 *n;
+    if (vi_search_ok_(db, (const float *)0, k, ids, scores)) return -1;
+    if (nq < 0 || (nq > 0 && !queries)) return vi_fail_(-1, "queries is NULL or nq below 0", (const char *)0, (const char *)0);
+    for (q = 0; q < nq; ++q) if (vi_vec_ok_(db, queries + (size_t)q * (size_t)db->s->dim, "a query")) {
+        char nb[24], why[VI_EMAX];
+        strcpy(why, vi_error());
+        sprintf(nb, "%d: ", q);
+        return vi_fail_(-1, "query ", nb, why);
+    }
+    if (nq == 0) return 0;
+    n = (i32 *)malloc((size_t)nq * sizeof(i32));
+    if (!n || store_search_exact_batch(db->s, queries, (i32)nq, (i32)k, (i64 *)ids, scores, n, (const StoreCnf *)0, (i64 *)checked) != 0) {
+        free(n);
+        return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    }
+    for (q = 0; q < nq; ++q) {
+        vi_cos_(db, scores + (size_t)q * k, n[q]);
+        for (j = n[q]; j < k; ++j) { ids[(size_t)q * k + j] = -1; scores[(size_t)q * k + j] = -1.0f; }
+    }
+    free(n);
+    return 0;
+}
+
 VI_API int vi_search(vi_db *db, const float *query, int k, vi_i64 *ids, float *scores)
 {
     int n;

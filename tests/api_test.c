@@ -144,6 +144,16 @@ int main(void)
         check(!bad && tchk < (vi_i64)40 * N, line);
         check(vi_search_exact(db, q, 0, got, sc, &chk) == -1 && vi_search_exact(db, q, 3, got, sc, (vi_i64 *)0) == 3,
               "vi_search_exact: k 0 refused, checked may be NULL");
+        {   vi_i64 bc[37];
+            for (i = 0, bad = 0; i < 37 * 10; ++i) bi[i] = -7;
+            check(vi_search_exact_batch(db, qs, 37, 10, bi, bs, bc) == 0, "vi_search_exact_batch: 37 queries (two passes of up to 16 and one of 5)");
+            for (i = 0; i < 37; ++i) {
+                n = vi_search_exact(db, qs + (size_t)i * DIM, 10, got, sc, &chk);
+                for (j = 0; j < 10; ++j) if (n != 10 || bi[i * 10 + j] != got[j] || bs[i * 10 + j] != sc[j]) bad = 1;
+                if (bc[i] != chk) bad = 1;
+            }
+            check(!bad, "vi_search_exact_batch == vi_search_exact, query by query: the same hits, scores and counts");
+        }
     }
 
     check(vi_snapshot(db, (const char *)0) == 0, "vi_snapshot starts a background snapshot of the store's file");
