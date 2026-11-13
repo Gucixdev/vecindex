@@ -81,8 +81,10 @@ static void store_ex_job_(void *p, i64 a, i64 b, i32 tid)
 /* The error bytes of rows [0, upto) for the current index, built or extended on demand and kept until the index
  * changes (a rebuild, a compaction: store_ex_reap_). A reader may still hold the previous array when another extends
  * it, so an outgrown array is kept on the side until the next store_ex_reap_ (under the write lock). *emax: the
- * largest of them; *serr (NULL: not wanted): the same bytes in the order of the built index's slots (nblk x 32, a slot
- * without a row 0), so the scan's second pass reads them in step with its sums. Called under the read lock. */
+ * largest of them; *serr (NULL: not wanted): the same bytes in the order of the built index's slots (nblk x 32), so the
+ * pass reads them in step with its sums. A slot without a row gets STORE_EX_NONE (no cut by that slot's byte): a row
+ * added later may take it (tq_add_put fills the padding of a cluster's last built block), and its own byte is then
+ * the one the per-row test reads. Called under the read lock. */
 static const u8 *store_ex_errs_(RagStore *s, i32 upto, u8 *emax, const u8 **serr)
 {
     StoreCert *c;
@@ -117,7 +119,7 @@ static const u8 *store_ex_errs_(RagStore *s, i32 upto, u8 *emax, const u8 **serr
         c->serr = (u8 *)malloc((size_t)t->nblk * 32);
         if (c->serr) for (i = 0; i < t->nblk * 32; ++i) {
             row = tq_srow_(t, i / 32, i % 32);
-            c->serr[i] = row < 0 || row >= t->n ? (u8)0 : row < c->n ? c->err[row] : (u8)STORE_EX_NONE;
+            c->serr[i] = row >= 0 && row < t->n && row < c->n ? c->err[row] : (u8)STORE_EX_NONE;
         }
     }
     out = c ? c->err : (const u8 *)0;

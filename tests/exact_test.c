@@ -132,7 +132,7 @@ static i32 ex_bound_(RagStore *s, const f32 *q, f64 *worst)
         if (err[row] == STORE_EX_NONE && e < 254.0 * eq.step) ++bad;                    /* given up only when too big */
         est = store_ex_est_(&eq, sums[i]); b = store_ex_b_(&eq, err[row]);
         if (fabs(c - est) > b) ++bad;                                                   /* the whole */
-        if (i < t->nblk * 32 && serr[i] != err[row]) ++bad;                             /* slot order: the same bytes */
+        if (i < t->nblk * 32 && serr[i] != err[row] && serr[i] != STORE_EX_NONE) ++bad; /* slot order: the same bytes, or none */
         if (!s->metric) for (j = 0; j < 5; ++j)                                         /* below the cut: out by its own byte */
             if ((i32)sums[i] < cut[j] && store_ex_ub_(&eq, 2.0, -2.0, sums[i], err[row]) >= 2.0 * CUTC[j] - 2.0) ++bad;
         if (err[row] != STORE_EX_NONE && fabs(c - est) / b > *worst) *worst = fabs(c - est) / b;
@@ -164,7 +164,7 @@ static i32 ex_same_(RagStore *s, const f32 *x, i32 n, i32 dim, i32 nq, i32 k, co
     return bad;
 }
 
-typedef struct { const char *name; i32 dim, n, ivf, bits, i8, metric, del, pend, live, filt, reload, maxpct; } ExCase;   /* maxpct: rows re-scored, % at most (0: any) */
+typedef struct { const char *name; i32 dim, n, ivf, bits, i8, metric, del, pend, live, filt, reload, maxpct, late; } ExCase;   /* late: rows added and indexed after the first exact searches */   /* maxpct: rows re-scored, % at most (0: any) */
 
 /* 21 queries in one store_search_exact_batch call (two passes, one short) == one call each: hits and counts */
 static i32 ex_batch_(RagStore *s, const f32 *x, i32 n, i32 dim, const StoreCnf *cnf)
@@ -190,7 +190,7 @@ static void ex_case_(const ExCase *c)
 {
     static Arena arena;
     RagStore *s;
-    f32 *x = ex_data_(c->n + c->pend, c->dim, 2026u + (u32)c->dim);
+    f32 *x = ex_data_(c->n + c->pend + c->late, c->dim, 2026u + (u32)c->dim);
     i32 i, keep = store_ivf_min_, bad, nq = 120, bb = 0;
     i64 chk = 0;
     f64 worst = 0.0;
@@ -227,11 +227,17 @@ static void ex_case_(const ExCase *c)
         nq = 88;
     } else bad = ex_same_(s, x, c->n, c->dim, nq, 10, cnf, 7u, &chk, &bb, &worst) + ex_same_(s, x, c->n, c->dim, 20, 40, cnf, 8u, &chk, &bb, &worst), nq += 20;
     bad += ex_batch_(s, x, c->n, c->dim, cnf);
+    if (c->late) {                                                  /* into the padding of built blocks and extra ones */
+        for (i = c->n; i < c->n + c->late; ++i) store_add(s, x + (size_t)i * c->dim, 1000 + i);
+        store_maintain(s);
+        bad += ex_same_(s, x, c->n + c->late, c->dim, 60, 10, cnf, 9u, &chk, &bb, &worst);
+        nq += 60;
+    }
     sprintf(msg, "%-34s exact == every row scored, batch == one by one: %s; re-scored %.1f%% of %d rows a query%s; bound held on every row (%d broken, tightest %.2f)",
-            c->name, bad ? "NO" : "yes", 100.0 * (f64)chk / nq / (c->n + c->pend), c->n + c->pend,
+            c->name, bad ? "NO" : "yes", 100.0 * (f64)chk / nq / (c->n + c->pend + c->late), c->n + c->pend + c->late,
             s->tq ? (s->tq->nc > 1 ? ", clustered" : ", flat") : ", no index", bb, worst);
     if (s->tq && s->tq->nblk + s->tq->xn >= 256) sprintf(msg + strlen(msg), "; the pass on %d threads", store_ncpu_(s) > 4 ? 4 : store_ncpu_(s));
-    CHECK(bad == 0 && bb == 0 && (!c->maxpct || 100.0 * (f64)chk / nq / (c->n + c->pend) <= c->maxpct), msg);
+    CHECK(bad == 0 && bb == 0 && (!c->maxpct || 100.0 * (f64)chk / nq / (c->n + c->pend + c->late) <= c->maxpct), msg);
     store_destroy(s);
     store_ivf_min_ = keep;
     free(x);
@@ -279,19 +285,20 @@ static void ex_threads_(void)
 int main(void)
 {
     static const ExCase cases[] = {
-        { "flat, 4-bit, cosine",              64, 6000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15 },
-        { "clustered, 4-bit, cosine",         64, 6000, 1, 0, 0, 0, 0, 0, 0, 0, 0, 16 },
-        { "clustered, odd dim 33",            33, 5000, 1, 0, 0, 0, 0, 0, 0, 0, 0, 15 },
-        { "2-bit codes",                      64, 5000, 1, 2, 0, 0, 0, 0, 0, 0, 0, 80 },
-        { "1-bit codes",                      48, 4000, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
-        { "int8 rows",                        64, 5000, 1, 0, 1, 0, 0, 0, 0, 0, 0, 18 },
-        { "dot product",                      64, 5000, 1, 0, 0, 1, 0, 0, 0, 0, 0, 35 },
-        { "L2",                               64, 5000, 0, 0, 0, 2, 0, 0, 0, 0, 0, 8 },
-        { "deleted + pending rows",           64, 5000, 1, 0, 0, 0, 1, 700, 0, 0, 0, 34 },
-        { "live adds",                        64, 4000, 1, 0, 0, 0, 0, 3000, 1, 0, 0, 15 },
-        { "numbers + namespace filter",       64, 6000, 1, 0, 0, 0, 0, 0, 0, 1, 0, 8 },
-        { "deletes, save, load",              64, 5000, 1, 0, 0, 0, 1, 0, 0, 0, 1, 15 },
-        { "12000 rows: the pass on threads",  32, 12000, 1, 0, 0, 0, 1, 0, 0, 0, 0, 7 }
+        { "flat, 4-bit, cosine",              64, 6000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0 },
+        { "clustered, 4-bit, cosine",         64, 6000, 1, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0 },
+        { "clustered, odd dim 33",            33, 5000, 1, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0 },
+        { "2-bit codes",                      64, 5000, 1, 2, 0, 0, 0, 0, 0, 0, 0, 80, 0 },
+        { "1-bit codes",                      48, 4000, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { "int8 rows",                        64, 5000, 1, 0, 1, 0, 0, 0, 0, 0, 0, 18, 0 },
+        { "dot product",                      64, 5000, 1, 0, 0, 1, 0, 0, 0, 0, 0, 35, 0 },
+        { "L2",                               64, 5000, 0, 0, 0, 2, 0, 0, 0, 0, 0, 8, 0 },
+        { "deleted + pending rows",           64, 5000, 1, 0, 0, 0, 1, 700, 0, 0, 0, 34, 0 },
+        { "live adds",                        64, 4000, 1, 0, 0, 0, 0, 3000, 1, 0, 0, 15, 0 },
+        { "numbers + namespace filter",       64, 6000, 1, 0, 0, 0, 0, 0, 0, 1, 0, 8, 0 },
+        { "deletes, save, load",              64, 5000, 1, 0, 0, 0, 1, 0, 0, 0, 1, 15, 0 },
+        { "12000 rows: the pass on threads",  32, 12000, 1, 0, 0, 0, 1, 0, 0, 0, 0, 7, 0 },
+        { "rows indexed after the first search", 64, 5000, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1500 }
     };
     i32 i;
     printf("exact_test\n");
