@@ -61,7 +61,7 @@ On a 2-vCPU Xeon with AVX-512, 2026-11-11:
 =================== lean4 summary ===================
   STEP                   RESULT  WHAT IT CHECKED
   lake build             ok      2743 jobs, proofs and oracle
-  axiom audit            ok      733 theorems (253 written in the sources)
+  axiom audit            ok      743 theorems (260 written in the sources)
   source scan            ok      no sorry, admit, native_decide, bv_decide or axiom
   gen/trustlean.c        ok      printed by TrustLean from the proved programs
   gf native              ok      260 lines: every table entry and product, the coefficients hashed
@@ -111,6 +111,7 @@ m + 1 is reported as damaged, not passed off as rebuilt.
 | `vs_rjtrim_` (`vserv_repl.c`), the frame of `store_jframe_` (`store_batch.c`) | `Journal.lean` | `walk_frames`: a journal of whole frames is kept whole; `walk_take`, `good_take`, `trim_take`: any prefix of the primary's journal (a replica killed mid-write) keeps exactly the frames that arrived whole - the primary's header and first k frames, never a piece of a record; `resume`: the rest from that offset gives the primary's journal back. For any checksum into u32 |
 | `vs_bucket_` (`vserv_keys.c`) | `Rate.lean` | `step_inv`: the tokens stay in [0, qps]; `window`: of any run of requests from t1 to t2 at most qps + qps (t2 - t1) get through, whatever came before; `wait_ok`: after 1/qps of quiet a request is let through |
 | `tq_in_set_` (`tq.c`), the namespace set of `store_search_nss` | `NsSet.lean` | `inSet_iff`: on a set sorted ascending without repeats, the branchless lower bound answers exactly membership; `go_lt`: it reads only inside the set |
+| `tq_em_update_`, `tq_em_revive_`, `tq_em_alpha_` (`tq.c`, e-means) | `Emeans.lean` | `pos_eq_ratio`: the C code's position-and-mass update equals the paper's running count and sum, ((1-a) S + a s) / ((1-a) N + a n); `lloyd_step`: a step of 1 makes a centroid the mean of its batch, one Lloyd round on a batch of every row; `weight_mem`, `pos_between`: for 0 < a <= 1 a step moves a centroid towards its batch mean and never past it; `mass_pos`: the mass stays positive; `split_mass`: a revival halves the donor's mass; `alpha_mem`: every step of the schedule lies in [a0 / 10, a0] for any cosine in [-1, 1]. Over any ordered field: the f32 code is held to it by `tests/emeans_test.c`, the whole algorithm to Meta's reference by `tests/emeans_ref.py` |
 
 ## TrustLean and AMO-Lean
 

@@ -10,9 +10,10 @@
  * The scan only proposes candidates; the caller re-scores them exactly (the store keeps the f32 rows).
  *
  * Large stores group the rows into clusters (IVF) and a query scans only the closest ones. The clustering is
- * built to scale: a sample that grows with the cluster count (capped in bytes), two-level k-means once there are
- * more than TQ_FLAT_MAX clusters, rows placed by looking in their 4 closest top cells, a polish round, centroid
- * scoring 16 centroids per instruction, and assignment and encoding spread over threads.
+ * built to scale: a sample that grows with the cluster count (capped in bytes), e-means (mini-batch k-means with
+ * running averages, Meta FAIR 2026) at two levels once there are more than TQ_FLAT_MAX clusters, the cells of the
+ * second level on threads of their own, rows placed by looking in their 4 closest top cells, a polish round,
+ * centroid scoring 16 centroids per instruction, and assignment and encoding spread over threads.
  *
  * A query picks its clusters with an int8 copy of the centroids (VNNI: 16 centroids x 4 dims per instruction, a
  * quarter of the bytes) and exact scores for the few near the cut; the scan keeps its candidates in a reservoir
@@ -622,6 +623,217 @@ static void tq_kmeans_(const f32 *x, i32 m, i32 dim, i32 nc, u32 *rng, f32 *cent
     if (!asg_out) free(asg);
 }
 
+/* ---- spherical e-means: the same job as tq_kmeans_ in fewer passes ----
+ * e-means (Meta FAIR, 2026; arXiv 2611.09501; reference code faiss/contrib/e_means, MIT) keeps Lloyd's
+ * assign-then-average step but takes it on mini-batches, folding each batch into an exponential moving average of
+ * every cluster's count N and sum S (the centroid is S / N):
+ *   N <- (1 - a) N + a n,   S <- (1 - a) S + a s     (n, s: the batch's count and sum for the cluster)
+ * kept here as mass N and position c = S / N, which the reference does too (lean4/Vecindex/Emeans.lean proves the two
+ * forms equal, and that a = 1 on a whole pass is one Lloyd round). The batch size B and the first step a0 come from
+ * the paper's fitted laws (no tuning), a falls along a cosine to a0 / 10, a cluster whose mass drops under a tenth of
+ * the mean is revived every 5 steps by splitting a busy one (picked in proportion to its mass), and the last pass's
+ * exact means are the result. Spherical, as the reference's spherical mode: a centroid is used rescaled to norm 1,
+ * rows go to the largest dot product. Epochs: VECINDEX_KMEANS=emeans:T (default 3); VECINDEX_KMEANS=lloyd picks
+ * tq_kmeans_. */
+#define TQ_EM_PI          3.14159265358979323846
+#define TQ_EM_EPOCHS      3.0
+#define TQ_EM_INIT_MASS   (1.0f / 65536.0f)  /* the reference's 2^-16 */
+#define TQ_EM_REVIVE      0.1f               /* revive below this share of the mean mass */
+#define TQ_EM_REVIVE_EVERY 5
+#define TQ_EM_SPLIT_EPS   1e-4f
+
+/* nearest power of two of v (1 below 1), as the reference rounds the batch */
+static f64 tq_em_pow2_(f64 v)
+{
+    f64 lo;
+    if (v <= 1.0) return 1.0;
+    lo = pow(2.0, floor(log(v) / log(2.0)));
+    if (lo * 2.0 <= v) lo *= 2.0;                           /* log rounding on either side of an exact power */
+    if (lo > v) lo *= 0.5;
+    return v / lo < (2.0 * lo) / v ? lo : 2.0 * lo;
+}
+
+/* the batch size and first step of n rows, k clusters, T passes in dim dimensions (the reference's shipped fits) */
+static void tq_em_recipe_(i32 n, i32 k, f64 T, i32 dim, i32 *bout, f64 *a0out)
+{
+    f64 b, a0;
+    if (dim > 16) {                                         /* "throughput" law, capped at a power of two near n / 2 */
+        b = tq_em_pow2_(0.035134 * pow((f64)k, 0.134749) * pow((f64)n, 0.876473) * pow(T, 0.813344));
+        if (b > tq_em_pow2_((f64)n / 2.0)) b = tq_em_pow2_((f64)n / 2.0);
+    } else {                                                /* "quality" law (low dimension), capped at n / 2 */
+        b = tq_em_pow2_(0.00439175 * pow((f64)k, 0.134749) * pow((f64)n, 0.876473) * pow(T, 0.813344));
+        if (b > (f64)(n / 2)) b = (f64)(n / 2);
+    }
+    if (b > (f64)n) b = (f64)n;
+    if (b < 1.0) b = 1.0;
+    a0 = 0.8244 * pow((f64)k, -0.4617) * pow(b, 0.9003) * pow((f64)n, -0.4498) * pow(T, -0.1057);
+    *bout = (i32)b;
+    *a0out = a0 < 1e-4 ? 1e-4 : (a0 > 1.0 ? 1.0 : a0);
+}
+
+/* the rows of each pass of T passes over m rows into rows[] (T <= 60), their count returned: whole passes, then a pass
+ * over a share of the rows for a fractional T, then a whole closing pass (the reference's _epoch_rows) */
+static i32 tq_em_passes_(i32 m, f64 T, i64 *rows)
+{
+    i32 whole = (i32)floor(T), rem = (i32)floor((T - whole) * m + 0.5), n = 0, e;
+    if (whole == 0) { rows[n++] = rem > 0 ? rem : 1; return n; }
+    for (e = 0; e < whole - 1; ++e) rows[n++] = m;
+    if (rem > 0) rows[n++] = rem;
+    rows[n++] = m;
+    return n;
+}
+
+/* the step a of step s of total: a0 down a cosine to a0 / 10 */
+static f64 tq_em_alpha_(f64 a0, i64 s, i64 total)
+{
+    f64 f = (f64)(s < total ? s : total) / (f64)(total > 1 ? total : 1);
+    return a0 * (0.1 + 0.9 * 0.5 * (1.0 + cos(TQ_EM_PI * f)));
+}
+
+/* out[nc x dim] = c rescaled to norm 1 (a zero row stays zero) */
+static void tq_em_unit_(const f32 *c, i32 nc, i32 dim, f32 *out)
+{
+    i32 j, d;
+    for (j = 0; j < nc; ++j) {
+        const f32 *s = c + (size_t)j * dim;
+        f32 *o = out + (size_t)j * dim;
+        f64 q = 0.0;
+        for (d = 0; d < dim; ++d) q += (f64)s[d] * s[d];
+        q = q > 0.0 ? 1.0 / sqrt(q) : 1.0;
+        for (d = 0; d < dim; ++d) o[d] = (f32)(s[d] * q);
+    }
+}
+
+typedef struct { f32 key; i32 j; } TqEmKey;
+static int tq_em_key_cmp_(const void *a, const void *b)
+{
+    f32 x = ((const TqEmKey *)a)->key, y = ((const TqEmKey *)b)->key;
+    return x > y ? -1 : (x < y ? 1 : 0);                    /* largest first */
+}
+
+/* Revive the clusters whose mass fell under TQ_EM_REVIVE of the mean: each takes half of a busy cluster, picked
+ * without replacement in proportion to its mass (Gumbel keys, as the reference), the two pushed 1e-4 apart. */
+static i32 tq_em_revive_(f32 *c, f32 *mass, i32 nc, i32 dim, u32 *rng, TqEmKey *key)
+{
+    f64 tot = 0.0;
+    f32 thr;
+    i32 j, d, nu = 0, nd = 0, ns, t;
+    for (j = 0; j < nc; ++j) tot += mass[j];
+    thr = (f32)(tot * TQ_EM_REVIVE / nc);
+    for (j = 0; j < nc; ++j) {
+        if (mass[j] < thr) ++nu;
+        else if (mass[j] > 0.0f) {
+            f64 u = ((f64)tq_rng_(rng) + 1.0) / 4294967296.0;    /* (0, 1] */
+            key[nd].key = (f32)(log((f64)mass[j]) - log(-log(u) > 1e-300 ? -log(u) : 1e-300)); key[nd].j = j; ++nd;
+        }
+    }
+    ns = nu < nd ? nu : nd;
+    if (ns == 0) return 0;
+    qsort(key, (size_t)nd, sizeof(TqEmKey), tq_em_key_cmp_);
+    for (j = 0, t = 0; j < nc && t < ns; ++j) {
+        f32 *src, *dst;
+        i32 same = 1;
+        if (mass[j] >= thr) continue;
+        src = c + (size_t)key[t].j * dim; dst = c + (size_t)j * dim;
+        for (d = 0; d < dim; ++d) {
+            f32 e = (d & 1) ? -TQ_EM_SPLIT_EPS : TQ_EM_SPLIT_EPS, v = src[d];
+            src[d] = v * (1.0f - e); dst[d] = v * (1.0f + e);
+            same &= src[d] == dst[d];
+        }
+        if (same) dst[0] = dst[0] > 0.0f ? dst[0] * (1.0f + 1e-6f) + 1e-30f : dst[0] + 1e-30f;   /* a zero donor */
+        mass[key[t].j] *= 0.5f; mass[j] = mass[key[t].j];
+        ++t;
+    }
+    return ns;
+}
+
+/* One step, the paper's line 8: every mass decays by 1 - a (not at a = 1, where a touched cluster's mass is just its
+ * count), a cluster the batch touched (cnt rows summing to sum) moves to c + w (sum / cnt - c) with w = a cnt / N', its
+ * new mass N' = (1 - a) N + a cnt: the sum-and-count average written for position and mass. psum, pcnt (NULL psum: not
+ * the last pass) collect the exact sums for the closing means. */
+static void tq_em_update_(f32 *pos, f32 *mass, const f32 *sum, const i32 *cnt, i32 nc, i32 dim, f64 a, f64 *psum, f64 *pcnt)
+{
+    i32 c, d;
+    if (a < 1.0) for (c = 0; c < nc; ++c) mass[c] = (f32)(mass[c] * (1.0 - a));
+    for (c = 0; c < nc; ++c) {
+        f32 *p = pos + (size_t)c * dim;
+        const f32 *s = sum + (size_t)c * dim;
+        f64 mm, w, inv;
+        if (cnt[c] == 0) continue;
+        if (psum) { for (d = 0; d < dim; ++d) psum[(size_t)c * dim + d] += s[d]; pcnt[c] += cnt[c]; }
+        mm = (a < 1.0 ? (f64)mass[c] : 0.0) + a * cnt[c];
+        w = a * cnt[c] / mm; inv = 1.0 / cnt[c];
+        if (w >= 1.0) for (d = 0; d < dim; ++d) p[d] = (f32)(s[d] * inv);
+        else for (d = 0; d < dim; ++d) p[d] = (f32)(p[d] + w * (s[d] * inv - p[d]));
+        mass[c] = (f32)mm;
+    }
+}
+
+/* nc unit centroids of the m rows of x into cent[nc x dim], as tq_kmeans_ (same seeding, same optional final
+ * assignment), in T passes of mini-batches */
+static void tq_emeans_(const f32 *x, i32 m, i32 dim, i32 nc, u32 *rng, f32 *cent, i32 *asg_out, i32 nth, f64 T)
+{
+    i32 nt = nth < 1 ? 1 : (nth > 64 ? 64 : nth), B, c, d, ep, nep, *perm, *asg, *cnt, revive = dim > 2;
+    i64 total = 0, step = 0, rows_ep[64];
+    f64 a0, *psum, *pcnt;
+    f32 *pos = (f32 *)malloc((size_t)nc * (size_t)dim * sizeof(f32)), *unit = (f32 *)malloc((size_t)nc * (size_t)dim * sizeof(f32));
+    f32 *mass = (f32 *)malloc((size_t)nc * sizeof(f32)), *xb, *sum;
+    TqEmKey *key = (TqEmKey *)malloc((size_t)nc * sizeof(TqEmKey));
+    TqKm k;
+    if (T <= 0.0) T = TQ_EM_EPOCHS;
+    if (T > 60.0) T = 60.0;
+    tq_em_recipe_(m, nc, T, dim, &B, &a0);
+    nep = tq_em_passes_(m, T, rows_ep);
+    for (ep = 0; ep < nep; ++ep) total += (rows_ep[ep] + B - 1) / B;
+    for (c = 0; c < nc; ++c) memcpy(pos + (size_t)c * dim, x + (size_t)((i64)m * c / nc + (tq_rng_(rng) % (u32)(m / nc > 0 ? m / nc : 1))) * dim, (size_t)dim * sizeof(f32));
+    for (c = 0; c < nc; ++c) mass[c] = TQ_EM_INIT_MASS;
+    perm = (i32 *)malloc((size_t)m * sizeof(i32)); asg = (i32 *)malloc((size_t)B * sizeof(i32));
+    xb = (f32 *)malloc((size_t)B * (size_t)dim * sizeof(f32));
+    sum = (f32 *)malloc((size_t)nt * (size_t)nc * (size_t)dim * sizeof(f32)); cnt = (i32 *)malloc((size_t)nt * (size_t)nc * sizeof(i32));
+    psum = (f64 *)calloc((size_t)nc * (size_t)dim, sizeof(f64)); pcnt = (f64 *)calloc((size_t)nc, sizeof(f64));
+    k.dim = dim; k.nc = nc; k.asg = asg; k.sum = sum; k.cnt = cnt; k.x = xb;
+    for (ep = 0; ep < nep; ++ep) {
+        i32 i, last = ep == nep - 1;
+        i64 b0;
+        for (i = 0; i < m; ++i) perm[i] = i;                 /* a fresh shuffle every pass */
+        for (i = m - 1; i > 0; --i) { i32 j = (i32)(tq_rng_(rng) % (u32)(i + 1)), z = perm[i]; perm[i] = perm[j]; perm[j] = z; }
+        for (b0 = 0; b0 < rows_ep[ep]; b0 += B, ++step) {
+            i32 bn = (i32)(rows_ep[ep] - b0 < B ? rows_ep[ep] - b0 : B);
+            f64 a = tq_em_alpha_(a0, step, total);
+            for (i = 0; i < bn; ++i) memcpy(xb + (size_t)i * dim, x + (size_t)perm[b0 + i] * dim, (size_t)dim * sizeof(f32));
+            memset(sum, 0, (size_t)nt * (size_t)nc * (size_t)dim * sizeof(f32)); memset(cnt, 0, (size_t)nt * (size_t)nc * sizeof(i32));
+            tq_em_unit_(pos, nc, dim, unit);                     /* every use sees the centroids at norm 1 */
+            k.ct = tq_transpose_(unit, nc, dim);
+            tq_par_(tq_km_asg_, &k, bn, nt);
+            free((void *)k.ct);
+            tq_fold_(sum, cnt, nc, dim, nt);
+            tq_em_update_(pos, mass, sum, cnt, nc, dim, a, last ? psum : (f64 *)0, pcnt);
+            if (revive && (step + 1) % TQ_EM_REVIVE_EVERY == 0) tq_em_revive_(pos, mass, nc, dim, rng, key);
+        }
+    }
+    for (c = 0; c < nc; ++c) if (pcnt[c] > 0.0)               /* the closing means: the last pass's exact averages */
+        for (d = 0; d < dim; ++d) pos[(size_t)c * dim + d] = (f32)(psum[(size_t)c * dim + d] / pcnt[c]);
+    tq_em_unit_(pos, nc, dim, cent);
+    free(xb); free(asg); free(perm); free(psum); free(pcnt);
+    if (asg_out) {
+        k.x = x; k.asg = asg_out; k.sum = (f32 *)0; k.cnt = (i32 *)0; k.ct = tq_transpose_(cent, nc, dim);
+        tq_par_(tq_km_asg_, &k, m, nt); free((void *)k.ct);
+    }
+    free(sum); free(cnt); free(pos); free(unit); free(mass); free(key);
+}
+
+/* the clustering every build uses: e-means by default, Lloyd's 8 rounds with VECINDEX_KMEANS=lloyd; emeans:T sets
+ * the passes (read on every call, so a test or a benchmark can switch it per build) */
+static void tq_cluster_(const f32 *x, i32 m, i32 dim, i32 nc, u32 *rng, f32 *cent, i32 *asg_out, i32 nth)
+{
+    const char *e = getenv("VECINDEX_KMEANS");
+    f64 T = TQ_EM_EPOCHS;
+    if (e && !strncmp(e, "lloyd", 5)) { tq_kmeans_(x, m, dim, nc, rng, cent, asg_out, nth); return; }
+    if (e && !strncmp(e, "emeans:", 7)) T = atof(e + 7);
+    if (nc < 2 || m < 2 * nc) { tq_kmeans_(x, m, dim, nc, rng, cent, asg_out, nth); return; }   /* nothing to batch */
+    tq_emeans_(x, m, dim, nc, rng, cent, asg_out, nth, T);
+}
+
 /* The clustering of a whole build. Flat (one level) up to TQ_FLAT_MAX clusters; above, k1 ~ sqrt(nc) top cells, each
  * split into sub-clusters in proportion to its share of the sample. A row goes to the closest sub-cluster among those
  * of its T = 4 closest top cells: k1 + 4 nc/k1 dot products instead of nc, and the truly closest centroid for nearly
@@ -747,6 +959,31 @@ static void tq_clus_polish_(TqClus *cl, const f32 *x, i32 m, i32 rounds, i32 nth
     free(pj.asg); free(pj.sum); free(pj.cnt);
 }
 
+/* the sub-clusters of a cell: its rows side by side (buf: the largest cell), clustered on one thread */
+typedef struct { TqClus *cl; const f32 *x, *top; const i32 *cnt, *ord; i32 dim, k1, big, nth; u32 seed; } TqCellJob;
+
+static void tq_cell_job_(void *p, i64 a, i64 b, i32 tid)
+{
+    TqCellJob *cj = (TqCellJob *)p;
+    TqClus *cl = cj->cl;
+    i32 dim = cj->dim, j;
+    f32 *buf = (f32 *)malloc((size_t)cj->big * (size_t)dim * sizeof(f32));
+    (void)a; (void)b;
+    for (j = tid; j < cj->k1; j += cj->nth) {
+        i32 cn = cj->cnt[j + 1] - cj->cnt[j], z;
+        u32 rr = cj->seed ^ ((u32)(j + 1) * 0x9e3779b9u);
+        f32 *dst = cl->cent + (size_t)cl->sub0[j] * dim;
+        if (!rr) rr = 1u;
+        if (cn == 0 || cl->subn[j] == 1) memcpy(dst, cj->top + (size_t)j * dim, (size_t)dim * sizeof(f32));   /* an empty or single cell: its own centre */
+        else {
+            for (z = 0; z < cn; ++z) memcpy(buf + (size_t)z * dim, cj->x + (size_t)cj->ord[cj->cnt[j] + z] * dim, (size_t)dim * sizeof(f32));
+            tq_cluster_(buf, cn, dim, cl->subn[j], &rr, dst, (i32 *)0, 1);
+        }
+        cl->sub_ct[j] = tq_transpose_(dst, cl->subn[j], dim);
+    }
+    free(buf);
+}
+
 static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc, u32 seed, i32 nth)
 {
     size_t cap = TQ_SAMPLE_MAX / ((size_t)dim * sizeof(f32));
@@ -768,26 +1005,28 @@ static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc
     if (nc <= TQ_FLAT_MAX) {
         cl->nc = nc;
         cl->cent = (f32 *)malloc((size_t)nc * (size_t)dim * sizeof(f32));
-        tq_kmeans_(x, m, dim, nc, &r, cl->cent, (i32 *)0, nth);
+        tq_cluster_(x, m, dim, nc, &r, cl->cent, (i32 *)0, nth);
         cl->flat_ct = tq_transpose_(cl->cent, nc, dim);
     } else {
         i32 k1 = (i32)sqrt((f64)nc), j, tot = 0, *asg = (i32 *)malloc((size_t)m * sizeof(i32)), *cnt, *ord, *at;
-        f32 *top = (f32 *)malloc((size_t)k1 * (size_t)dim * sizeof(f32)), *buf;
+        f64 t0 = tq_now_(), tsub;
+        f32 *top = (f32 *)malloc((size_t)k1 * (size_t)dim * sizeof(f32));
         {   /* the top cells need far fewer rows than the sub-clusters: k-means on every st-th sample row (at most 1024
              * a cell), then one pass puts every sample row in its cell */
             i32 st = m / (k1 * 1024) > 1 ? m / (k1 * 1024) : 1, ms = (m + st - 1) / st;
-            if (st == 1) tq_kmeans_(x, m, dim, k1, &r, top, asg, nth);
+            if (st == 1) tq_cluster_(x, m, dim, k1, &r, top, asg, nth);
             else {
                 f32 *xs = (f32 *)malloc((size_t)ms * (size_t)dim * sizeof(f32));
                 TqKm k;
                 for (i = 0; i < ms; ++i) memcpy(xs + (size_t)i * dim, x + (size_t)i * st * dim, (size_t)dim * sizeof(f32));
-                tq_kmeans_(xs, ms, dim, k1, &r, top, (i32 *)0, nth);
+                tq_cluster_(xs, ms, dim, k1, &r, top, (i32 *)0, nth);
                 free(xs);
                 k.x = x; k.dim = dim; k.nc = k1; k.asg = asg; k.sum = (f32 *)0; k.cnt = (i32 *)0; k.ct = tq_transpose_(top, k1, dim);
                 tq_par_(tq_km_asg_, &k, m, nth);
                 free((void *)k.ct);
             }
         }
+        tsub = tq_now_();
         cnt = (i32 *)calloc((size_t)k1 + 1, sizeof(i32));
         for (i = 0; i < m; ++i) ++cnt[asg[i] + 1];
         for (j = 0; j < k1; ++j) cnt[j + 1] += cnt[j];                      /* cnt[j] = first member of cell j in ord */
@@ -805,27 +1044,23 @@ static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc
         cl->nc = tot;
         cl->cent = (f32 *)malloc((size_t)tot * (size_t)dim * sizeof(f32));
         cl->sub_ct = (f32 **)calloc((size_t)k1, sizeof(f32 *));
-        { i32 big = 1; for (j = 0; j < k1; ++j) if (cnt[j + 1] - cnt[j] > big) big = cnt[j + 1] - cnt[j];
-          buf = (f32 *)malloc((size_t)big * (size_t)dim * sizeof(f32)); }        /* the largest cell, not the whole sample */
-        for (j = 0; j < k1; ++j) {
-            i32 cn = cnt[j + 1] - cnt[j], z;
-            f32 *dst = cl->cent + (size_t)cl->sub0[j] * dim;
-            if (cn == 0) memcpy(dst, top + (size_t)j * dim, (size_t)dim * sizeof(f32));          /* an empty cell keeps its own centre */
-            else {
-                for (z = 0; z < cn; ++z) memcpy(buf + (size_t)z * dim, x + (size_t)ord[cnt[j] + z] * dim, (size_t)dim * sizeof(f32));
-                if (cl->subn[j] == 1) memcpy(dst, top + (size_t)j * dim, (size_t)dim * sizeof(f32));
-                else tq_kmeans_(buf, cn, dim, cl->subn[j], &r, dst, (i32 *)0, nth);
-            }
-            cl->sub_ct[j] = tq_transpose_(dst, cl->subn[j], dim);
+        {   /* the cells are independent: the threads take every nth-th one, each cell with a generator of its own,
+             * so the result does not depend on the thread count */
+            TqCellJob cj;
+            cj.cl = cl; cj.x = x; cj.top = top; cj.cnt = cnt; cj.ord = ord; cj.dim = dim; cj.k1 = k1; cj.seed = r;
+            cj.nth = nth < 1 ? 1 : (nth > 64 ? 64 : nth); cj.big = 1;
+            for (j = 0; j < k1; ++j) if (cnt[j + 1] - cnt[j] > cj.big) cj.big = cnt[j + 1] - cnt[j];
+            tq_par2_(tq_cell_job_, &cj, cj.nth, cj.nth);
         }
         cl->top_ct = tq_transpose_(top, k1, dim);
-        free(buf); free(top); free(asg); free(cnt); free(ord); free(at);
+        free(top); free(asg); free(cnt); free(ord); free(at);
+        if (getenv("TQ_VERBOSE")) fprintf(stderr, "tq_clus_train_: top cells %.2fs, sub-clusters %.2fs\n", tsub - t0, tq_now_() - tsub);
     }
     cl->T = cl->k1 > 128 ? 2 : TQ_TMAX;
     if (cl->T > cl->k1) cl->T = cl->k1 ? cl->k1 : 1;
     cl->wide = cl->nc;
     if (cl->k1) { i32 j; cl->wide = cl->k1; for (j = 0; j < cl->k1; ++j) if (cl->subn[j] > cl->wide) cl->wide = cl->subn[j]; }
-    if (cl->k1) tq_clus_polish_(cl, x, m, TQ_POLISH, nth);
+    if (cl->k1) { f64 tp = tq_now_(); tq_clus_polish_(cl, x, m, TQ_POLISH, nth); if (getenv("TQ_VERBOSE")) fprintf(stderr, "tq_clus_train_: polish %.2fs\n", tq_now_() - tp); }
     free(x);
 }
 

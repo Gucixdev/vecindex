@@ -23,6 +23,9 @@
 #                              on $COMPARE_DIR/data (default /var/tmp/vecindex-compare) when that exists, without the
 #                              10M/100M runs (SKIP_SCALE= to keep them). real_val builds its corpus into $COMPARE_DIR/emb
 #                              the first time (needs the venv-leann python with torch; installs datasets+transformers there)
+#   EMEANS_REF=DIR ./run       also tests/emeans_ref.py: the e-means clustering against Meta's reference, DIR being a
+#                              faiss checkout's contrib/ (python3 with numpy and faiss-cpu); GLOVE_TRAIN=FILE (the
+#                              train.bin of bench/kmeans.c prep) adds a GloVe sample
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -115,9 +118,10 @@ notes() {
         vserv)   echo "$(ex "$OUT/log_vserv.txt" '[0-9]+/s'), $(ex "$OUT/log_vserv.txt" '[0-9]+ queries/s'), $(okn "$OUT/log_vserv.txt") checks" ;;
         "vserv TLS") echo "$(ex "$OUT/log_vserv_tls.txt" '[0-9]+ queries/s') over TLS, $(okn "$OUT/log_vserv_tls.txt") checks" ;;
         "vserv line protocol") echo "$(okn "$OUT/log_vserv_line.txt") checks ok" ;;
+        emeans)  echo "$(okn "$OUT/log_emeans.txt") checks, $(ex "$OUT/log_emeans.txt" 'e-means error [0-9.]+ < Lloyd.s 8 rounds [0-9.]+')" ;;
     esac
 }
-for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd engine store ${more[@]+"${more[@]}"}; do
+for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd emeans engine store ${more[@]+"${more[@]}"}; do
     bin="$OUT/$name"
     src="tests/${name}_test.c"
     def=()
@@ -130,6 +134,7 @@ for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd engine store ${more
         hnsw)   deps=(src/hnsw.c src/vsimd.h) ;;
         ivf)    deps=(src/ivf.c) ;;
         simd)   deps=(src/tq*.c src/vsimd.h src/base.h) ;;
+        emeans) deps=("${STORE[@]}") ;;
         engine) deps=("${ENG[@]}"); def=(-DENGINE_SERIALIZE) ;;   # exercise the .vxi round-trip in the test
         store)  deps=("${STORE[@]}") ;;
         bench)  src=bench/bench.c; def=(-DBENCH); deps=("${ENG[@]}") ;;
@@ -158,6 +163,14 @@ for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd engine store ${more
     if ! "./$bin" "${runargs[@]}" 2>&1 | tee "$OUT/log_$name.txt"; then echo "  ^ $name FAILED"; fail=1; rec "$name" FAIL; else rec "$name" ok "$(notes "$name")"; fi
     echo
 done
+
+# ---- e-means held to Meta's reference (faiss/contrib/e_means): needs numpy, faiss and EMEANS_REF=.../faiss/contrib ----
+if [[ -n ${EMEANS_REF:-} ]] && command -v python3 >/dev/null; then
+    python3 -W error tests/emeans_ref.py "$OUT/emeans" ${GLOVE_TRAIN:+"$GLOVE_TRAIN"} 2>&1 | tee "$OUT/log_emeans_ref.txt"
+    if grep -q '^skip' "$OUT/log_emeans_ref.txt"; then rec "e-means reference" skip "$(sed -n 's/^skip //p' "$OUT/log_emeans_ref.txt")"
+    elif grep -q '^all ok' "$OUT/log_emeans_ref.txt"; then rec "e-means reference" ok "$(okn "$OUT/log_emeans_ref.txt") checks against faiss/contrib/e_means"
+    else echo "  ^ e-means reference FAILED"; fail=1; rec "e-means reference" FAIL; fi
+else rec "e-means reference" skip "EMEANS_REF unset (path to faiss/contrib)"; fi
 
 # ---- the SIMD kernels again, built for the other code paths this CPU can run: on x86-64 AVX2 without AVX-512 and no
 # ---- SIMD at all, on aarch64 no NEON (tools/cross covers 32-bit ARM, RISC-V and big-endian s390x) ----
