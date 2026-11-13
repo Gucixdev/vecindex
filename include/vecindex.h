@@ -258,7 +258,8 @@ VI_API int vi_search_exact_batch(vi_db *db, const float *queries, int nq, int k,
 VI_API void vi_build(vi_db *db);
 
 /* Keeps recall@10 at target (e.g. 0.95): every build measures recall against an exact search and picks the fewest
- * probes that reach it. 0 turns it off. 0, or -1 for a target outside [0, 1). */
+ * probes that reach it. A store opened without VI_MANUAL keeps 0.90 unless told otherwise (speed first, for RAG);
+ * vi_search_exact is there when every hit counts. 0 turns it off. 0, or -1 for a target outside [0, 1). */
 VI_API int vi_set_recall(vi_db *db, float target);
 
 /* Memory per row before the first row is added: code_bits 4 (default), 2 or 1 for what a search scans (dim / 2,

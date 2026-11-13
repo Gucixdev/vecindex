@@ -111,6 +111,13 @@ VI_API const char *vi_error(void)
 
 VI_API const char *vi_open_error(void) { return vi_error(); }
 
+/* The recall@10 a store opened without VI_MANUAL keeps by default: for RAG over many documents speed matters more
+ * than the last few hits (GloVe-100: about 1.6 times the queries a second of recall 0.95, docs/benchmarks.md);
+ * vi_set_recall changes it, 0 turns the tuning off (the build's default probes: about 0.96 there). */
+#ifndef VI_RECALL_DEFAULT
+#define VI_RECALL_DEFAULT 0.90f
+#endif
+
 VI_API vi_db *vi_open(const char *path, int dim, int flags)
 {
     vi_db *db;
@@ -160,7 +167,10 @@ VI_API vi_db *vi_open(const char *path, int dim, int flags)
             return (vi_db *)0;
         }
     }
-    if (!(flags & VI_MANUAL)) store_set_live(db->s, 1, 1.0f);   /* rows are indexed as they come: no vi_build to forget */
+    if (!(flags & VI_MANUAL)) {
+        store_set_live(db->s, 1, 1.0f);                          /* rows are indexed as they come: no vi_build to forget */
+        store_set_target_recall(db->s, VI_RECALL_DEFAULT);       /* the fewest probes that keep recall@10 at 0.90 */
+    }
     {   char *e = vi_ebuf_(); if (e) *e = 0; }                   /* an open that worked leaves no reason from an earlier failure */
     return db;
 }
