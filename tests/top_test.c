@@ -112,6 +112,29 @@ int main(void)
         sprintf(msg, "%d clusters split: %d clusters, every one in a top cell (%d broken)", done, t->nc, tp_lists_(t));
         CHECK(done == 3 && t->nc == nc0 + 3 && tp_lists_(t) == 0, msg);
     }
+    {   /* the top cells travel in the file: a load has them as saved (the three splits included), builds none */
+        RagStore *l;
+        i32 same = 0, ok = 0;
+        if (store_save(s, "/tmp/vecindex_top_test.vxi") != 0) printf("  (save failed)\n");
+        l = store_load(&arena, "/tmp/vecindex_top_test.vxi");
+        t = s->tq;
+        if (l && l->tq && l->tq->top && l->tq->nk1 == t->nk1 && l->tq->nc == t->nc) {
+            same = memcmp(l->tq->top, t->top, (size_t)t->nk1 * DIM * sizeof(f32)) == 0
+                && memcmp(l->tq->tstart, t->tstart, (size_t)(t->nk1 + 1) * sizeof(i32)) == 0
+                && memcmp(l->tq->tlist, t->tlist, (size_t)t->nc * sizeof(i32)) == 0;
+            store_set_probe(l, np);                                  /* (the probe count set above is the store's, not the file's) */
+            for (qi = 0; qi < NQ; ++qi) {
+                i64 ia[10], ib[10];
+                f32 sa[10], sb[10];
+                tp_row_(N + 17 * qi, v);
+                ok += store_search(s, v, 10, ia, sa) == store_search(l, v, 10, ib, sb) && memcmp(ia, ib, sizeof(ia)) == 0;
+            }
+        }
+        sprintf(msg, "saved and loaded: the %d top cells and lists byte for byte %s, the same top 10 on %d/%d", t->nk1, same ? "the same" : "DIFFER", ok, NQ);
+        CHECK(same && ok == NQ, msg);
+        if (l) store_destroy(l);
+        remove("/tmp/vecindex_top_test.vxi"); remove("/tmp/vecindex_top_test.vxi.j");
+    }
     free(scr); free(pa);
     store_destroy(s);
     store_ivf_min_ = keep; tq_top_min_ = keept;

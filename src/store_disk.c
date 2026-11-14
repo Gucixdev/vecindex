@@ -42,9 +42,6 @@ static int store_goal_r_(FILE *f, StoreGoal *g)
  * there as for a tail, and a copy of the journal is kept as PATH.j.damaged. 'VXJ2' (no header CRC, records not
  * framed) still replays. A file from before v7 has no stamp: its journal is 'VXJ1' base_live(i32) base_bytes(i64)
  * dim(i32), matched on rows and file size. ---- */
-#define STORE_JMAGIC  0x314a5856u
-#define STORE_JMAGIC2 0x324a5856u
-#define STORE_JMAGIC3 0x334a5856u
 
 /* flush a stdio file all the way to the disk */
 static i32 store_fsync_(FILE *f)
@@ -385,7 +382,7 @@ static int store_tq_w_(FILE *f, const Tq *t)
     i32 h[8], c, nb, i, nc1 = t->nc > 1 ? t->nc : 1, *bl, *cs, bad = 0;
     size_t bb = (size_t)t->vd * 16;
     h[0] = t->dim; h[1] = t->dpad; h[2] = t->n; h[3] = t->nblk + t->xn; h[4] = t->nc; h[5] = t->nprobe;
-    h[6] = t->slot_row != (i32 *)0;
+    h[6] = (t->slot_row != (i32 *)0) | (t->nc > 1 && t->top ? 2 : 0);   /* bit 1: the top cells follow the cluster starts */
     h[7] = t->codes1 ? 5 : (t->bits == 4 ? 0 : t->bits);        /* 0 = 4-bit (older files); 5 = 4-bit, then the 1-bit codes */
     if (store_pad_(f) || STORE_W32(f, h, 8)
         || store_pad_(f) || STORE_W32(f, t->s1, (size_t)t->dpad)
@@ -397,7 +394,12 @@ static int store_tq_w_(FILE *f, const Tq *t)
     cs[nc1] = nb;
     if (t->nc > 1 && (store_pad_(f) || STORE_W32(f, t->cent, (size_t)t->nc * (size_t)t->dim)
                       || store_pad_(f) || STORE_W32(f, cs, (size_t)t->nc + 1))) bad = 1;
-    if (!bad && h[6]) {
+    if (!bad && (h[6] & 2))                                      /* the second level: no k-means over the centroids at load */
+        bad = store_pad_(f) || STORE_W32(f, &t->nk1, 1)
+           || store_pad_(f) || STORE_W32(f, t->top, (size_t)t->nk1 * (size_t)t->dim)
+           || store_pad_(f) || STORE_W32(f, t->tstart, (size_t)t->nk1 + 1)
+           || store_pad_(f) || STORE_W32(f, t->tlist, (size_t)t->nc);
+    if (!bad && (h[6] & 1)) {
         bad = store_pad_(f) != 0;
         for (i = 0; i < nb && !bad; ++i)
             bad = STORE_W32(f, bl[i] < t->nblk ? t->slot_row + (size_t)bl[i] * 32 : t->xslot + (size_t)(bl[i] - t->nblk) * 32, 32) != 0;
@@ -500,7 +502,8 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
     f = fopen(tmp, "w+b");                                       /* the old file stays intact until the new one is complete */
     if (!f) return -1;
     hdr[0] = (i32)STORE_MAGIC; hdr[2] = s->dim; hdr[3] = live;
-    ext[0] = (s->vbytes == 1 ? 1 : 0) | (s->has_text ? 2 : 0) | (s->nlab ? 4 : 0) | (s->has_num ? 8 : 0) | (s->has_ns ? 16 : 0) | (s->has_text ? 32 : 0); ext[1] = s->metric;   /* v9: 0 cosine, 1 dot, 2 L2 */
+    ext[0] = (s->vbytes == 1 ? 1 : 0) | (s->has_text ? 2 : 0) | (s->nlab ? 4 : 0) | (s->has_num ? 8 : 0) | (s->has_ns ? 16 : 0) | (s->has_text ? 32 : 0)
+           | (kind == 2 && s->tq->nc > 1 && s->tq->top ? STORE_F_TOP : 0); ext[1] = s->metric;   /* v9: 0 cosine, 1 dot, 2 L2 */
     hdr[1] = (ext[0] & ~STORE_FLAGS_V9) ? STORE_VERSION10 : STORE_VERSION9;   /* the oldest version that holds it */
     ext[2] = (i32)(u32)(stamp & 0xffffffffu); ext[3] = (i32)(u32)(stamp >> 32);
     bad = STORE_W32(f, hdr, 4) || STORE_W32(f, ext, 4) || store_goal_w_(f, &s->goal)
@@ -863,8 +866,22 @@ static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows, const
         t->cstart = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nc + 1);
         o = STORE_AL(o + ((size_t)t->nc + 1) * 4);
     }
+    if (t->nc > 1 && (h[6] & 2)) {                               /* the top cells, copied out: tq_top.c owns and grows them */
+        i32 *k1 = (i32 *)store_take_(map, len, f, o, 4, 1), nk1 = k1 ? *k1 : 0;
+        if (k1 && !map) free(k1);
+        o = STORE_AL(o + 4);
+        if (nk1 >= 1 && nk1 <= TQ_TOP_KMAX) {
+            f32 *tp = (f32 *)store_take_(map, len, f, o, 4, (size_t)nk1 * (size_t)t->dim);
+            i32 *ts, *tl;
+            o = STORE_AL(o + (size_t)nk1 * (size_t)t->dim * 4);
+            ts = (i32 *)store_take_(map, len, f, o, 4, (size_t)nk1 + 1); o = STORE_AL(o + ((size_t)nk1 + 1) * 4);
+            tl = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nc); o = STORE_AL(o + (size_t)t->nc * 4);
+            if (tp && ts && tl) tq_top_set(t, nk1, tp, ts, tl);  /* (lists that do not hold every cluster once: built again) */
+            if (!map) { free(tp); free(ts); free(tl); }
+        } else { tq_free(t); return (Tq *)0; }
+    }
     if (vz && ssum_vouch_(vz, path, ro, (u64)STORE_AL(off), (u64)(o - STORE_AL(off)))) { tq_free(t); return (Tq *)0; }
-    if (h[6]) { t->slot_row = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nblk * 32); o = STORE_AL(o + (size_t)t->nblk * 128); }
+    if (h[6] & 1) { t->slot_row = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nblk * 32); o = STORE_AL(o + (size_t)t->nblk * 128); }
     t->codes = (u8 *)store_take_(map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd * 16);
     if (h[7] == 5 && t->codes) {                                 /* the cascade's 1-bit codes follow */
         o = STORE_AL(o + (size_t)t->nblk * (size_t)t->vd * 16);
@@ -872,7 +889,7 @@ static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows, const
         t->codes1 = (u8 *)store_take_(map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd1 * 16);
         t->c1_own = !map;
     }
-    if (!t->s1 || !t->s2 || !t->perm || (t->nc > 1 && (!t->cent || !t->cstart)) || (h[6] && !t->slot_row) || !t->codes
+    if (!t->s1 || !t->s2 || !t->perm || (t->nc > 1 && (!t->cent || !t->cstart)) || ((h[6] & 1) && !t->slot_row) || !t->codes
         || (h[7] == 5 && !t->codes1)) {
         tq_free(t);
         return (Tq *)0;

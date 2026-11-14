@@ -79,7 +79,7 @@ CFLAGS=(-std=c89 -pedantic -Wall -Wextra -Werror
 OUT=.build
 mkdir -p "$OUT"
 
-STORE=(src/core.c src/vsimd.h src/store*.c src/hdict.c src/lex.c src/blake3.c src/tq*.c src/config.h src/scratch.h)
+STORE=(src/core.c src/vsimd.h src/store*.c src/hdict.c src/lex.c src/blake3.c src/tq*.c src/config.h src/scratch.h src/format.h)
 
 fail=0
 # one line per step for the table at the very end: rec NAME ok|FAIL|skip [note]

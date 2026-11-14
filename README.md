@@ -35,7 +35,7 @@ part of `LAYER.c`, which includes it; it is not compiled on its own.
 | `src/` files | what they hold |
 |---|---|
 | `base.h`, `arena_alloc.h`, `contracts.h`, `print.h`, `fine_grained.h`, `vsimd.h` | fixed-size types, the arena allocator, contracts, output without stdio, the job system, SIMD helpers |
-| `core.c`, `config.h`, `scratch.h` | the helpers every layer shares (top-k insertion, square root, little-endian file I/O); every compile-time setting; the pool of working buffers a search takes instead of malloc |
+| `core.c`, `config.h`, `format.h`, `scratch.h` | the helpers every layer shares (top-k insertion, square root, little-endian file I/O); every compile-time setting; the file format's layout, versions and flags; the pool of working buffers a search takes instead of malloc |
 | `tq.c`, `tq_scan.c`, `tq_add.c` | the rotated 4-bit / 2-bit fast-scan index: build, scan, rows added after the build |
 | `hdict.c`, `lex.c` | hash dictionaries; the term dictionary, postings and BM25 |
 | `blake3.c`, `store_sum.c` | BLAKE3; the file's block digests, Reed-Solomon parity, the checks at load and the scrub |

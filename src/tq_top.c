@@ -76,6 +76,26 @@ static void tq_top_build_(Tq *t)
     free(sum); free(of); free(cnt);
 }
 
+/* Top cells read from a file: copied in when the lists are whole (starts rising from 0 to nc, every cluster in
+ * exactly one cell); else t stays without them and tq_prepare_ builds them. */
+void tq_top_set(Tq *t, i32 k1, const f32 *top, const i32 *ts, const i32 *tl)
+{
+    i32 g, i, ok = ts[0] == 0 && ts[k1] == t->nc;
+    u8 *seen;
+    tq_top_free_(t);
+    for (g = 0; ok && g < k1; ++g) ok = ts[g] <= ts[g + 1];
+    if (!ok || !(seen = (u8 *)calloc((size_t)t->nc, 1))) return;
+    for (i = 0; ok && i < t->nc; ++i) { ok = tl[i] >= 0 && tl[i] < t->nc && !seen[tl[i]]; if (ok) seen[tl[i]] = 1; }
+    free(seen);
+    if (!ok) return;
+    t->top = (f32 *)malloc((size_t)k1 * t->dim * sizeof(f32));
+    t->tstart = (i32 *)malloc((size_t)(k1 + 1) * sizeof(i32)); t->tlist = (i32 *)malloc((size_t)t->nc * sizeof(i32));
+    if (!t->top || !t->tstart || !t->tlist) { tq_top_free_(t); return; }
+    memcpy(t->top, top, (size_t)k1 * t->dim * sizeof(f32));
+    memcpy(t->tstart, ts, (size_t)(k1 + 1) * sizeof(i32)); memcpy(t->tlist, tl, (size_t)t->nc * sizeof(i32));
+    t->nk1 = k1;
+}
+
 /* cluster c (new: t->nc already counts it) into its closest top cell. On no memory the second level is dropped. */
 static void tq_top_add_(Tq *t, i32 c)
 {

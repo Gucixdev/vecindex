@@ -181,22 +181,7 @@ static void store_prefetch_row_(const f32 *row, i32 dim)
 #endif
 }
 
-#define STORE_MAGIC   0x34584956u   /* 'VIX4' - v4 = goal gains max_candidates */
-#define STORE_VERSION 5             /* v5: 64-byte aligned sections, the scan index saved too, loaded by mmap */
-#define STORE_VERSION_I8 6          /* v6: v5 + a 16-byte extension after the header (int8 rows) and their scales */
-#define STORE_VERSION7 7            /* v7: the extension on every file - flags (bit 0: int8 rows), 0, and the 64-bit
-                                     * stamp its journal carries too */
-#define STORE_VERSION8 8            /* v8: v7 + texts (flags bit 1): after the meta column, the heap's length (u64),
-                                     * each row's text offset | length << 40 (u64), then the heap; written only by a
-                                     * store that holds texts */
-#define STORE_VERSION9 9            /* v9: the v7/v8 layout (texts: flags bit 1), then block digests, Reed-Solomon
-                                     * parity and two copies of the table of digests and its trailer (store_sum.c) */
-#define STORE_VERSION10 10          /* v10: v9 with features a v9 reader does not know (flags 8 numbers, 16 namespaces, 32
-                                     * text CRCs) and would misread: so that it refuses the file. A store without them is
-                                     * still written as v9, which every reader since v9 opens (docs/format.md) */
-#define STORE_FLAGS_V9 7            /* the flags a v9 reader knows: int8 rows, texts, labels */
-#define STORE_FLAGS_KNOWN 63        /* every flag this build reads: a file with another is from a newer build, refused */
-#define STORE_V9UP(v) ((v) == STORE_VERSION9 || (v) == STORE_VERSION10)   /* the v9 layout, with its digests and parity */
+#include "format.h"
 #define STORE_LABELS 64             /* labels: names for the 64 bits of a row's tag (store_label.c) */
 #define STORE_LABEL_NAME 64         /* bytes of a label's name, its 0 included */
 #define STORE_SUM_K 32              /* data blocks a parity group, by default */

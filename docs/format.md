@@ -1,5 +1,8 @@
 # The file format and what stays compatible
 
+The layout itself - every section, in order - is the header comment of `src/format.h`, with every magic, version
+and flag defined below it.
+
 A store is a file, `NAME.vxi`, and its journal, `NAME.vxi.j`. An application ships with its data in them, so they
 have to outlive the build that wrote them. From 0.4.0 these are promises, and `./run` checks each one on every change:
 
@@ -39,6 +42,7 @@ that change, report a damaged journal (`vi_integrity`: `journal_damaged`) and ke
 | 8 | | texts | as 4 |
 | 9 | 0.3.0, and 0.4.0 for stores without what v10 adds | block digests, Reed-Solomon parity, the rows' checks, the metric, labels | yes: 0.3.0 (cosine; int8 rows with L2), 0.4.0 |
 | 10 | 0.4.0 | numbers, namespaces, CRCs of the texts | yes: 0.4.0 (cosine; int8 rows with L2) |
+| 10, flag 64 | after 0.4.0, not released | the scan index carries its top cells (`src/tq_top.c`); only a store of 16384 clusters or more (about 16M rows) has them, so smaller files are unchanged; 0.4.0 refuses the flag | no: `tests/top_test.c` saves and loads one |
 
 Journals: `VXJ1` (bound to the file by its size), `VXJ2` (by the stamp), `VXJ3` (a header with its CRC, then frames
 each with a CRC-32C). A build reads all three; 0.3.0 and 0.4.0 write `VXJ3`. The kinds of change in a frame: `A`, `P` and

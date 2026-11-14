@@ -1282,7 +1282,7 @@ static void tq_prepare_(Tq *t)
 {
     if (t->nc > 1 && !t->ct) t->ct = tq_transpose_(t->cent, t->nc, t->dim);
     tq_c8_(t);
-    if (t->nc > 1) tq_top_build_(t);
+    if (t->nc > 1 && !t->top) tq_top_build_(t);                  /* (a file may have brought them: tq_top_set) */
 }
 
 void tq_free(Tq *t)

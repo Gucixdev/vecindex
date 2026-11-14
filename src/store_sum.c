@@ -16,7 +16,6 @@
  * damaged data blocks of a group come back from as many intact parity blocks by one small inverse. */
 #include "blake3.c"
 
-#define SSUM_MAGIC 0x31535856u      /* 'VXS1' */
 #define SSUM_BLOG  16               /* 64 KiB blocks */
 #define SSUM_TRL   128
 #define SSUM_PG    4096u
