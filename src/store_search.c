@@ -173,6 +173,7 @@ void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, 
 {
     i32 dim = s->dim, R, off, i;
     f32 *qn, *ql;
+    Scr qa;
     if (nq <= 0 || k <= 0) return;
     if (nthreads < 1) nthreads = 1;
     if (!s->tq) {                                                /* no scan index: one query at a time, in parallel */
@@ -181,8 +182,12 @@ void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, 
         tq_par2_(store_each_, &e, nq, nthreads);
         return;
     }
-    qn = (f32 *)malloc((size_t)nq * (size_t)dim * sizeof(f32));
-    ql = (f32 *)malloc((size_t)nq * sizeof(f32));
+    if (scr_get_(&qa, scr_need_((size_t)nq * (size_t)dim * sizeof(f32)) + scr_need_((size_t)nq * sizeof(f32))) != 0) {
+        for (i = 0; i < nq * k; ++i) { out_ids[i] = -1; out_scores[i] = -1.0f; }   /* no memory: no hits */
+        return;
+    }
+    qn = (f32 *)scr_take_(&qa, (size_t)nq * (size_t)dim * sizeof(f32));
+    ql = (f32 *)scr_take_(&qa, (size_t)nq * sizeof(f32));
     memcpy(qn, Q, (size_t)nq * (size_t)dim * sizeof(f32));
     for (i = 0; i < nq; ++i) {                                   /* a query that is not finite: scanned as zeros */
         f32 *q = qn + (size_t)i * dim;
@@ -194,17 +199,23 @@ void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, 
     R = s->tq_rerank > 0 ? s->tq_rerank : (k * 20 > 256 ? k * 20 : 256) * (s->tq->bits == 1 ? 4 : 1) * (s->metric ? 4 : 1);   /* as one query */
     for (off = 0; off < nq; off += 1024) {                       /* batches of 1024 bound the per-query candidates */
         i32 m = nq - off < 1024 ? nq - off : 1024;
-        i32 *rows = (i32 *)malloc((size_t)m * (size_t)R * sizeof(i32)), *cnt = (i32 *)malloc((size_t)m * sizeof(i32));
+        i32 *rows, *cnt, z;
+        Scr ra;
         StoreBatch j;
+        if (scr_get_(&ra, scr_need_((size_t)m * (size_t)R * sizeof(i32)) + scr_need_((size_t)m * sizeof(i32))) != 0) {
+            for (z = off * k; z < (off + m) * k; ++z) { out_ids[z] = -1; out_scores[z] = -1.0f; }
+            continue;
+        }
+        rows = (i32 *)scr_take_(&ra, (size_t)m * (size_t)R * sizeof(i32)); cnt = (i32 *)scr_take_(&ra, (size_t)m * sizeof(i32));
         if (s->tq->codes1) tq_search_many_cascade(s->tq, qn + (size_t)off * dim, m, STORE_CAS_SHORT * R, R, rows, cnt, s->dead, nthreads, s->tq_probe);
         else tq_search_many(s->tq, qn + (size_t)off * dim, m, R, rows, cnt, s->dead, nthreads, s->tq_probe);
         j.s = s; j.qn = qn + (size_t)off * dim; j.qlen = ql + off; j.k = k; j.R = R; j.rows = rows; j.cnt = cnt;
         j.ids = out_ids + (size_t)off * k; j.sc = out_scores + (size_t)off * k;
         tq_par2_(store_batch_fin_, &j, m, nthreads);
-        free(rows); free(cnt);
+        scr_put_(&ra);
     }
     pthread_rwlock_unlock(&s->lock);
-    free(qn); free(ql);
+    scr_put_(&qa);
 }
 
 #define STORE_GROUP_MAX 65536   /* the most rows a grouped search ranks before it gives up on finding k groups */
@@ -218,22 +229,23 @@ i32 store_search_grouped(RagStore *s, const f32 *query, i32 k, i32 shift, const 
     i64 total, *ci;
     f32 *cs;
     i32 want, n, have, i, j;
+    Scr ga;
     if (shift <= 0) return cnf ? store_search_cnf(s, query, k, ids, scores, cnf) : store_search(s, query, k, ids, scores);
     total = store_count(s);
     want = k > STORE_GROUP_MAX / 4 ? STORE_GROUP_MAX : k * 4;
     if (want < 64) want = 64;
     for (;;) {
         if ((i64)want > total) want = total > 0 ? (i32)total : 1;
-        ci = (i64 *)malloc((size_t)want * sizeof(i64));
-        cs = (f32 *)malloc((size_t)want * sizeof(f32));
-        if (!ci || !cs) { free(ci); free(cs); return -1; }
+        if (scr_get_(&ga, scr_need_((size_t)want * sizeof(i64)) + scr_need_((size_t)want * sizeof(f32))) != 0) return -1;
+        ci = (i64 *)scr_take_(&ga, (size_t)want * sizeof(i64));
+        cs = (f32 *)scr_take_(&ga, (size_t)want * sizeof(f32));
         n = cnf ? store_search_cnf(s, query, want, ci, cs, cnf) : store_search(s, query, want, ci, cs);
         for (i = have = 0; i < n && have < k; ++i) {
             u64 g = (u64)ci[i] >> shift;
             for (j = 0; j < have && ((u64)ids[j] >> shift) != g; ++j) {}
             if (j == have) { ids[have] = ci[i]; scores[have] = cs[i]; ++have; }
         }
-        free(ci); free(cs);
+        scr_put_(&ga);
         if (have >= k || n < want || (i64)want >= total || want >= STORE_GROUP_MAX) break;
         want = want > STORE_GROUP_MAX / 4 ? STORE_GROUP_MAX : want * 4;
     }
