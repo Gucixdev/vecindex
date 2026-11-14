@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# gen - regenerate src/q2.c, src/q4.c, src/q5.c and their tests from src/q1.c and tests/q1_test.c, the templates.
+#
+# q1.c is the single source of truth for the bit-packed scalar
+# quantizer: calibration, packing, per-query LUT, the two search
+# scores, the *_into scratch forms, the cascade primitives, the qn2 /
+# l2_lambda machinery. q2/q4/q5 differ only in LEVELS / BITS / DPB and
+# the test's self-retrieval bar, so they are pure sed derivations - not
+# separate code to keep in sync by hand. (q3.c is radix-3 and is NOT
+# generated; it is maintained field-for-field against this template.)
+#
+#   tools/gen           rewrite src/q2.c q4.c q5.c and tests/q2_test.c q4_test.c q5_test.c
+#   tools/gen --check   exit non-zero if any of them is stale (used by ./run)
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+emit() {   # FILE U L LEVELS BITS DPB DESC THRESHOLD
+    local F=$1 U=$2 L=$3 LV=$4 BITS=$5 DPB=$6 DESC=$7 THR=$8
+    sed -e "s/Q1_/${U}_/g" \
+        -e "s/q1_/${L}_/g" \
+        -e "s/q1d_/${L}d_/g" \
+        -e "s/Q1Index/${U}Index/g" \
+        -e "s/#define ${U}_LEVELS 2\$/#define ${U}_LEVELS ${LV}/" \
+        -e "s/#define ${U}_BITS   1\$/#define ${U}_BITS   ${BITS}/" \
+        -e "s|#define ${U}_DPB    8 .*|#define ${U}_DPB    ${DPB}|" \
+        -e "s|^/\\* q1\\.c - 1-bit (binary, 2-level).*|/* ${L}.c - ${DESC} quantized flat vector index, one file.|" \
+        -e "s/print_cstr(\"q1  dim=\")/print_cstr(\"${L}  dim=\")/" \
+        -e "s|return (hit1 \\* 100 / n >= 90)|return (hit1 * 100 / n >= ${THR})|" \
+        -e "s/\\bq1\\.c\\b/${L}.c/g" \
+        "$F"
+}
+
+declare -a SPEC=(
+    "Q2 q2 4   2 4 '2-bit (4-level)'                     92"
+    "Q4 q4 16  4 2 '4-bit (16-level)'                    95"
+    "Q5 q5 256 8 1 '8-bit (256-level, near-lossless)'    95"
+)
+
+check=0
+[[ "${1:-}" == "--check" ]] && check=1
+
+rc=0
+for line in "${SPEC[@]}"; do
+    eval "set -- $line"
+    L=$2
+    for pair in "src/q1.c src/$L.c" "tests/q1_test.c tests/${L}_test.c"; do
+        read -r from to <<<"$pair"
+        if (( check )); then
+            if ! diff -q <(emit "$from" "$@") "$to" >/dev/null 2>&1; then
+                echo "gen: $to is STALE vs $from - run tools/gen" >&2
+                rc=1
+            fi
+        else
+            emit "$from" "$@" > "$to"
+            echo "gen: wrote $to"
+        fi
+    done
+done
+exit $rc

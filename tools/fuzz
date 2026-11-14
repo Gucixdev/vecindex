@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# fuzz - coverage-guided fuzzing of what vecindex reads from outside, with clang's libFuzzer under ASan and UBSan:
+# tests/fuzz_proto.c (vserv's binary, line and HTTP protocols, a store behind them, the replies checked for framing)
+# and tests/fuzz_store.c (a store file and its journal as store_load reads, repairs and replays them).
+#
+#   tools/fuzz                 every target, 60 s each
+#   tools/fuzz proto 600       one target for 10 minutes (proto, store)
+#   JOBS=2 tools/fuzz store 3600   libFuzzer's -fork mode with 2 worker processes
+#
+# Corpora grow in .build/fuzz/NAME, seeded from tests/fuzz/NAME (.gz files there are unpacked first: a store file
+# is 200 KB of mostly zeros). An input that fails is written to .build/fuzz/ as
+# crash-*, leak-* or timeout-* and the run exits non-zero; reproduce it with `.build/fuzz_NAME FILE`. Once the bug is
+# fixed, copy the file into tests/fuzz/NAME (gzip -9n it if it is large): ./run replays that folder on every run. Prints one line per target: runs,
+# runs per second, coverage (libFuzzer's cov: edges, ft: features) and the corpus size.
+# Needs clang with compiler-rt (Debian/Ubuntu: clang and libclang-rt-dev).
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 2
+
+targets=(proto store)
+[[ ${1:-} ]] && targets=("$1")
+secs=${2:-60}
+mkdir -p .build/fuzz
+command -v clang >/dev/null || { echo "fuzz: clang not found (Debian/Ubuntu: apt install clang libclang-rt-dev)" >&2; exit 2; }
+fail=0
+for t in "${targets[@]}"; do
+    case $t in
+        proto) extra=(-DVSERV_NO_TLS); opts=(-dict=tests/fuzz/proto.dict -max_len=4096) ;;
+        store) extra=(); opts=(-max_len=262144) ;;
+        *) echo "fuzz: no target $t (proto, store)" >&2; exit 2 ;;
+    esac
+    bin=.build/fuzz_$t
+    stale=0
+    [[ -x $bin ]] || stale=1
+    for d in "tests/fuzz_$t.c" tests/fuzz_main.h src/*.c src/*.h; do [[ $d -nt $bin ]] && stale=1; done   # a unity build: all of src/
+    if (( stale )) && ! clang -std=gnu99 -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
+            -march=native "${extra[@]}" -Isrc "tests/fuzz_$t.c" -lm -lpthread -o "$bin"; then
+        echo "fuzz: $t does not build (libFuzzer needs compiler-rt: libclang-rt-dev)" >&2; fail=1; continue
+    fi
+    mkdir -p ".build/fuzz/$t"
+    seeds=.build/fuzz/seeds-$t; rm -rf "$seeds"; mkdir -p "$seeds"   # .gz seeds unpacked, the rest as they are
+    for f in "tests/fuzz/$t"/*; do case $f in *.gz) gzip -dc "$f" > "$seeds/$(basename "$f" .gz)";; *) cp "$f" "$seeds/";; esac; done
+    par=()
+    [[ ${JOBS:-} ]] && par=(-fork="$JOBS" -ignore_crashes=0)
+    "$bin" "${opts[@]}" "${par[@]}" -max_total_time="$secs" -print_final_stats=1 -artifact_prefix=.build/fuzz/ \
+        ".build/fuzz/$t" "$seeds" > ".build/fuzz/$t.log" 2>&1
+    st=$?
+    last=$(tr '\r' '\n' < ".build/fuzz/$t.log" | grep -aE '^#[0-9]+' | tail -1)
+    runs=$(grep -ao 'number_of_executed_units: [0-9]*' ".build/fuzz/$t.log" | grep -o '[0-9]*$')
+    rate=$(grep -ao 'average_exec_per_sec: *[0-9]*' ".build/fuzz/$t.log" | grep -o '[0-9]*$')
+    cov=$(grep -aoE 'cov: [0-9]+ ft: [0-9]+' <<<"$last")
+    corp=$(find ".build/fuzz/$t" -type f | wc -l)
+    if (( st != 0 )) || grep -aq 'Test unit written to' ".build/fuzz/$t.log"; then
+        echo "  FAIL $t: $(grep -aE 'ERROR|runtime error|fuzz_(proto|store):' ".build/fuzz/$t.log" | head -1)"
+        grep -a 'Test unit written to' ".build/fuzz/$t.log" | sed 's/^/       /'
+        fail=1
+    else
+        echo "  ok   $t: ${runs:-?} runs in ${secs} s (${rate:-?}/s), ${cov:-cov ?}, corpus $corp inputs"
+    fi
+done
+exit "$fail"

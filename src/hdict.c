@@ -1,0 +1,305 @@
+/* hdict.c - hash dictionaries for vecindex.
+ *
+ * Two open-addressing tables (linear probing, power-of-two capacity, load
+ * kept at or below 1/2, tombstones purged on growth):
+ *
+ *   H64   i64 key -> i32 value.  doc id -> row, in store.c: O(1) delete,
+ *         lookup and duplicate detection instead of a scan of every row.
+ *   HStr  byte-string key -> i32 value. Keys are copied into one pool
+ *         (length-prefixed); a slot is 12 bytes: a 32-bit tag of the hash, the
+ *         key's pool offset and the value, so a probe compares the tag first
+ *         and only then the bytes. Load up to 0.7. term -> term id in lex.c.
+ *
+ * Values are i32 >= 0; -1 means "absent". No arena: the tables grow with
+ * realloc-style rehashing, so they may be used from any layer.
+ *
+ *   gcc -std=c89 -pedantic -Wall -Wextra -Werror -O2 -Isrc tests/hdict_test.c \
+ *       -o hdict_test && ./hdict_test
+ */
+#ifndef HDICT_C
+#define HDICT_C
+
+#include "base.h"
+#include <stdlib.h>
+#include <string.h>
+
+/* 64-bit constants without the C99 `ull` suffix (the build is -std=c89 -pedantic) */
+#define HD_C64(hi, lo) (((u64)(hi##u) << 32) | (u64)(lo##u))
+
+/* ------------------------------------------------------------------ */
+/* H64: i64 -> i32                                                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    i64 *key;
+    i32 *val;
+    u8  *st;        /* 0 empty, 1 full, 2 deleted */
+    i32  cap;       /* power of two */
+    i32  n;         /* full slots */
+    i32  used;      /* full + deleted */
+} H64;
+
+static u64 h64_mix_(u64 x)      /* splitmix64 finaliser */
+{
+    x += HD_C64(0x9e3779b9, 0x7f4a7c15);
+    x = (x ^ (x >> 30)) * HD_C64(0xbf58476d, 0x1ce4e5b9);
+    x = (x ^ (x >> 27)) * HD_C64(0x94d049bb, 0x133111eb);
+    return x ^ (x >> 31);
+}
+
+static void h64_alloc_(H64 *h, i32 cap)
+{
+    h->key = (i64 *)malloc((size_t)cap * sizeof(i64));
+    h->val = (i32 *)malloc((size_t)cap * sizeof(i32));
+    h->st  = (u8  *)calloc((size_t)cap, 1);
+    h->cap = cap;
+    h->n = h->used = 0;
+}
+
+void h64_init(H64 *h, i32 hint)
+{
+    i32 cap = 16;
+    while (cap < hint * 2) cap <<= 1;
+    h64_alloc_(h, cap);
+}
+
+void h64_free(H64 *h)
+{
+    free(h->key); free(h->val); free(h->st);
+    memset(h, 0, sizeof(*h));
+}
+
+void h64_clear(H64 *h)
+{
+    memset(h->st, 0, (size_t)h->cap);
+    h->n = h->used = 0;
+}
+
+static void h64_put_raw_(H64 *h, i64 k, i32 v)   /* key known to be absent */
+{
+    u32 i = (u32)h64_mix_((u64)k) & (u32)(h->cap - 1);
+    while (h->st[i] == 1) i = (i + 1) & (u32)(h->cap - 1);
+    if (h->st[i] == 0) ++h->used;
+    h->st[i] = 1; h->key[i] = k; h->val[i] = v; ++h->n;
+}
+
+static void h64_grow_(H64 *h)
+{
+    H64 old = *h;
+    i32 i, cap = old.cap;
+    if (old.n * 4 > cap) cap <<= 1;     /* really full: double; else just purge tombstones */
+    h64_alloc_(h, cap);
+    for (i = 0; i < old.cap; ++i)
+        if (old.st[i] == 1) h64_put_raw_(h, old.key[i], old.val[i]);
+    free(old.key); free(old.val); free(old.st);
+}
+
+i32 h64_get(const H64 *h, i64 k)
+{
+    u32 i = (u32)h64_mix_((u64)k) & (u32)(h->cap - 1);
+    while (h->st[i] != 0) {
+        if (h->st[i] == 1 && h->key[i] == k) return h->val[i];
+        i = (i + 1) & (u32)(h->cap - 1);
+    }
+    return -1;
+}
+
+/* store k -> v; returns the previous value or -1 if k was new */
+i32 h64_put(H64 *h, i64 k, i32 v)
+{
+    u32 i;
+    i32 tomb = -1;
+    if ((h->used + 1) * 2 > h->cap) h64_grow_(h);
+    i = (u32)h64_mix_((u64)k) & (u32)(h->cap - 1);
+    while (h->st[i] != 0) {
+        if (h->st[i] == 1 && h->key[i] == k) {
+            i32 old = h->val[i];
+            h->val[i] = v;
+            return old;
+        }
+        if (h->st[i] == 2 && tomb < 0) tomb = (i32)i;
+        i = (i + 1) & (u32)(h->cap - 1);
+    }
+    if (tomb >= 0) i = (u32)tomb; else ++h->used;
+    h->st[i] = 1; h->key[i] = k; h->val[i] = v; ++h->n;
+    return -1;
+}
+
+/* remove k; returns its value or -1 if absent */
+i32 h64_del(H64 *h, i64 k)
+{
+    u32 i = (u32)h64_mix_((u64)k) & (u32)(h->cap - 1);
+    while (h->st[i] != 0) {
+        if (h->st[i] == 1 && h->key[i] == k) {
+            h->st[i] = 2; --h->n;
+            return h->val[i];
+        }
+        i = (i + 1) & (u32)(h->cap - 1);
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* HStr: byte string -> i32                                            */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    u32 *tag;               /* upper 32 bits of the key's hash; also picks the home slot */
+    u32 *off;               /* 1 + pool offset of the key record; 0 = empty, HS_GONE = deleted */
+    i32 *val;
+    i32  cap, n, used;      /* cap: power of two; used = full + deleted */
+    i32  bits;
+    char *pool;             /* key records: length (1 byte, or 255 + 4 bytes), the bytes, a NUL */
+    size_t plen, pcap;
+} HStr;
+
+#define HS_GONE 0xffffffffu
+
+static u64 hs_hash_(const char *s, i32 len)      /* FNV-1a 64, then a final avalanche */
+{
+    u64 h = HD_C64(0xcbf29ce4, 0x84222325);
+    i32 i;
+    for (i = 0; i < len; ++i) { h ^= (u8)s[i]; h *= HD_C64(0x00000100, 0x000001b3); }
+    h ^= h >> 32;
+    h *= HD_C64(0xd6e8feb8, 0x6659fd93);
+    return h ^ (h >> 32);
+}
+
+static u32 hs_home_(const HStr *h, u32 tag) { return (u32)(tag * 2654435761u) >> (32 - h->bits); }
+
+static void hs_alloc_(HStr *h, i32 cap)
+{
+    i32 b = 0;
+    while ((1 << b) < cap) ++b;
+    h->tag = (u32 *)malloc((size_t)cap * sizeof(u32));
+    h->off = (u32 *)calloc((size_t)cap, sizeof(u32));
+    h->val = (i32 *)malloc((size_t)cap * sizeof(i32));
+    h->cap = cap; h->bits = b;
+    h->n = h->used = 0;
+}
+
+void hs_init(HStr *h, i32 hint)
+{
+    i32 cap = 16;
+    while (cap * 7 < hint * 10) cap <<= 1;
+    hs_alloc_(h, cap);
+    h->pcap = 4096;
+    h->pool = (char *)malloc(h->pcap);
+    h->plen = 0;
+}
+
+void hs_free(HStr *h)
+{
+    free(h->tag); free(h->off); free(h->val); free(h->pool);
+    memset(h, 0, sizeof(*h));
+}
+
+/* the key bytes of the record at pool offset o, and their length */
+static const char *hs_key_(const HStr *h, u32 o, i32 *len)
+{
+    const u8 *p = (const u8 *)h->pool + o;
+    if (*p < 255) { *len = *p; return (const char *)p + 1; }
+    { u32 l; memcpy(&l, p + 1, 4); *len = (i32)l; return (const char *)p + 5; }
+}
+
+static u32 hs_pool_add_(HStr *h, const char *s, i32 len)
+{
+    size_t need = (size_t)len + (len < 255 ? 2 : 6);
+    u32 off;
+    if (h->plen + need > h->pcap) {
+        while (h->plen + need > h->pcap) h->pcap *= 2;
+        h->pool = (char *)realloc(h->pool, h->pcap);
+    }
+    off = (u32)h->plen;
+    if (len < 255) { h->pool[h->plen++] = (char)len; }
+    else { u32 l = (u32)len; h->pool[h->plen++] = (char)255; memcpy(h->pool + h->plen, &l, 4); h->plen += 4; }
+    memcpy(h->pool + h->plen, s, (size_t)len);
+    h->plen += (size_t)len;
+    h->pool[h->plen++] = 0;                     /* keys are also NUL terminated */
+    return off;
+}
+
+static void hs_grow_(HStr *h)
+{
+    HStr old = *h;
+    i32 i, cap = old.cap;
+    if ((old.n + 1) * 10 > cap * 5) cap <<= 1;  /* only tombstones: same size, rebuilt clean */
+    hs_alloc_(h, cap);
+    h->pool = old.pool; h->plen = old.plen; h->pcap = old.pcap;   /* the pool is kept as is */
+    for (i = 0; i < old.cap; ++i) {
+        if (old.off[i] && old.off[i] != HS_GONE) {
+            u32 j = hs_home_(h, old.tag[i]);
+            while (h->off[j]) j = (j + 1) & (u32)(h->cap - 1);
+            h->tag[j] = old.tag[i]; h->off[j] = old.off[i]; h->val[j] = old.val[i];
+            ++h->n; ++h->used;
+        }
+    }
+    free(old.tag); free(old.off); free(old.val);
+}
+
+static i32 hs_find_(const HStr *h, const char *s, i32 len, u32 tag)
+{
+    u32 i = hs_home_(h, tag);
+    while (h->off[i] != 0) {
+        if (h->off[i] != HS_GONE && h->tag[i] == tag) {
+            i32 kl;
+            const char *k = hs_key_(h, h->off[i] - 1, &kl);
+            if (kl == len && memcmp(k, s, (size_t)len) == 0) return (i32)i;
+        }
+        i = (i + 1) & (u32)(h->cap - 1);
+    }
+    return -1;
+}
+
+i32 hs_get(const HStr *h, const char *s, i32 len)
+{
+    i32 slot = hs_find_(h, s, len, (u32)(hs_hash_(s, len) >> 32));
+    return slot < 0 ? -1 : h->val[slot];
+}
+
+/* store s -> v; returns the previous value or -1 if s was new */
+i32 hs_put(HStr *h, const char *s, i32 len, i32 v)
+{
+    u32 tag = (u32)(hs_hash_(s, len) >> 32), i;
+    i32 slot, tomb = -1;
+    if ((slot = hs_find_(h, s, len, tag)) >= 0) {
+        i32 old = h->val[slot];
+        h->val[slot] = v;
+        return old;
+    }
+    if ((h->used + 1) * 10 > h->cap * 7) hs_grow_(h);
+    i = hs_home_(h, tag);
+    while (h->off[i] != 0) {
+        if (h->off[i] == HS_GONE && tomb < 0) tomb = (i32)i;
+        i = (i + 1) & (u32)(h->cap - 1);
+    }
+    if (tomb >= 0) i = (u32)tomb; else ++h->used;
+    h->tag[i] = tag; h->off[i] = hs_pool_add_(h, s, len) + 1; h->val[i] = v;
+    ++h->n;
+    return -1;
+}
+
+/* remove s; returns its value or -1. The key bytes stay in the pool. */
+i32 hs_del(HStr *h, const char *s, i32 len)
+{
+    i32 slot = hs_find_(h, s, len, (u32)(hs_hash_(s, len) >> 32)), v;
+    if (slot < 0) return -1;
+    v = h->val[slot];
+    h->off[slot] = HS_GONE; --h->n;
+    return v;
+}
+
+/* iteration: start with *cursor = 0; returns 0 when done. */
+i32 hs_next(const HStr *h, i32 *cursor, const char **key, i32 *len, i32 *val)
+{
+    while (*cursor < h->cap) {
+        i32 i = (*cursor)++;
+        if (h->off[i] && h->off[i] != HS_GONE) {
+            *key = hs_key_(h, h->off[i] - 1, len); *val = h->val[i];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+#endif /* HDICT_C */

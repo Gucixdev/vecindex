@@ -1,0 +1,5 @@
+POST /t/acme/search?k=1 HTTP/1.1
+Host: x
+Content-Length: 21
+
+[0.1, -0.2, 0.3, 0.4]

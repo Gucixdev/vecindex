@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# cov - line coverage of the test suite, per source file: which lines and functions of src/ no test ever runs.
+#
+#   tools/cov                the default ./run suite
+#   tools/cov stress         ./run with one more target (any MODE ./run takes)
+#   MISSED=1 tools/cov       also print every unexecuted range of src/ (file, function, lines)
+#
+# Copies the tree into a temp dir, so the instrumented build never lands in .build; runs ./run there with gcc
+# --coverage -fprofile-update=atomic (atomic counters: TSan would report the plain ones as races); merges gcov's JSON
+# over every binary (each test is a unity build that includes the sources, so one source file is spread over many
+# binaries); prints one line per file of src/, least covered first, with its largest unexecuted ranges. Counts are
+# by line: gcc inlines static functions, so per-function counts would say "never called" for code that ran. A
+# process killed with SIGKILL writes no counts, so the server's numbers are lower bounds (the crash tests kill it).
+# Needs gcc with gcov and python3. Leaves the temp dir (its path is printed; cov_missed.tsv lists every unexecuted
+# range). Exit status is ./run's.
+set -uo pipefail
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/vecindex-cov.XXXXXX")
+tar -C "$here" --exclude=./.build --exclude=./lean4 --exclude='./bench/results-*' -cf - . | tar -C "$tmp" -xf -
+cd "$tmp" || exit 2
+printf '#!/bin/sh\nexec %s --coverage -fprofile-update=atomic "$@"\n' "${CC:-gcc}" > cc-cov && chmod +x cc-cov
+echo "cov: ./run ${1:-} in $tmp (instrumented, about twice as slow)"
+CC="$tmp/cc-cov" ./run "${1:-}" > cov_run.log 2>&1
+st=$?
+grep -aE '^  [0-9]+ ok, ' cov_run.log | tail -1
+find .build -name '*.gcda' > cov_gcda.list
+
+python3 - "$tmp" "${MISSED:-0}" <<'EOF'
+import collections, json, os, subprocess, sys
+root, show_missed = sys.argv[1], sys.argv[2] == "1"
+count = collections.defaultdict(dict)          # file -> line -> executions, summed over binaries
+func = collections.defaultdict(dict)           # file -> function -> [start, end, executions]
+for gcda in open(os.path.join(root, "cov_gcda.list")).read().split():
+    out = subprocess.run(["gcov", "--json-format", "--stdout", gcda], cwd=root, capture_output=True, text=True).stdout
+    for doc in out.splitlines():
+        if not doc.strip():
+            continue
+        for f in json.loads(doc)["files"]:
+            path = os.path.normpath(f["file"])
+            if not path.startswith("src/"):
+                continue
+            for l in f["lines"]:
+                count[path][l["line_number"]] = count[path].get(l["line_number"], 0) + l["count"]
+            for fn in f["functions"]:
+                e = func[path].setdefault(fn["name"], [fn["start_line"], fn["end_line"], 0])
+                e[2] += fn["execution_count"]
+def spans(path):
+    out = []
+    for ln in sorted(count[path]):
+        if count[path][ln]:
+            continue
+        if out and ln - out[-1][1] <= 3:
+            out[-1][1] = ln
+        else:
+            out.append([ln, ln])
+    return out
+def owner(path, a):
+    best = None
+    for name, e in func[path].items():
+        if e[0] <= a <= e[1] and (best is None or e[0] > best[1]):
+            best = (name, e[0])
+    return best[0] if best else "?"
+rows, tl, tr = [], 0, 0
+for path in sorted(count):
+    n, r = len(count[path]), sum(1 for c in count[path].values() if c)
+    tl, tr = tl + n, tr + r
+    gaps = sorted(spans(path), key=lambda s: s[0] - s[1])[:3]
+    rows.append((r / n if n else 1.0, path, r, n, ", ".join("%s %d-%d" % (owner(path, a), a, b) for a, b in gaps)))
+print("  %-22s %6s %13s  %s" % ("FILE", "LINES", "RUN/EXEC", "LARGEST UNEXECUTED RANGES"))
+for pct, path, r, n, gaps in sorted(rows):
+    print("  %-22s %5.1f%% %6d/%-6d  %s" % (path, 100 * pct, r, n, gaps or "-"))
+print("  %-22s %5.1f%% %6d/%-6d  (lines gcc compiled into at least one test binary)" % ("total", 100 * tr / tl, tr, tl))
+with open(os.path.join(root, "cov_missed.tsv"), "w") as o:
+    o.write("file\tfunction\tfirst\tlast\n")
+    for path in sorted(count):
+        for a, b in spans(path):
+            o.write("%s\t%s\t%d\t%d\n" % (path, owner(path, a), a, b))
+            if show_missed:
+                print("  missed %s:%d-%d (%s)" % (path, a, b, owner(path, a)))
+EOF
+echo "cov: tree, logs and cov_missed.tsv in $tmp"
+exit "$st"

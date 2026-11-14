@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# mutants - does the differential test catch a wrong kernel? Each mutant is one small change to a copy of ../src (the
+# real tree is not touched); the harness is rebuilt against the copy and the step that covers the kernel must fail.
+#   lean4/mutants          every mutant; exit 0 when each one was caught
+# Needs a previous lean4/run (the oracle binary and its tables in .build/out).
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+ORACLE=.lake/build/bin/vecindex-oracle
+[[ -x $ORACLE ]] || { echo "mutants: run lean4/run first" >&2; exit 2; }
+CFLAGS=(-std=c89 -pedantic -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200112L -O2 -Igen)
+tmp=$(mktemp -d)
+trap 'rm -rf -- "$tmp"' EXIT
+missed=0
+
+# name @ file @ sed expression @ arch @ check (a table name, a random-case name, or props) @ caught or survives
+# A mutant marked "survives" changes code that the inputs of the C code never reach: the run proves that it stays
+# unreached rather than missed.
+mutants=(
+"AVX2 fold: a1 << 7 instead of << 8@tq_scan.c@s/_mm_slli_epi16(x1, 8)/_mm_slli_epi16(x1, 7)/@haswell@block@caught"
+"AVX-512 odd rows shifted by 7@tq_scan.c@s/A1 = _mm512_add_epi16(A1, _mm512_srli_epi16(r0, 8));/A1 = _mm512_add_epi16(A1, _mm512_srli_epi16(r0, 7));/@native@block@caught"
+"scalar kernel: row 16 reads the low half@tq_scan.c@s/u8 c = j < 16 ? (u8)(byte \& 15) : (u8)(byte >> 4);/u8 c = j < 17 ? (u8)(byte \& 15) : (u8)(byte >> 4);/@x86-64@block@caught"
+"gf_invert_ skips row 0 in the elimination@store_sum.c@s/if (r == c [|][|] !(f = a\[r \* n + c\])) continue;/if (r == c || r == 0 || !(f = a[r * n + c])) continue;/@native@props@caught"
+"gf_invert_ without the row swap (a Cauchy matrix never needs one: its leading minors are nonzero)@store_sum.c@s/if (r != c) for (j = 0; j < n; ++j) {/if (0) for (j = 0; j < n; ++j) {/@native@props@survives"
+"GF(2^8) polynomial 0x11b@store_sum.c@s/x ^= 0x11du;/x ^= 0x11bu;/@native@gf@caught"
+"CRC-32C table polynomial off by one bit@store_batch.c@s/0x82f63b78u/0x82f63b79u/@x86-64@crc@caught"
+"CRC-32C SSE4.2 path skips the last byte@store_batch.c@s/while (n--) crc = _mm_crc32_u8(crc, \*p++);/while (n-- > 1) crc = _mm_crc32_u8(crc, *p++);/@native@crc@caught"
+"tq_code_ compares >= at step 3@tq.c@s/c += (v > TQ_B\[c + 1\]) << 1;/c += (v >= TQ_B[c + 1]) << 1;/@x86-64@props@caught"
+"top-k breaks ties the other way@q1.c@0,/while (j > 0 \&\& scores\[j - 1\] < scores\[j\])/s//while (j > 0 \&\& scores[j - 1] <= scores[j])/@native@topk@caught"
+"2-bit column count not even@tq.c@s/((dpad \/ 2) + 1) \& ~1/((dpad \/ 2) + 1)/@native@vd@caught"
+"q3 digit table off by one level@q3.c@s/tbl\[b\]\[s\] = (u8)(rem % Q3_LEVELS);/tbl[b][s] = (u8)((rem + 1) % Q3_LEVELS);/@native@digits@caught"
+"layout: one parity block too few@store_sum.c@s/z->P = z->G \* m;/z->P = z->G * m - (m > 0);/@native@layout@caught"
+"Walsh-Hadamard chunk: largest power not taken@tq.c@s/for (len = 1; len \* 2 <= dpad; len \*= 2) {}/for (len = 1; len * 4 <= dpad; len *= 2) {}/@x86-64@chunks@caught"
+"rebuild uses the wrong parity row@store_sum.c@s/gf_coef_(k, use\[q\], md\[p\])/gf_coef_(k, use[q] + 1, md[p])/@native@props@caught"
+)
+
+for row in "${mutants[@]}"; do
+    IFS='@' read -r name file expr arch check expect <<< "$row"
+    d=$(mktemp -d -p "$tmp")
+    cp -r ../src "$d/src"
+    sed -i "$expr" "$d/src/$file"
+    if cmp -s "../src/$file" "$d/src/$file"; then echo "?? $name: the sed did not apply"; missed=1; continue; fi
+    bin=$d/diff
+    if ! gcc "${CFLAGS[@]}" -I"$d/src" -march="$arch" c/diff.c -lm -lpthread -o "$bin" 2> "$d/cc.txt"; then
+        echo "WRONG     (does not compile): $name"; missed=1; continue; fi
+    caught=0
+    case $check in
+        gf|digits|vd|layout|chunks)
+            "$ORACLE" "$check" > "$d/want"; "$bin" "$check" > "$d/got" || true
+            cmp -s "$d/want" "$d/got" || caught=1 ;;
+        crc|block|topk)
+            "$bin" "cases-$check" 300 1 > "$d/in"
+            "$ORACLE" "$check" < "$d/in" > "$d/want"; "$bin" "$check" < "$d/in" > "$d/got" || true
+            cmp -s "$d/want" "$d/got" || caught=1 ;;
+        props)
+            "$bin" props 100 1 > "$d/got" 2>&1 || caught=1 ;;
+    esac
+    if [[ $caught == 1 && $expect == caught ]]; then echo "caught    ($check, -march=$arch): $name"
+    elif [[ $caught == 0 && $expect == survives ]]; then echo "survives  ($check, -march=$arch): $name"
+    else echo "WRONG     ($check, -march=$arch, expected $expect): $name"; missed=1; fi
+done
+exit $missed

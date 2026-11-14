@@ -1,0 +1,8 @@
+begin
+add 3 0 1 0 0
+del 3
+commit
+begin
+add 4 0 0 1 0
+abort
+commit sync

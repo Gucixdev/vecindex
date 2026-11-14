@@ -1,0 +1,21 @@
+GET /range?lo=0&hi=10 HTTP/1.3
+Host: x
+
+POST /delete?id=3 HTTP/1.1
+Host: x
+Contymi-Le0
+Host: x
+Content-Le0 HTTP/1.1
+Host: x
+
+POST /delete id?=3HTTP/1.1
+Host: x
+Content-Length: 0
+
+POST /delete?lo=777777777777777777777770&
+Contength: 0
+
+POST /delete?l$o=0&hi=9 HTTP/1.1
+Host: x
+Content-Length: 0
+

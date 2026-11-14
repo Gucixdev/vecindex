@@ -1,0 +1,11 @@
+POST /add?id=6 HTTP/1.1
+Host: x
+Content-Type: application/octet-stream
+Content-Length: 16
+
+ÍÌÌ=ÍÌL¾š™™>ÍÌÌ>POST /search?k=2 HTTP/1.1
+Host: x
+Content-Type: application/octet-stream
+Content-Length: 16
+
+ÍÌÌ=ÍÌL¾š™™>ÍÌÌ>

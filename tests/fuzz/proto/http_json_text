@@ -1,0 +1,12 @@
+POST /add?id=4 HTTP/1.1
+Host: x
+Content-Length: 59
+
+{"vector": [0.1, -0.2, 0.3, 0.4], "text": "hi \"there\"\n"}GET /text?id=4 HTTP/1.1
+Host: x
+
+POST /hybrid?k=3 HTTP/1.1
+Host: x
+Content-Length: 47
+
+{"vector": [0.1, -0.2, 0.3, 0.4], "text": "hi"}

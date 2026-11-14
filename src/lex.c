@@ -1,0 +1,404 @@
+/* lex.c - term dictionary + inverted index + BM25, on hdict.c.
+ *
+ * The lexical half of vecindex. A vector index answers "what is close in
+ * meaning"; it is weak on exact things - an identifier, a rare name, a
+ * number, a word the embedding smeared away. This is the exact half:
+ *
+ *   term dictionary   HStr: term -> term id, so a query word costs one hash
+ *                     probe and lands on its posting list directly
+ *   postings          per term id, (doc slot, term frequency) pairs, compressed: slot gaps and tf packed
+ *                     into varints (1-2 bytes a posting), kept inside the 24-byte list header while they
+ *                     fit in 8 bytes - a term seen once or twice costs no allocation at all
+ *   BM25              k1 = 1.2, b = 0.75, idf = ln(1 + (N-df+0.5)/(df+0.5)),
+ *                     scored term-at-a-time into one accumulator array
+ *   H64 doc table     doc id -> slot: add replaces, delete is O(1)
+ *
+ * Tokens: ASCII letters and digits, lowercased; every byte >= 0x80 counts as
+ * a letter so UTF-8 words survive whole (no Unicode case folding: "Łódź" and
+ * "łódź" stay different terms). Length 1..64.
+ *
+ * delete marks the slot dead (postings are skipped while scoring) and the
+ * index compacts itself once a quarter of its slots are dead.
+ *
+ *   gcc -std=c89 -pedantic -Wall -Wextra -Werror -O2 -Isrc tests/lex_test.c -lm -o lex_test && ./lex_test
+ */
+#ifndef LEX_C
+#define LEX_C
+
+#include "hdict.c"
+#include <math.h>
+#include <stdio.h>
+#include <pthread.h>
+
+#define LEX_MAXTOK 64
+
+typedef struct {
+    u32 n;              /* postings (documents) in the list */
+    u32 len;            /* bytes of encoded postings */
+    u32 last;           /* slot of the last posting: the base of the next gap */
+    u32 cap;            /* bytes at b.p; 0 = the postings sit in b.inl */
+    union { u8 inl[8]; u8 *p; } b;
+} LexPost;
+
+#define LEX_PB(pl) ((pl)->cap ? (pl)->b.p : (pl)->b.inl)
+
+static i32 lex_vput_(u8 *o, u64 v)                  /* LEB128 */
+{
+    i32 n = 0;
+    while (v >= 0x80) { o[n++] = (u8)(v | 0x80); v >>= 7; }
+    o[n++] = (u8)v;
+    return n;
+}
+static u64 lex_vget_(const u8 **q)
+{
+    u64 v = 0;
+    i32 sh = 0;
+    while (**q & 0x80) { v |= (u64)(**q & 0x7f) << sh; sh += 7; ++*q; }
+    v |= (u64)**q << sh; ++*q;
+    return v;
+}
+
+/* walk a list: slot/tf of each posting in order */
+typedef struct { const u8 *q, *e; u32 slot; } LexIt;
+static void lex_it_(const LexPost *pl, LexIt *it) { it->q = LEX_PB(pl); it->e = it->q + pl->len; it->slot = 0; }
+static i32 lex_next_post_(LexIt *it, i32 *slot, i32 *tf)
+{
+    u64 v;
+    if (it->q >= it->e) return 0;
+    v = lex_vget_(&it->q);
+    it->slot += (u32)(v >> 3);
+    *slot = (i32)it->slot;
+    *tf = (i32)(v & 7u);
+    if (*tf == 7) *tf = 7 + (i32)lex_vget_(&it->q);
+    return 1;
+}
+
+typedef struct {
+    HStr     terms;
+    LexPost *post;      /* [nterms] */
+    i32      nterms, tcap;
+    H64      docs;      /* doc id -> slot */
+    i64     *doc_id;    /* [ndocs] */
+    i32     *doc_len;   /* tokens in the doc */
+    u8      *doc_dead;
+    i32      ndocs, dcap;
+    i32      live;
+    i64      total_len; /* sum of doc_len over live docs */
+    f32     *acc;       /* search scratch, all zero between queries (so no O(ndocs) work per query) */
+    i32     *touched;
+    i32      scap;
+    pthread_mutex_t mu; /* lex_search shares that scratch, so searches on one Lex take turns (add/delete still need one writer) */
+} Lex;
+
+void lex_init(Lex *x)
+{
+    memset(x, 0, sizeof(*x));
+    hs_init(&x->terms, 1024);
+    h64_init(&x->docs, 256);
+    pthread_mutex_init(&x->mu, (const pthread_mutexattr_t *)0);
+}
+
+void lex_free(Lex *x)
+{
+    i32 t;
+    for (t = 0; t < x->nterms; ++t) if (x->post[t].cap) free(x->post[t].b.p);
+    free(x->acc); free(x->touched);
+    free(x->post); free(x->doc_id); free(x->doc_len); free(x->doc_dead);
+    hs_free(&x->terms); h64_free(&x->docs);
+    pthread_mutex_destroy(&x->mu);
+    memset(x, 0, sizeof(*x));
+}
+
+/* ---- tokenizer ---- */
+
+static i32 lex_isword_(u8 c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80; }
+
+/* Polish letters folded to ASCII (a-ogonek -> a, o-acute -> o, l-stroke -> l ...), both cases, so a query typed
+ * without diacritics still finds them and the suffix rules below see one alphabet. a = lead byte, b = second. */
+static char lex_fold2_(u8 a, u8 b)
+{
+    if (a == 0xC4) { if (b == 0x84 || b == 0x85) return 'a'; if (b == 0x86 || b == 0x87) return 'c'; if (b == 0x98 || b == 0x99) return 'e'; }
+    else if (a == 0xC5) { if (b == 0x81 || b == 0x82) return 'l'; if (b == 0x83 || b == 0x84) return 'n'; if (b == 0x9A || b == 0x9B) return 's'; if (b == 0xB9 || b == 0xBA || b == 0xBB || b == 0xBC) return 'z'; }
+    else if (a == 0xC3) { if (b == 0x93 || b == 0xB3) return 'o'; }
+    return 0;
+}
+
+/* Light stemmer for English and Polish (inflection: kota/kotem/kotami, programowanie/programuje/programowac,
+ * notes/note). Longest matching suffix wins, the stem must stay long enough (3 letters for the long endings, 4 for
+ * one-letter endings and English -s/-ed/-ing), tokens with digits are left alone (ids, versions). Applied to the
+ * folded (ASCII) token, when indexing and when querying, so both sides agree even where the stem is not a word. */
+typedef struct { const char *s; i32 min; } LexSuf;
+
+static i32 lex_stem_(char *t, i32 n)
+{
+    static const LexSuf suf[] = {
+        /* Polish verbal nouns and verb forms in -owac / -ywac / -ac (programowanie, programuje, programowal) */
+        { "owaniem", 3 }, { "owaniu", 3 }, { "owania", 3 }, { "owanie", 3 }, { "owanych", 3 }, { "owanego", 3 },
+        { "owany", 3 }, { "owana", 3 }, { "owane", 3 }, { "owali", 3 }, { "owala", 3 }, { "owalo", 3 }, { "owal", 3 }, { "owac", 3 },
+        { "ujemy", 3 }, { "ujecie", 3 }, { "ujesz", 3 }, { "ujac", 3 }, { "uja", 3 }, { "uje", 3 },
+        { "aniem", 3 }, { "eniem", 3 }, { "aniu", 3 }, { "eniu", 3 }, { "ania", 3 }, { "enia", 3 }, { "anie", 3 }, { "enie", 3 },
+        /* nouns and adjectives: case endings */
+        { "ami", 3 }, { "ach", 3 }, { "ymi", 3 }, { "imi", 3 }, { "ego", 3 }, { "emu", 3 }, { "ych", 3 }, { "ich", 3 }, { "owie", 3 },
+        { "iem", 3 }, { "ie", 3 }, { "ze", 4 }, { "ce", 4 }, { "an", 4 }, { "ej", 3 }, { "ym", 3 }, { "im", 3 }, { "om", 3 }, { "em", 3 }, { "ow", 3 }, { "ii", 3 }, { "ia", 3 },
+        /* English */
+        { "ingu", 4 }, { "ing", 4 }, { "ies", 4 }, { "ed", 4 }, { "es", 4 }, { "s", 3 },
+        { 0, 0 }
+    };
+    i32 i;
+    for (i = 0; i < n; ++i) if (t[i] >= '0' && t[i] <= '9') return n;
+    for (i = 0; suf[i].s; ++i) {
+        i32 l = (i32)strlen(suf[i].s);
+        if (n - l >= suf[i].min && memcmp(t + n - l, suf[i].s, (size_t)l) == 0) { n -= l; break; }
+    }
+    /* second step: a final vowel (Polish kot/kota/koty, English note/notes after the -s went) */
+    if (n >= 4) { char c = t[n - 1]; if (c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' || c == 'y') --n; }
+    return n;
+}
+
+/* next token at *p (advances it): lowercased, Polish letters folded, NOT stemmed; length or 0 at the end */
+static i32 lex_next_raw_(const char **p, const char *end, char *out)
+{
+    const char *s = *p;
+    i32 n = 0;
+    while (s < end && !lex_isword_((u8)*s)) ++s;
+    while (s < end && lex_isword_((u8)*s)) {
+        char c;
+        if (s + 1 < end && (c = lex_fold2_((u8)s[0], (u8)s[1])) != 0) { if (n < LEX_MAXTOK) out[n++] = c; s += 2; continue; }
+        if (n < LEX_MAXTOK) out[n++] = (*s >= 'A' && *s <= 'Z') ? (char)(*s + 32) : *s;
+        ++s;
+    }
+    *p = s;
+    return n;
+}
+
+/* the same, stemmed */
+static i32 lex_next_(const char **p, const char *end, char *out)
+{
+    i32 n = lex_next_raw_(p, end, out);
+    return n > 0 ? lex_stem_(out, n) : 0;
+}
+
+/* ---- adding and deleting ---- */
+
+static i32 lex_term_id_(Lex *x, const char *t, i32 n, i32 create)
+{
+    i32 id = hs_get(&x->terms, t, n);
+    if (id >= 0 || !create) return id;
+    if (x->nterms == x->tcap) {
+        x->tcap = x->tcap ? x->tcap + x->tcap / 2 : 1024;
+        x->post = (LexPost *)realloc(x->post, (size_t)x->tcap * sizeof(LexPost));
+    }
+    id = x->nterms++;
+    memset(&x->post[id], 0, sizeof(LexPost));
+    hs_put(&x->terms, t, n, id);
+    return id;
+}
+
+static void lex_post_add_(LexPost *p, i32 slot, i32 tf)
+{
+    u8 enc[20];
+    i32 k = lex_vput_(enc, ((u64)((u32)slot - p->last) << 3) | (u64)(tf < 7 ? tf : 7));
+    if (tf >= 7) k += lex_vput_(enc + k, (u64)(tf - 7));
+    if (!p->cap && p->len + (u32)k > sizeof(p->b.inl)) {      /* outgrew the inline bytes */
+        u8 *h = (u8 *)malloc(32);
+        memcpy(h, p->b.inl, p->len);
+        p->b.p = h; p->cap = 32;
+    } else if (p->cap && p->len + (u32)k > p->cap) {
+        p->cap = p->cap + p->cap / 2 + (u32)k;
+        p->b.p = (u8 *)realloc(p->b.p, p->cap);
+    }
+    memcpy(LEX_PB(p) + p->len, enc, (size_t)k);
+    p->len += (u32)k; p->last = (u32)slot; ++p->n;
+}
+
+/* drop dead slots and renumber: postings, doc arrays, the doc table. Gaps only shrink under the renumbering,
+ * so each list is re-encoded in place. */
+static void lex_compact_(Lex *x)
+{
+    i32 *remap = (i32 *)malloc((size_t)(x->ndocs ? x->ndocs : 1) * sizeof(i32));
+    i32 s, w = 0, t;
+    for (s = 0; s < x->ndocs; ++s) {
+        if (x->doc_dead[s]) { remap[s] = -1; continue; }
+        remap[s] = w;
+        x->doc_id[w] = x->doc_id[s]; x->doc_len[w] = x->doc_len[s]; x->doc_dead[w] = 0;
+        ++w;
+    }
+    x->ndocs = w;
+    h64_clear(&x->docs);
+    for (s = 0; s < w; ++s) h64_put(&x->docs, x->doc_id[s], s);
+    for (t = 0; t < x->nterms; ++t) {
+        LexPost *p = &x->post[t];
+        LexIt it;
+        i32 sl, tf;
+        u8 *o = LEX_PB(p);
+        u32 len = 0, last = 0, n = 0;
+        lex_it_(p, &it);
+        while (lex_next_post_(&it, &sl, &tf)) {
+            u8 enc[20];
+            i32 k;
+            if (remap[sl] < 0) continue;
+            k = lex_vput_(enc, ((u64)((u32)remap[sl] - last) << 3) | (u64)(tf < 7 ? tf : 7));
+            if (tf >= 7) k += lex_vput_(enc + k, (u64)(tf - 7));
+            memcpy(o + len, enc, (size_t)k);                       /* never ahead of the reader */
+            len += (u32)k; last = (u32)remap[sl]; ++n;
+        }
+        p->len = len; p->last = last; p->n = n;
+    }
+    free(remap);
+}
+
+i32 lex_delete(Lex *x, i64 doc_id)
+{
+    i32 s = h64_get(&x->docs, doc_id);
+    if (s < 0) return 0;
+    x->doc_dead[s] = 1;
+    x->total_len -= x->doc_len[s];
+    --x->live;
+    h64_del(&x->docs, doc_id);
+    if (x->ndocs - x->live > 64 && (x->ndocs - x->live) * 4 > x->ndocs) lex_compact_(x);
+    return 1;
+}
+
+/* index text under doc_id (an existing doc is replaced). Returns the number of tokens. */
+i32 lex_add(Lex *x, i64 doc_id, const char *text, i32 len)
+{
+    const char *p = text, *end = text + len;
+    char tok[LEX_MAXTOK + 1];
+    i32 n, slot, ntok = 0;
+    i32 *ids = (i32 *)0; i32 nid = 0, cap = 0;
+
+    lex_delete(x, doc_id);
+    if (x->ndocs == x->dcap) {
+        x->dcap = x->dcap ? x->dcap + x->dcap / 2 : 256;
+        x->doc_id   = (i64 *)realloc(x->doc_id,   (size_t)x->dcap * sizeof(i64));
+        x->doc_len  = (i32 *)realloc(x->doc_len,  (size_t)x->dcap * sizeof(i32));
+        x->doc_dead = (u8  *)realloc(x->doc_dead, (size_t)x->dcap);
+    }
+    slot = x->ndocs++;
+    x->doc_id[slot] = doc_id; x->doc_dead[slot] = 0;
+
+    /* collect term ids, sort, then one (slot, tf) entry per distinct term */
+    while ((n = lex_next_(&p, end, tok)) > 0) {
+        if (nid == cap) { cap = cap ? cap * 2 : 64; ids = (i32 *)realloc(ids, (size_t)cap * sizeof(i32)); }
+        ids[nid++] = lex_term_id_(x, tok, n, 1);
+        ++ntok;
+    }
+    if (nid > 1) {   /* insertion sort is fine for note-sized texts; shell sort for long ones */
+        i32 gap, i, j;
+        for (gap = nid / 2; gap > 0; gap /= 2)
+            for (i = gap; i < nid; ++i) {
+                i32 v = ids[i];
+                for (j = i; j >= gap && ids[j - gap] > v; j -= gap) ids[j] = ids[j - gap];
+                ids[j] = v;
+            }
+    }
+    { i32 i = 0;
+      while (i < nid) {
+          i32 j = i;
+          while (j < nid && ids[j] == ids[i]) ++j;
+          lex_post_add_(&x->post[ids[i]], slot, j - i);
+          i = j;
+      } }
+    free(ids);
+    x->doc_len[slot] = ntok;
+    x->total_len += ntok;
+    ++x->live;
+    h64_put(&x->docs, doc_id, slot);
+    return ntok;
+}
+
+/* ---- BM25 search ---- */
+
+/* add one term's BM25 contribution to every live doc that has it */
+static void lex_acc_term_(const Lex *x, i32 id, f32 *acc, i32 *touched, i32 *ntouched, f64 avgdl)
+{
+    const LexPost *pl = &x->post[id];
+    const f64 k1 = 1.2, b = 0.75;
+    f64 idf, N = (f64)x->live;
+    i32 df = 0, s, t;
+    LexIt it;
+    if (x->live == x->ndocs) df = (i32)pl->n;                  /* no dead docs: the list length is the df */
+    else { lex_it_(pl, &it); while (lex_next_post_(&it, &s, &t)) if (!x->doc_dead[s]) ++df; }
+    if (df == 0) return;
+    idf = log(1.0 + (N - (f64)df + 0.5) / ((f64)df + 0.5));
+    lex_it_(pl, &it);
+    while (lex_next_post_(&it, &s, &t)) {
+        f64 tf, norm;
+        if (x->doc_dead[s]) continue;
+        tf = (f64)t;
+        norm = tf + k1 * (1.0 - b + b * (f64)x->doc_len[s] / avgdl);
+        if (acc[s] == 0.0f) touched[(*ntouched)++] = s;
+        acc[s] += (f32)(idf * tf * (k1 + 1.0) / norm);
+    }
+}
+
+
+/* top-k live docs for the query text; scores are BM25 (higher is better). Returns the number found. */
+i32 lex_search(const Lex *x, const char *query, i32 qlen, i32 k, i64 *out_ids, f32 *out_scores)
+{
+    const char *p = query, *end = query + qlen;
+    char tok[LEX_MAXTOK + 1];
+    f32 *acc;
+    i32 *touched, ntouched = 0, n, i, found = 0, qt[64], nq = 0;
+    f64 avgdl;
+
+    if (x->live == 0 || k <= 0) return 0;
+    pthread_mutex_lock(&((Lex *)x)->mu);
+    { Lex *xm = (Lex *)x;
+      if (xm->scap < xm->ndocs) {
+          i32 ncap = xm->ndocs + xm->ndocs / 2 + 64;
+          xm->acc = (f32 *)realloc(xm->acc, (size_t)ncap * sizeof(f32));
+          memset(xm->acc + xm->scap, 0, (size_t)(ncap - xm->scap) * sizeof(f32));
+          xm->touched = (i32 *)realloc(xm->touched, (size_t)ncap * sizeof(i32));
+          xm->scap = ncap;
+      }
+      acc = xm->acc; touched = xm->touched; }
+    avgdl = (f64)x->total_len / (f64)x->live;
+    if (avgdl < 1.0) avgdl = 1.0;
+
+    while ((n = lex_next_raw_(&p, end, tok)) > 0) {
+        if (p < end && *p == '*') {                              /* prefix: every term that starts with it (folded, not stemmed) */
+            const char *key; i32 kl, val, cur = 0;
+            ++p;
+            while (hs_next(&x->terms, &cur, &key, &kl, &val))
+                if (kl >= n && memcmp(key, tok, (size_t)n) == 0) lex_acc_term_(x, val, acc, touched, &ntouched, avgdl);
+            {   /* the terms are stems ("genome" is stored as "genom"), so a typed word longer than its stem would find
+                 * nothing: its own stem counts too, unless the loop above already took it (it starts with the typed text) */
+                char st[LEX_MAXTOK + 1];
+                i32 sn;
+                memcpy(st, tok, (size_t)n);
+                sn = lex_stem_(st, n);
+                if (sn > 0) {
+                    i32 id = hs_get(&x->terms, st, sn);
+                    if (id >= 0 && !(sn >= n && memcmp(st, tok, (size_t)n) == 0)) lex_acc_term_(x, id, acc, touched, &ntouched, avgdl);
+                }
+            }
+            continue;
+        }
+        n = lex_stem_(tok, n);
+        { i32 id = hs_get(&x->terms, tok, n);
+          if (id >= 0 && nq < 64) qt[nq++] = id; }
+    }
+    /* Terms found in > 1/8 of the documents ("the", "of") add almost nothing (idf ~ 0) yet
+     * cost a pass over a huge posting list; skip them whenever a rarer term is present. */
+    { i32 rare = 0;
+      for (i = 0; i < nq; ++i) if ((i64)x->post[qt[i]].n * 8 <= (i64)x->live) { rare = 1; break; }
+      for (i = 0; i < nq; ++i) {
+          if (rare && (i64)x->post[qt[i]].n * 8 > (i64)x->live) continue;
+          lex_acc_term_(x, qt[i], acc, touched, &ntouched, avgdl);
+      } }
+    /* top-k by partial insertion into out_* (k is small) */
+    for (i = 0; i < ntouched; ++i) {
+        i32 s = touched[i], j;
+        f32 sc = acc[s];
+        if (found == k && sc <= out_scores[k - 1]) continue;
+        j = found < k ? found++ : k - 1;
+        while (j > 0 && out_scores[j - 1] < sc) { out_scores[j] = out_scores[j - 1]; out_ids[j] = out_ids[j - 1]; --j; }
+        out_scores[j] = sc; out_ids[j] = x->doc_id[s];
+    }
+    for (i = 0; i < ntouched; ++i) acc[touched[i]] = 0.0f;   /* back to all-zero for the next query */
+    pthread_mutex_unlock(&((Lex *)x)->mu);
+    return found;
+}
+
+#endif /* LEX_C */

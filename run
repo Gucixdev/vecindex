@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# run - build and test vecindex. Every module in src/ has its self-test in tests/NAME_test.c: the bit-packed
+# quantizers (q1-q5 + qmix), the IVF coarse router + HNSW graph router, the 4-bit fast-scan, the adaptive engine
+# and the store. Then the SIMD kernels per instruction set, the C API, the store under the sanitizers and kill -9,
+# the server end to end and vfind. Each binary goes to .build/ and is rebuilt only when its source or a dependency
+# changed; it is compiled with -Werror and a non-zero exit fails the run.
+#   ./run                      every test, and .build/libvecindex.so / .a (needs bash and gcc; python3 for the server's
+#                              end-to-end tests)
+#   ./run bench                also bench/bench.c (timings vs the Rust port)
+#   ./run stress               also tests/stress.c (churn + oracle + edge cases)
+#   ./run real_val             also bench/real_val.c, the SQuAD + AG-News retrieval benchmark (needs emb/real_data.bin)
+#   ./run lean                 only lean4/run: the Lean 4 proofs, their axiom audit, and the C kernels against the proved
+#                              model (needs lake; ./run all runs it too when lake is installed)
+#   ./run compare DATA [OUT]   only the measurements of docs/benchmarks.md: every library on GloVe-100 through
+#                              py/bench.py, then the 10M and 100M scale runs. DATA from py/prepare_glove.py; results in
+#                              OUT (default bench/results-HOSTNAME), `python3 py/tables.py OUT/glove.jsonl` prints the
+#                              tables. Needs python3 with numpy, faiss-cpu, turbovec, qdrant-edge-py, vecgrid, and LEANN
+#                              in a venv of its own ($PYTHON_LEANN); a library that cannot import is logged and skipped.
+#                              2-3 hours on 2 cores, ~30 GB in /var/tmp ($VECINDEX_SPILL). The memory limit of the
+#                              published numbers: systemd-run --user --scope -p MemoryMax=5.84G ./run compare DATA
+#   ./run all [DATA [OUT]]     everything: every test, then stress, bench and real_val, the cross-built tests
+#                              (tools/cross: the targets whose compiler and qemu are installed), and compare: on DATA, or
+#                              on $COMPARE_DIR/data (default /var/tmp/vecindex-compare) when that exists, without the
+#                              10M/100M runs (SKIP_SCALE= to keep them). real_val builds its corpus into $COMPARE_DIR/emb
+#                              the first time (needs the venv-leann python with torch; installs datasets+transformers there)
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+# everything compare and real_val need (python venvs, GloVe data, embeddings) lives in $CMP, never in the project
+CMP=${COMPARE_DIR:-/var/tmp/vecindex-compare}
+
+# every measurement of docs/benchmarks.md, in one go (data dir, results dir): 0, or 1 when a build failed
+compare() {
+    local data out py p job T=${THREADS:-$(nproc)}   # every core by default; THREADS=2 for the published setting
+    data=$(realpath "$1") || return 1
+    out=$(realpath -m "${2:-bench/results-$(hostname)}")
+    py=${PYTHON:-$([[ -x $CMP/venv/bin/python ]] && echo "$CMP/venv/bin/python" || echo python3)}
+    local pl=${PYTHON_LEANN:-$([[ -x $CMP/venv-leann/bin/python ]] && echo "$CMP/venv-leann/bin/python" || echo "$py")}
+    mkdir -p "$out"
+    lscpu > "$out/cpu.txt" 2>/dev/null || true
+    (
+        cd bench || exit 1
+        gcc -std=gnu99 -O3 -march=native -fPIC -shared -I../src vi.c -o libvi.so -lm -lpthread || exit 1
+        gcc -std=gnu99 -O2 -march=native -I../src scale.c -lm -lpthread -o scale || exit 1
+        log() { echo "=== $* $(date +%T)" | tee -a "$out/run.log"; }
+        # GloVe-100: every library through the same harness (turbovec on 1 thread too: its one-query-per-call column)
+        for job in "vecindex $T" "vecindex-i8 $T" "vecindex-2bit $T" "vecindex-2bit-i8 $T" "vecindex-1bit $T" "vecindex-1bit-i8 $T" \
+                   "vecindex-cascade $T" "vecindex-cascade-i8 $T" "turbovec4 1" "turbovec4 $T" "turbovec2 1" "turbovec2 $T" \
+                   "faiss-ivfpqfs $T" "faiss-hnsw $T" "faiss-ivfflat $T" "qdrant $T" "vecgrid $T" "leann $T"; do
+            set -- $job
+            p=$py; [[ $1 == leann ]] && p=$pl
+            log "$1 threads=$2"
+            "$p" ../py/bench.py "$data" "$1" --threads "$2" --lat 1000 >> "$out/glove.jsonl" 2>> "$out/run.log" || log "$1 failed"
+        done
+        [[ -n ${SKIP_SCALE:-} ]] && { log "done (SKIP_SCALE: no 10M/100M runs): $out"; exit 0; }
+        # scale: synthetic rows streamed through the store (time and memory at every stage)
+        log "scale 10M x 128"
+        TQ_VERBOSE=1 ./scale 10000000 128 --nq 100 --probe 100,200,400,800 > "$out/scale_10m.jsonl" 2>&1 || log "scale 10M failed"
+        log "scale 100M x 96, 2-bit codes + int8 rows"
+        TQ_VERBOSE=1 ./scale 100000000 96 --nq 100 --bits 2 --int8 --probe 1000,2000,4000,8000 --rerank 1000 \
+            > "$out/scale_100m.jsonl" 2>&1 || log "scale 100M failed"
+        log "done: $out"
+    )
+}
+
+mode=${1:-}
+case $mode in
+    compare) [[ -n ${2:-} ]] || { echo "usage: ./run compare DATA_DIR [OUT_DIR]" >&2; exit 2; }
+             compare "$2" "${3:-}"; exit $? ;;
+    lean)    exec lean4/run "${@:2}" ;;
+    all)     more=(stress bench real_val) ;;
+    "")      more=() ;;
+    *)       more=("$mode") ;;
+esac
+
+CC="${CC:-gcc}"
+CFLAGS=(-std=c89 -pedantic -Wall -Wextra -Werror
+        -D_POSIX_C_SOURCE=200112L -O2 -march=native -Isrc)
+OUT=.build
+mkdir -p "$OUT"
+
+# q2/q4/q5 and their tests are sed-derived from q1 - fail loudly if they have drifted.
+tools/gen --check
+
+QDEPS=(src/q1.c src/q2.c src/q3.c src/q4.c src/q5.c src/qmix.c src/q4fs.c src/vsimd.h)
+ENG=("${QDEPS[@]}" src/ivf.c src/hnsw.c src/engine*.c)
+STORE=("${ENG[@]}" src/store*.c src/hdict.c src/lex.c src/blake3.c src/tq*.c)
+
+fail=0
+# one line per step for the table at the very end: rec NAME ok|FAIL|skip [note]
+RN=(); RS=(); RT=(); RD=(); T0=$SECONDS; LAST=$SECONDS
+rec() { RN+=("$1"); RS+=("$2"); RT+=("${3:-}"); RD+=("$((SECONDS-LAST))"); LAST=$SECONDS; }
+# ex LOG REGEX [first|last]: the first/last thing in a step's log that matches (the numbers for the table)
+ex() { local m; m=$(grep -aoE "$2" "$1" 2>/dev/null | { [[ ${3:-first} == last ]] && tail -n1 || head -n1; }); printf '%s' "$m"; }
+okn() { grep -ac '^ *ok ' "$1" 2>/dev/null || true; }
+# the headline numbers of each step, read back from its log
+notes() {
+    local n=$1 l="$OUT/log_$1.txt"
+    case $n in
+        hdict)   echo "id lookup: $(ex $l 'scan [0-9.]+ s, hash [0-9.]+ s')" ;;
+        lex)     echo "$(ex $l '[0-9]+ docs, [0-9]+ terms'), $(ex $l '[0-9]+ us/query')" ;;
+        q1|q2|q3|q4|q5) echo "$(ex $l 'code_bytes/vec=[0-9]+') $(ex $l 'recall@10 vs exact f32 = [0-9]+%')" ;;
+        qmix)    echo "$(ex $l 'qmix = [0-9]+%   uniform q2 = [0-9]+%')" ;;
+        q4fs)    echo "fast-scan $(ex $l 'speedup = [0-9.]+x') over plain q4" ;;
+        hnsw)    echo "$(ex $l 'recall@10 = [0-9.]+%') vs brute" ;;
+        ivf)     echo "self routes to own cluster $(ex $l '[0-9]+%$')" ;;
+        simd)    echo "$(grep -ac 'simd: ok' $l) kernel sets ok" ;;
+        engine)  echo "$(ex $l 'IVF\+q4 nprobe=4, 48 B/vec, recall [0-9]+%')" ;;
+        store)   echo "$(ex $l 'held-out recall@10 [0-9]+/1000' last); $(ex $l 'rows streamed in while searching')" | sed 's/; $//' ;;
+        stress)  echo "$(ex $l 'batch 4000q/[0-9]+T in [0-9]+ us/q'), $(ex $l 'recall@10 vs exact = [0-9]+%')" ;;
+        bench)   echo "$(ex $l 'chosen IVF\+[a-z0-9]+ nprobe=[0-9]+, recall@10 [0-9]+%   query [0-9.]+ us' last)" ;;
+        "simd "*) echo "$(grep -ac 'simd: ok' "$OUT/log_simd_${n#simd }.txt") kernel sets ok" ;;
+        "C API"*) echo "$(okn "$OUT/log_capi.txt") checks ok" ;;
+        "kill -9 crash test") echo "$(ex "$OUT/log_scrash.txt" '[0-9]+ rounds, [0-9]+ ids synced')" ;;
+        vserv)   echo "$(ex "$OUT/log_vserv.txt" '[0-9]+/s'), $(ex "$OUT/log_vserv.txt" '[0-9]+ queries/s'), $(okn "$OUT/log_vserv.txt") checks" ;;
+        "vserv TLS") echo "$(ex "$OUT/log_vserv_tls.txt" '[0-9]+ queries/s') over TLS, $(okn "$OUT/log_vserv_tls.txt") checks" ;;
+        "vserv line protocol") echo "$(okn "$OUT/log_vserv_line.txt") checks ok" ;;
+    esac
+}
+for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd engine store ${more[@]+"${more[@]}"}; do
+    bin="$OUT/$name"
+    src="tests/${name}_test.c"
+    def=()
+    case $name in
+        hdict)  deps=(src/hdict.c) ;;
+        lex)    deps=(src/hdict.c src/lex.c) ;;
+        q1|q2|q3|q4|q5) deps=("src/$name.c" src/vsimd.h) ;;
+        qmix)   deps=(src/q1.c src/q2.c src/q4.c src/qmix.c src/vsimd.h) ;;
+        q4fs)   deps=(src/q4.c src/q4fs.c src/vsimd.h) ;;
+        hnsw)   deps=(src/hnsw.c src/vsimd.h) ;;
+        ivf)    deps=(src/ivf.c) ;;
+        simd)   deps=(src/tq*.c src/vsimd.h src/base.h) ;;
+        engine) deps=("${ENG[@]}"); def=(-DENGINE_SERIALIZE) ;;   # exercise the .vxi round-trip in the test
+        store)  deps=("${STORE[@]}") ;;
+        bench)  src=bench/bench.c; def=(-DBENCH); deps=("${ENG[@]}") ;;
+        stress) src=tests/stress.c; def=(-DSTRESS); deps=("${STORE[@]}") ;;
+        real_val) src=bench/real_val.c; def=(-DREAL_VAL); deps=("${STORE[@]}")
+                  # the real corpus (SQuAD + AG-News, MiniLM embeddings): built once into $EMB (tmp), skipped if that cannot be done
+                  EMB=${EMB_DIR:-$CMP/emb}
+                  [[ -f emb/real_data.bin ]] && EMB=emb
+                  if [[ ! -f $EMB/real_data.bin && $mode == all ]]; then
+                      rp=${PYTHON_EMB:-$CMP/venv-leann/bin/python}
+                      if [[ -x $rp ]]; then
+                          echo "real_val: building the corpus into $EMB (first run only: downloads SQuAD, AG-News and MiniLM)"
+                          mkdir -p "$EMB" && { "$rp" -c 'import datasets, transformers, torch' 2>/dev/null || "$rp" -m pip install -q datasets "transformers<4.58"; } \
+                              && "$rp" py/real_gen.py "$EMB" > "$OUT/log_real_gen.txt" 2>&1 || echo "real_val: py/real_gen.py failed (see $OUT/log_real_gen.txt)"
+                      fi
+                  fi
+                  [[ -f $EMB/real_data.bin ]] || { echo "real_val: $EMB/real_data.bin absent (py/real_gen.py DIR) - skipped"; rec real_val skip "no real_data.bin (py/real_gen.py DIR)"; continue; } ;;
+        *)      echo "run: unknown target '$name'" >&2; exit 2 ;;
+    esac
+    stale=0
+    [[ -x $bin ]] || stale=1
+    for d in "$src" "${deps[@]}"; do [[ $d -nt $bin ]] && stale=1; done
+    (( stale )) && "$CC" "${CFLAGS[@]}" "$src" "${def[@]}" -lm -lpthread -o "$bin"
+    runargs=()
+    [[ $name == real_val ]] && runargs=("$EMB")
+    if ! "./$bin" "${runargs[@]}" 2>&1 | tee "$OUT/log_$name.txt"; then echo "  ^ $name FAILED"; fail=1; rec "$name" FAIL; else rec "$name" ok "$(notes "$name")"; fi
+    echo
+done
+
+# ---- the SIMD kernels again, built for the other code paths this CPU can run: on x86-64 AVX2 without AVX-512 and no
+# ---- SIMD at all, on aarch64 no NEON (tools/cross covers 32-bit ARM, RISC-V and big-endian s390x) ----
+case $(uname -m) in
+    x86_64)  isas=(haswell x86-64) ;;
+    aarch64) isas=(armv8-a+nosimd) ;;
+    *)       isas=() ;;
+esac
+for isa in "${isas[@]}"; do
+    bin="$OUT/simd_$isa"
+    stale=0
+    [[ -x $bin ]] || stale=1
+    for d in tests/simd_test.c src/tq*.c src/vsimd.h src/base.h; do [[ $d -nt $bin ]] && stale=1; done
+    (( stale )) && "$CC" "${CFLAGS[@]/-march=native/-march=$isa}" tests/simd_test.c -lm -lpthread -o "$bin"
+    if "./$bin" 2>&1 | tee "$OUT/log_simd_$isa.txt"; then rec "simd $isa" ok "$(notes "simd $isa")"; else echo "  ^ simd ($isa) FAILED"; fail=1; rec "simd $isa" FAIL; fi
+done
+
+# ---- the C API: libvecindex.so / .a with nothing but vi_* exported, and a program that uses only the header ----
+echo "C API: libvecindex.so, libvecindex.a"
+"$CC" "${CFLAGS[@]}" -fPIC -shared -fvisibility=hidden -Iinclude src/vecindex.c -lm -lpthread -o "$OUT/libvecindex.so" || fail=1
+"$CC" "${CFLAGS[@]}" -fPIC -fvisibility=hidden -Iinclude -c src/vecindex.c -o "$OUT/vecindex.o" && ar rcs "$OUT/libvecindex.a" "$OUT/vecindex.o" || fail=1
+if command -v nm >/dev/null; then
+    # __gcov_* and mangle_path come from libgcov when tools/cov builds with --coverage
+    extra=$(nm -D --defined-only "$OUT/libvecindex.so" | awk '{print $3}' \
+            | grep -v -E '^(vi_[a-z_]+|_init|_fini|_edata|_end|__bss_start|__gcov_[a-z_]+|mangle_path)$' || true)
+    if [[ -z $extra ]]; then echo "  ok   only vi_* exported"; else echo "  FAIL exported beyond vi_*: $extra"; fail=1; rec "C API exports" FAIL; fi
+fi
+"$CC" "${CFLAGS[@]}" -Iinclude tests/api_test.c -L"$OUT" -lvecindex -lm -lpthread -o "$OUT/api_test_so" \
+    && LD_LIBRARY_PATH="$OUT" "./$OUT/api_test_so" 2>&1 | tee "$OUT/log_capi.txt" && rec "C API shared" ok "$(notes "C API")" || { echo "  ^ C API (shared) FAILED"; fail=1; rec "C API shared" FAIL; }
+"$CC" "${CFLAGS[@]}" -Iinclude tests/api_test.c "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/api_test_a" \
+    && "./$OUT/api_test_a" > /dev/null && rec "C API static" ok "same checks, static lib" || { echo "  ^ C API (static) FAILED"; fail=1; rec "C API static" FAIL; }
+echo
+
+# ---- the store's live mode (its own indexing / rebuild thread beside adders and searchers), under the thread sanitizer ----
+echo "store threads (live mode)"
+if "$CC" -std=gnu99 -g -O1 -fsanitize=thread -march=native -Isrc tests/store_test.c -lm -lpthread -o "$OUT/store_tsan" 2>/dev/null; then
+    if TSAN_OPTIONS="halt_on_error=1" "./$OUT/store_tsan" > /dev/null; then echo "  ok   no data race reported"; rec "store TSan" ok "no data race, live-mode threads"
+    else echo "  ^ store thread test FAILED"; fail=1; rec "store TSan" FAIL; fi
+else
+    echo "  (thread sanitizer unavailable - skipped)"; rec "store TSan" skip "no sanitizer"
+fi
+
+# ---- the store self-test again under the address and undefined-behaviour sanitizers ----
+echo "store under ASan/UBSan"
+# float-cast-overflow too: gcc leaves it out of -fsanitize=undefined (clang has it there)
+UBS=("-fsanitize=address,undefined,float-cast-overflow" "-fno-sanitize-recover=undefined,float-cast-overflow")
+if "$CC" -std=gnu99 -g -O1 "${UBS[@]}" -march=native -Isrc tests/store_test.c -lm -lpthread -o "$OUT/store_asan" 2>/dev/null; then
+    if "./$OUT/store_asan" > /dev/null; then echo "  ok   no memory error reported"; rec "store ASan/UBSan" ok "no memory error / UB"
+    else echo "  ^ store under ASan/UBSan FAILED"; fail=1; rec "store ASan/UBSan" FAIL; fi
+else
+    echo "  (sanitizers unavailable - skipped)"; rec "store ASan/UBSan" skip "no sanitizer"
+fi
+
+# ---- the fuzz targets' seeds and every input that once made one fail, replayed under ASan/UBSan with gcc alone;
+# ---- tools/fuzz does the fuzzing itself, with clang's libFuzzer ----
+echo "fuzz regressions (tests/fuzz)"
+fzn=0; fzs=ok
+for t in proto store; do
+    extra=(); [[ $t == proto ]] && extra=(-DVSERV_NO_TLS)
+    if ! "$CC" -std=gnu99 -g -O1 "${UBS[@]}" -march=native -DFUZZ_MAIN \
+            "${extra[@]}" -Isrc "tests/fuzz_$t.c" -lm -lpthread -o "$OUT/fuzz_${t}_replay" 2>/dev/null; then [[ $fzs == ok ]] && fzs=skip; continue; fi
+    rm -rf "$OUT/fuzz_seeds/$t"; mkdir -p "$OUT/fuzz_seeds/$t"          # .gz seeds unpacked, the rest as they are
+    for f in "tests/fuzz/$t"/*; do case $f in *.gz) gzip -dc "$f" > "$OUT/fuzz_seeds/$t/$(basename "$f" .gz)";; *) cp "$f" "$OUT/fuzz_seeds/$t/";; esac; done
+    if r=$("./$OUT/fuzz_${t}_replay" "$OUT/fuzz_seeds/$t" 2>&1); then
+        echo "  ok   $t: $(grep -o '[0-9]* inputs' <<<"$r")"; fzn=$((fzn + $(grep -o '[0-9]* inputs' <<<"$r" | grep -o '^[0-9]*')))
+    else
+        tail -5 <<<"$r"; echo "  ^ fuzz replay ($t) FAILED"; fzs=FAIL; fail=1
+    fi
+done
+case $fzs in ok) rec "fuzz regressions" ok "$fzn inputs, ASan/UBSan";; skip) rec "fuzz regressions" skip "no sanitizer";;
+             *) rec "fuzz regressions" FAIL;; esac
+
+# ---- crash safety for the store itself, with background snapshots running: kill -9 the writer (and in every other
+# ---- round its snapshot child too) at random moments; every synced row must be there exactly once ----
+echo "store crash test (journal + background snapshots)"
+"$CC" -std=gnu99 -O2 -march=native -Isrc tests/scrash.c -lm -lpthread -o "$OUT/scrash" && "./$OUT/scrash" 20 2>&1 | tee "$OUT/log_scrash.txt" && rec "kill -9 crash test" ok "$(notes "kill -9 crash test")" || { echo "  ^ store crash test FAILED"; fail=1; rec "kill -9 crash test" FAIL; }
+
+# ---- the store's integrity claim against damage on the disk (tests/battle_damage.c): blocks destroyed at random, in
+# ---- runs, exactly at the limit lean4 proves (recover_gf, burst_within_parity, burst_beyond_parity), in the checksum
+# ---- tables; every copy must load rebuilt byte for byte or be refused, a scrub must restore the rebuildable ones, and
+# ---- no row may come back different from the one saved ----
+echo "store damage battletest"
+if "$CC" "${CFLAGS[@]}" tests/battle_damage.c -lm -lpthread -o "$OUT/battle_damage" \
+        && "./$OUT/battle_damage" "${BATTLE_TRIALS:-40}" "${SEED:-$(date +%Y%m%d)}" > "$OUT/log_battle_damage.txt" 2>&1; then
+    grep -a 'copies - ' "$OUT/log_battle_damage.txt"
+    rec "damage battletest" ok "$(awk '/copies - /{for(i=1;i<=NF;i++){if($(i+1)=="copies")c+=$i; if($(i+1)=="rebuilt")r+=$i; if($(i+1)=="refused,")f+=$i}} END{printf "%d damaged copies: %d rebuilt byte for byte, %d refused, 0 wrong rows", c, r, f}' "$OUT/log_battle_damage.txt")"
+else
+    grep -a 'FAIL' "$OUT/log_battle_damage.txt" | head -5; echo "  ^ damage battletest FAILED"; fail=1; rec "damage battletest" FAIL
+fi
+
+# ---- the socket server: both protocols, Unix + TCP sockets, bad input, pipelining, concurrency, restart ----
+# ---- (TLS through the vendored BearSSL: built once into $OUT/libbearssl.a) ----
+echo "vserv"
+if [[ ! -f $OUT/libbearssl.a || third_party/bearssl/inc/bearssl.h -nt $OUT/libbearssl.a ]]; then
+    mkdir -p "$OUT/bearssl"
+    find third_party/bearssl/src -name '*.c' | while read -r f; do
+        o=${f#third_party/bearssl/src/}; echo "$f $OUT/bearssl/${o//\//_}"
+    done | xargs -P "$(nproc 2>/dev/null || echo 2)" -n 2 sh -c '"$0" -O2 -Ithird_party/bearssl/inc -Ithird_party/bearssl/src -c "$1" -o "${2%.c}.o"' "$CC" \
+        && ar rcs "$OUT/libbearssl.a" "$OUT"/bearssl/*.o || fail=1
+fi
+"$CC" "${CFLAGS[@]}" -isystem third_party/bearssl/inc src/vserv.c "$OUT/libbearssl.a" -lm -lpthread -o "$OUT/vserv" || fail=1
+"$CC" "${CFLAGS[@]}" -DVSERV_NO_TLS src/vserv.c -lm -lpthread -o "$OUT/vserv_plain" || fail=1
+if command -v python3 >/dev/null; then
+    python3 py/vserv_test.py "$OUT/vserv" 2>&1 | tee "$OUT/log_vserv.txt" && rec vserv ok "$(notes vserv)" || { echo "  ^ vserv FAILED"; fail=1; rec vserv FAIL; }
+    python3 py/vserv_test.py "$OUT/vserv_plain" >/dev/null && rec "vserv no-TLS" ok || { echo "  ^ vserv (no TLS build) FAILED"; fail=1; rec "vserv no-TLS" FAIL; }
+    python3 py/vserv_tls_test.py "$OUT/vserv" 2>&1 | tee "$OUT/log_vserv_tls.txt" && rec "vserv TLS" ok "$(notes "vserv TLS")" || { echo "  ^ vserv TLS FAILED"; fail=1; rec "vserv TLS" FAIL; }
+else
+    echo "  (python3 unavailable - built, end-to-end tests skipped)"; rec vserv skip "no python3"
+fi
+# ---- vfind: search the texts as you type, Enter to the document (a TUI, driven through tmux; skipped without) ----
+"$CC" "${CFLAGS[@]}" src/vfind.c -lm -lpthread -o "$OUT/vfind" \
+    && "$CC" "${CFLAGS[@]}" tests/vfind_demo.c -lm -lpthread -o "$OUT/vfind_demo" \
+    && vfo=$(tests/vfind_test.sh "$OUT/vfind" "$OUT/vfind_demo") && printf '%s\n' "$vfo" \
+    && { if grep -q "skipped" <<<"$vfo"; then rec vfind skip "tmux missing"; else rec vfind ok; fi; } || { printf '%s\n' "${vfo:-}"; echo "  ^ vfind FAILED"; fail=1; rec vfind FAIL; }
+
+# ---- the line protocol, the log, the journal under kill -9, timed snapshots, mTLS names in the log ----
+"$CC" -std=gnu99 -O2 -Wall -Wextra tests/vserv_test.c -o "$OUT/vserv_line_test" \
+    && "$OUT/vserv_line_test" "$OUT/vserv" 2>/dev/null | tee "$OUT/log_vserv_line.txt" && rec "vserv line protocol" ok "$(notes "vserv line protocol")" || { echo "  ^ vserv line protocol FAILED"; fail=1; rec "vserv line protocol" FAIL; }
+
+if [[ $mode == all ]]; then
+    echo; echo "cross-built tests (tools/cross; a target without its compiler and qemu is skipped)"
+    cro=$(tools/cross | tee /dev/stderr) && { rec "cross builds" ok "$(grep -c '^  ok' <<<"$cro") test runs ok on $(grep -c '^==' <<<"$cro") of 4 CPUs (aarch64 armv7 riscv64 s390x), $(grep -c 'skipped' <<<"$cro") skipped"; } || { echo "  ^ cross FAILED"; fail=1; rec "cross builds" FAIL; }
+    echo
+    if command -v lake >/dev/null || [[ -x $HOME/.elan/bin/lake ]]; then
+        echo "lean4/run (the proofs and the C kernels against them)"
+        if lean4/run > "$OUT/log_lean4.txt" 2>&1; then rec "lean4" ok "$(grep -o '[0-9]* steps, all ok' "$OUT/log_lean4.txt"), $(grep -o '[0-9]* theorems' "$OUT/log_lean4.txt" | head -1)"
+        else tail -20 "$OUT/log_lean4.txt"; echo "  ^ lean4 FAILED"; fail=1; rec "lean4" FAIL; fi
+    else rec "lean4" skip "no lake (elan) installed"; fi
+    echo
+    data=${2:-}; res=${3:-}
+    if [[ -z $data && -f $CMP/data/meta.json ]]; then   # the GloVe set prepared earlier: use it, without the 10M/100M runs (they want far more RAM and disk)
+        data=$CMP/data; res=${res:-$CMP/results}; SKIP_SCALE=${SKIP_SCALE-1}; export SKIP_SCALE
+        echo "compare: using $data (SKIP_SCALE=$SKIP_SCALE; SKIP_SCALE= ./run all runs the scale tests too)"
+    fi
+    if [[ -n $data ]]; then
+        if compare "$data" "$res"; then rec compare ok; else echo "  ^ compare FAILED"; fail=1; rec compare FAIL; fi
+    else echo "compare: skipped (./run all DATA_DIR runs it; DATA_DIR from py/prepare_glove.py)"; rec compare skip "no DATA_DIR ($CMP/data absent; py/prepare_glove.py)"; fi
+fi
+
+# ---- the table at the very end ----
+echo; echo "=================== summary ==================="
+printf '  %-22s %-6s %5s  %s\n' STEP RESULT TIME "WHAT IT MEASURED"
+printf '  %-22s %-6s %5s  %s\n' ---------------------- ------ ----- ----------------
+nok=0; nfail=0; nskip=0
+for i in "${!RN[@]}"; do
+    printf '  %-22s %-6s %4ss  %s\n' "${RN[i]}" "${RS[i]}" "${RD[i]}" "${RT[i]}"
+    case ${RS[i]} in ok) nok=$((nok+1));; FAIL) nfail=$((nfail+1));; *) nskip=$((nskip+1));; esac
+done
+printf '  %-22s %-6s %5s  %s\n' ---------------------- ------ ----- ----------------
+echo "  $nok ok, $nfail FAILED, $nskip skipped   ($((SECONDS-T0)) s)"
+if [[ $mode == all && -n ${data:-} ]]; then
+    res=$(realpath -m "${res:-bench/results-$(hostname)}")
+    [[ -s $res/glove.jsonl ]] && { echo; echo "=================== compare: GloVe-100 ==================="; "${PYTHON:-python3}" py/tables.py "$res/glove.jsonl" || true; }
+fi
+
+exit $fail

@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# run - build and test agent_launcher: the note database (vecdb), agent memory (mem.c with its rule engine) and the
+# cross-encoder re-rank, all on top of vecindex's store. Builds against vecindex itself ($VECINDEX, default
+# ../..): its src/ goes on the include path, nothing is copied out of it. Each binary goes to .build/.
+#   ./run          every test
+#   ./run bench    also bench/mbench.c (mem.c timings, the mem_consolidate cost-vs-N sweep)
+#   ./run stress   also tests/mstress.c (mem.c churn with invariant checks)
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+mode=${1:-}     # saved: the loops below reuse the positional parameters
+
+VECINDEX=${VECINDEX:-../..}
+[[ -f $VECINDEX/src/store.c ]] || { echo "run: no vecindex checkout at $VECINDEX (it is holyc's vecindex/; set VECINDEX for another copy)" >&2; exit 2; }
+CC="${CC:-gcc}"
+CFLAGS=(-std=c89 -pedantic -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200112L -O2 -march=native -Isrc -I"$VECINDEX/src")
+GNU=(-std=gnu99 -Isrc -I"$VECINDEX/src")
+OUT=.build
+mkdir -p "$OUT"
+fail=0
+
+for name in vecdb mem; do
+    "$CC" "${CFLAGS[@]}" "tests/${name}_test.c" -lm -lpthread -o "$OUT/$name" && "./$OUT/$name" || { echo "  ^ $name FAILED"; fail=1; }
+    echo
+done
+
+# ---- vecdb command line, end to end (built-in embedder, no model server) ----
+echo "vecdb cli end-to-end"
+cli="$OUT/vecdb_cli"
+"$CC" "${CFLAGS[@]}" src/vecdb_cli.c -lm -lpthread -o "$cli" || fail=1
+T=$(mktemp -d)
+mkdir "$T/notes"
+printf 'Physics of light. See [[Quantum]] and [[Optics]]. #physics\n' > "$T/notes/light.md"
+printf 'Quantum mechanics and entanglement. Links: [[Light]]. #physics/quantum\n' > "$T/notes/quantum.md"
+printf 'Cooking pasta with tomato. #food\n' > "$T/notes/pasta.md"
+step() { local want="$1"; shift; local out; out=$("$@" 2>&1 || true); if grep -q -- "$want" <<<"$out"; then echo "  ok   $want"; else echo "  FAIL expected '$want' from: $*"; echo "$out" | head -5; fail=1; fi; }
+DB="$T/x.vdb"
+step "3 notes" "$cli" "$DB" index "$T/notes"
+step "quantum.md" "$cli" "$DB" search "entanglement #physics"
+step "light.md" "$cli" "$DB" backlinks quantum
+step "optics" "$cli" "$DB" ghosts
+step "#physics/quantum" "$cli" "$DB" tags
+step "pasta.md" "$cli" "$DB" tag food
+printf 'Cooking risotto.\n' > "$T/notes/pasta.md"; rm "$T/notes/light.md"
+step "1 notes removed" "$cli" "$DB" update "$T/notes"
+step "2 notes" "$cli" "$DB" stats
+step "risotto\|pasta" "$cli" "$DB" search risotto
+step "removed quantum" "$cli" "$DB" remove quantum
+step "1 notes" "$cli" "$DB" stats
+step "not a directory" "$cli" "$DB" index "$T/nope"
+rm -rf "$T"
+
+# ---- random input under the address/undefined-behaviour sanitizers: vecdb, then mem.c's rule parser ----
+for f in "vfuzz 3000" "mrfuzz 5000"; do
+    set -- $f
+    echo "$1"
+    if "$CC" "${GNU[@]}" -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined "tests/$1.c" -lm -lpthread -o "$OUT/$1" 2>/dev/null; then
+        "./$OUT/$1" "$2" || { echo "  ^ $1 FAILED"; fail=1; }
+    else
+        echo "  (sanitizers unavailable - skipped)"
+    fi
+done
+
+# ---- readers + a writer, under the thread sanitizer: one vecdb, then one Mem ----
+for t in vthreads mthreads; do
+    echo "$t"
+    if "$CC" "${GNU[@]}" -g -O1 -fsanitize=thread "tests/$t.c" -lm -lpthread -o "$OUT/$t" 2>/dev/null; then
+        "./$OUT/$t" || { echo "  ^ $t FAILED"; fail=1; }
+    else
+        echo "  (thread sanitizer unavailable - skipped)"
+    fi
+done
+
+# ---- crash safety: kill -9 a writer at random moments; vcrash2 re-indexes over an existing database; mcrash is
+# ---- mem.c's own files ----
+for c in "vcrash 25" "vcrash2 20" "mcrash 20"; do
+    set -- $c
+    echo "$1"
+    "$CC" "${GNU[@]}" -O2 -march=native "tests/$1.c" -lm -lpthread -o "$OUT/$1" && "./$OUT/$1" "$2" || { echo "  ^ $1 FAILED"; fail=1; }
+done
+
+# ---- the cross-encoder second pass (src/rerank.c + py/rerank_srv.py); skips without a torch-capable python3 ----
+echo "rerank demo"
+"$CC" "${CFLAGS[@]}" tests/rerank_test.c -lm -lpthread -o "$OUT/rerank_demo" && "./$OUT/rerank_demo" || { echo "  ^ rerank demo FAILED"; fail=1; }
+
+if [[ $mode == bench ]]; then
+    echo; echo "mem bench"
+    "$CC" "${GNU[@]}" -O2 -march=native bench/mbench.c -lm -lpthread -o "$OUT/mbench" && "./$OUT/mbench" || { echo "  ^ mem bench FAILED"; fail=1; }
+fi
+if [[ $mode == stress ]]; then
+    echo; echo "mem stress"
+    "$CC" "${CFLAGS[@]}" tests/mstress.c -lm -lpthread -o "$OUT/mstress" && "./$OUT/mstress" || { echo "  ^ mem stress FAILED"; fail=1; }
+fi
+
+exit $fail

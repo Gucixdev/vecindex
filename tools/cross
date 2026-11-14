@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# cross - build the core tests for other CPUs and run them under qemu user-mode emulation: aarch64 (NEON, the
+# Raspberry Pi 3/4/5 and ARM servers), armv7 (32-bit ARM, NEON), riscv64, and s390x (big-endian, which checks that
+# every file is written and read little-endian). The binaries are static, so no target sysroot is needed to run them.
+#
+#   tools/cross              every target whose compiler and qemu are installed
+#   tools/cross aarch64 ...  the targets named (aarch64 armv7 riscv64 s390x)
+#   TESTS="q1 store" tools/cross   a subset of the tests (default: all of them below)
+#
+# Needs: TARGET-linux-gnu-gcc and qemu-TARGET-static on PATH, or it downloads zig + qemu-user-static into /var/tmp (CROSS_DIR=,
+# CROSS_FETCH=0 to forbid). Distro packages work too (Debian/Ubuntu: gcc-aarch64-linux-gnu,
+# gcc-arm-linux-gnueabihf, gcc-riscv64-linux-gnu, gcc-s390x-linux-gnu, qemu-user-static). A missing target is
+# skipped. Exits non-zero when a test fails on any target that was run. Emulation is 10-50x slower than native:
+# expect minutes for the store test.
+set -uo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+
+# ---- missing compilers / qemu are fetched into $CROSS_DIR (default /var/tmp/vecindex-cross), never installed: one zig
+# ---- (zig cc is clang with a built-in sysroot for every target, static musl) and qemu-user-static unpacked from the
+# ---- Debian package. CROSS_FETCH=0 turns the download off (then a missing target is only skipped).
+CROSS_DIR=${CROSS_DIR:-/var/tmp/vecindex-cross}
+ZIG_VERSION=${ZIG_VERSION:-0.17.0}
+declare -A ZT=([aarch64]=aarch64-linux-musl [armv7]=arm-linux-musleabihf [riscv64]=riscv64-linux-musl [s390x]=s390x-linux-musl)
+fetch_tools() {   # fetch_tools TARGET: makes TARGET-linux-gnu-gcc and qemu-TARGET-static appear in $CROSS_DIR/bin
+    local t=$1 cc=$2 qemu=$3 bin=$CROSS_DIR/bin
+    mkdir -p "$bin" "$CROSS_DIR/dl" || return 1
+    if ! command -v "$cc" >/dev/null; then
+        if [[ ! -x $CROSS_DIR/zig/zig ]]; then
+            echo "  fetching zig $ZIG_VERSION into $CROSS_DIR ..."
+            curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" -o "$CROSS_DIR/dl/zig.tar.xz" \
+                && mkdir -p "$CROSS_DIR/zig" && tar -xJf "$CROSS_DIR/dl/zig.tar.xz" -C "$CROSS_DIR/zig" --strip-components=1 || return 1
+        fi
+        # gcc's -march/-mfpu/-mfloat-abi are dropped (zig names CPUs, not architectures): armv7 gets a cortex-a15 (NEON-VFPv4, hard float)
+        local cpu=; [[ $t == armv7 ]] && cpu="-mcpu=cortex_a15"
+        printf '#!/bin/sh\nfor a; do shift; case $a in -march=*|-mfpu=*|-mfloat-abi=*) ;; *) set -- "$@" "$a";; esac; done\nZIG_GLOBAL_CACHE_DIR=%s/zigcache exec %s/zig/zig cc -target %s %s "$@"\n' "$CROSS_DIR" "$CROSS_DIR" "${ZT[$t]}" "$cpu" > "$bin/$cc"
+        chmod +x "$bin/$cc"
+    fi
+    if ! command -v "$qemu" >/dev/null; then
+        if [[ ! -x $CROSS_DIR/qemu/usr/bin/$qemu ]]; then
+            local deb
+            local d sz   # the newest package that really holds the static binaries (the newest are 77 kB of symlinks)
+            deb=
+            for d in $(curl -fsSL https://deb.debian.org/debian/pool/main/q/qemu/ | grep -o 'qemu-user-static_[^"]*_amd64\.deb' | grep -v bpo | sort -uVr); do
+                sz=$(curl -fsSI "https://deb.debian.org/debian/pool/main/q/qemu/$d" | tr -d '\r' | awk 'tolower($1)=="content-length:" {print $2}')
+                if [[ ${sz:-0} -gt 5000000 ]]; then deb=$d; break; fi
+            done
+            [[ -n $deb ]] || return 1
+            echo "  fetching $deb into $CROSS_DIR ..."
+            curl -fsSL "https://deb.debian.org/debian/pool/main/q/qemu/$deb" -o "$CROSS_DIR/dl/qemu.deb" || return 1
+            mkdir -p "$CROSS_DIR/qemu" && ( cd "$CROSS_DIR/dl" && rm -f data.tar.* && ar x qemu.deb && tar -xf data.tar.* -C "$CROSS_DIR/qemu" ) || return 1
+        fi
+        ln -sf "$CROSS_DIR/qemu/usr/bin/$qemu" "$bin/$qemu"
+    fi
+}
+[[ -d $CROSS_DIR/bin ]] && PATH=$CROSS_DIR/bin:$PATH
+
+declare -A CC=([aarch64]=aarch64-linux-gnu-gcc [armv7]=arm-linux-gnueabihf-gcc [riscv64]=riscv64-linux-gnu-gcc [s390x]=s390x-linux-gnu-gcc)
+declare -A QEMU=([aarch64]=qemu-aarch64-static [armv7]=qemu-arm-static [riscv64]=qemu-riscv64-static [s390x]=qemu-s390x-static)
+declare -A ARCH=([aarch64]="-march=armv8-a" [armv7]="-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard" [riscv64]="" [s390x]="")
+TESTS=${TESTS:-"hdict lex q1 q3 q4fs ivf hnsw simd engine store api"}
+CFLAGS=(-std=c89 -pedantic -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200112L -O2 -static -Isrc -Iinclude)
+
+targets=("$@")
+(( ${#targets[@]} )) || targets=(aarch64 armv7 riscv64 s390x)
+fail=0
+for t in "${targets[@]}"; do
+    cc=${CC[$t]:-}
+    qemu=${QEMU[$t]:-}
+    if [[ -z $cc ]]; then echo "cross: unknown target '$t'" >&2; exit 2; fi
+    if { ! command -v "$cc" >/dev/null || ! command -v "$qemu" >/dev/null; } && [[ ${CROSS_FETCH:-1} != 0 ]]; then
+        fetch_tools "$t" "$cc" "$qemu" || echo "$t: could not fetch the toolchain (offline?)"
+        PATH=$CROSS_DIR/bin:$PATH
+    fi
+    if ! command -v "$cc" >/dev/null || ! command -v "$qemu" >/dev/null; then echo "$t: $cc or $qemu not installed - skipped"; continue; fi
+    out=.build/cross/$t
+    mkdir -p "$out"
+    echo "== $t ($cc, $qemu)"
+    for name in $TESTS; do
+        src=tests/${name}_test.c
+        extra=()
+        [[ $name == engine ]] && extra=(-DENGINE_SERIALIZE)
+        [[ $name == api ]] && extra=(src/vecindex.c)
+        # shellcheck disable=SC2086
+        if ! "$cc" "${CFLAGS[@]}" ${ARCH[$t]} "$src" "${extra[@]}" -lm -lpthread -o "$out/$name" 2> "$out/$name.build.log"; then
+            echo "  FAIL $name: does not build ($(grep -m1 -E 'error|warning' "$out/$name.build.log" | cut -c1-150))"
+            fail=1; continue
+        fi
+        t0=$(date +%s)
+        if (cd "$out" && timeout 3600 "$qemu" "./$name" > "$name.log" 2>&1); then
+            echo "  ok   $name ($(( $(date +%s) - t0 )) s)"
+        else
+            echo "  FAIL $name: $(grep -m1 -E 'FAIL|Assert|assert|error|Segmentation' "$out/$name.log" | cut -c1-150)"
+            fail=1
+        fi
+    done
+done
+exit $fail

@@ -1,0 +1,5 @@
+add 7 1 0 0 0
+get 7
+del 7
+get 7
+del 1 100

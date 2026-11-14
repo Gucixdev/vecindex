@@ -1,0 +1,5 @@
+addt 5 0.1 -0.2 0.3 0.4 hello\nworld \t tab
+text 5
+words 3 hello
+hybrid 3 0.1 -0.2 0.3 0.4 hello world
+range 0 100 10

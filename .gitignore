@@ -1,0 +1,27 @@
+.build/
+__pycache__/
+*.o
+emb/real_data.bin
+emb/real_texts.json
+bench/libvi.so
+bench/data/
+bench/scale
+bench/live
+bench/tune
+bench/results-*/
+bench/.venv/
+py/.venv/
+# what libFuzzer writes into the current directory when run by hand (tools/fuzz writes into .build/fuzz)
+/crash-*
+/leak-*
+/oom-*
+/timeout-*
+/slow-unit-*
+
+.lake/
+node_modules/
+*.o
+*.a
+*.so
+.env
+.env.*

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# run - check the Lean model of vecindex and hold the C code to it.
+#   lean4/run             build the proofs (lake), audit their axioms, check that gen/trustlean.c is what the proved
+#                         TrustLean programs print, then the differential test: the C kernels, built for
+#                         -march=native, haswell and x86-64 (AVX-512, AVX2 and scalar kernels, both CRC paths), against
+#                         the Lean oracle on every input of the GF(2^8) and digit tables, on ranges and grids of the
+#                         column counts, file layouts and Walsh-Hadamard chunks, and on random inputs of the others,
+#                         and the properties checked in C alone (the rebuild of damaged store files among them)
+#   lean4/run quick       the same without rebuilding the proofs (a previous build must exist)
+#   N=2000 SEED=7 lean4/run   more random cases, another seed (defaults: 300, the date)
+# Needs elan with leanprover/lean4:v4.26.0 (lake), gcc and bash. Without the Mathlib cache the first build compiles
+# the part of Mathlib that is needed (about 1400 modules with its dependencies, 30 min on 2 vCPUs); `lake exe cache
+# get` fetches it instead where the network allows. Exit 0 when every step passed.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+export PATH="$HOME/.elan/bin:$PATH"
+
+N=${N:-300}
+SEED=${SEED:-$(date +%Y%m%d)}
+OUT=.build
+mkdir -p "$OUT/out"
+RN=(); RS=(); RT=(); T0=$SECONDS; fail=0
+rec() { RN+=("$1"); RS+=("$2"); RT+=("${3:-}"); [[ $2 == ok ]] || fail=1; }
+
+command -v lake >/dev/null || { echo "run: lake not found (install elan, then: elan toolchain install leanprover/lean4:v4.26.0)" >&2; exit 2; }
+
+# 1. the proofs
+if [[ ${1:-} != quick ]]; then
+    echo "== lake build"
+    if lake build Vecindex vecindex-oracle > "$OUT/log_build.txt" 2>&1; then
+        rec "lake build" ok "$(grep -o '[0-9]* jobs' "$OUT/log_build.txt" | tail -1), proofs and oracle"
+    else
+        tail -30 "$OUT/log_build.txt"; rec "lake build" FAIL; fi
+fi
+
+# 2. nothing but the three standard axioms, and no escape hatch in the sources
+echo "== axiom audit"
+if lake env lean Audit.lean > "$OUT/log_audit.txt" 2>&1 && grep -q 'axiom audit: [0-9]* theorems (.*), none' "$OUT/log_audit.txt"; then
+    rec "axiom audit" ok "$(grep -oE '[0-9]+ theorems \([0-9]+ written' "$OUT/log_audit.txt") in the sources)"
+else
+    cat "$OUT/log_audit.txt"; rec "axiom audit" FAIL; fi
+if grep -rnE '\b(sorry|admit|native_decide|bv_decide)\b|^[[:space:]]*axiom ' Vecindex Vecindex.lean Oracle.lean \
+        | grep -v 'no `native_decide`' > "$OUT/log_grep.txt"; then
+    cat "$OUT/log_grep.txt"; rec "source scan" FAIL
+else
+    rec "source scan" ok "no sorry, admit, native_decide, bv_decide or axiom"; fi
+
+ORACLE=.lake/build/bin/vecindex-oracle
+
+# 3. the printed TrustLean kernels are the committed ones
+echo "== gen/trustlean.c"
+"$ORACLE" gen > "$OUT/trustlean.c"
+if cmp -s "$OUT/trustlean.c" gen/trustlean.c; then rec "gen/trustlean.c" ok "printed by TrustLean from the proved programs"
+else diff "$OUT/trustlean.c" gen/trustlean.c | head; rec "gen/trustlean.c" FAIL "differs: lake exe vecindex-oracle gen > gen/trustlean.c"; fi
+
+# 4. the differential test
+CFLAGS=(-std=c89 -pedantic -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200112L -O2 -I../src -Igen)
+declare -A WHAT=([gf]="every table entry and product, the coefficients hashed" [digits]="every byte, q1-q5"
+                 [vd]="every even dpad to 4096, 1, 2 and 4 bits" [layout]="a grid of sizes, block sizes, k, m"
+                 [chunks]="every dpad from 1 to 1024")
+for t in gf digits vd layout chunks; do "$ORACLE" "$t" > "$OUT/out/$t.lean"; done
+for arch in native haswell x86-64; do
+    bin="$OUT/diff-$arch"
+    echo "== C kernels, -march=$arch"
+    if ! gcc "${CFLAGS[@]}" -march="$arch" c/diff.c -lm -lpthread -o "$bin" 2> "$OUT/log_cc_$arch.txt"; then
+        head -20 "$OUT/log_cc_$arch.txt"; rec "build $arch" FAIL; continue; fi
+    for t in gf digits vd layout chunks; do
+        "$bin" "$t" > "$OUT/out/$t.$arch"
+        if cmp -s "$OUT/out/$t.lean" "$OUT/out/$t.$arch"; then
+            rec "$t $arch" ok "$(wc -l < "$OUT/out/$t.lean") lines: ${WHAT[$t]}"
+        else diff "$OUT/out/$t.lean" "$OUT/out/$t.$arch" | head -5; rec "$t $arch" FAIL; fi
+    done
+    for t in crc block topk; do
+        "$bin" "cases-$t" "$N" "$SEED" > "$OUT/out/$t.in"
+        "$ORACLE" "$t" < "$OUT/out/$t.in" > "$OUT/out/$t.lean"
+        "$bin" "$t" < "$OUT/out/$t.in" > "$OUT/out/$t.$arch"
+        if [[ -s $OUT/out/$t.lean ]] && cmp -s "$OUT/out/$t.lean" "$OUT/out/$t.$arch"; then
+            rec "$t $arch" ok "$(wc -l < "$OUT/out/$t.lean") random cases, seed $SEED"
+        else diff "$OUT/out/$t.lean" "$OUT/out/$t.$arch" | head -5; rec "$t $arch" FAIL; fi
+    done
+    if "$bin" props "$N" "$SEED" > "$OUT/log_props_$arch.txt" 2>&1; then
+        rec "props $arch" ok "$(grep -c '^ok' "$OUT/log_props_$arch.txt") checks"
+    else grep -v '^ok' "$OUT/log_props_$arch.txt" | head; rec "props $arch" FAIL; fi
+done
+if [[ -f $OUT/log_props_native.txt ]]; then echo "== properties (native build)"; sed 's/^/    /' "$OUT/log_props_native.txt"; fi
+
+echo
+echo "=================== lean4 summary ==================="
+printf '  %-22s %-6s  %s\n' STEP RESULT "WHAT IT CHECKED"
+for i in "${!RN[@]}"; do printf '  %-22s %-6s  %s\n' "${RN[$i]}" "${RS[$i]}" "${RT[$i]}"; done
+echo "  $(( ${#RN[@]} )) steps, $([[ $fail == 0 ]] && echo 'all ok' || echo 'FAILURES')   ($((SECONDS - T0)) s)"
+exit $fail

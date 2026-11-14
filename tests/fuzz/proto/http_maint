@@ -1,0 +1,16 @@
+POST /build HTTP/1.1
+Host: x
+Content-Length: 0
+
+POST /save HTTP/1.1
+Host: x
+Content-Length: 0
+
+POST /snapshot HTTP/1.1
+Host: x
+Content-Length: 0
+
+GET /nothing HTTP/1.1
+Host: x
+Connection: close
+
