@@ -60,13 +60,13 @@ CFLAGS=(-std=c89 -pedantic -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200112L -O2 -
 declare -A WHAT=([gf]="every table entry and product, the coefficients hashed" [digits]="every byte, q1-q5"
                  [vd]="every even dpad to 4096, 1, 2 and 4 bits" [layout]="a grid of sizes, block sizes, k, m"
                  [chunks]="every dpad from 1 to 1024")
-for t in gf digits vd layout chunks; do "$ORACLE" "$t" > "$OUT/out/$t.lean"; done
+for t in gf vd layout chunks; do "$ORACLE" "$t" > "$OUT/out/$t.lean"; done
 for arch in native haswell x86-64; do
     bin="$OUT/diff-$arch"
     echo "== C kernels, -march=$arch"
     if ! gcc "${CFLAGS[@]}" -march="$arch" c/diff.c -lm -lpthread -o "$bin" 2> "$OUT/log_cc_$arch.txt"; then
         head -20 "$OUT/log_cc_$arch.txt"; rec "build $arch" FAIL; continue; fi
-    for t in gf digits vd layout chunks; do
+    for t in gf vd layout chunks; do
         "$bin" "$t" > "$OUT/out/$t.$arch"
         if cmp -s "$OUT/out/$t.lean" "$OUT/out/$t.$arch"; then
             rec "$t $arch" ok "$(wc -l < "$OUT/out/$t.lean") lines: ${WHAT[$t]}"

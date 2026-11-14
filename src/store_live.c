@@ -45,7 +45,7 @@ static i32 store_index_pending_(RagStore *s, i32 nth)
         i32 r0, m, ok;
         pthread_rwlock_rdlock(&s->lock);
         t = s->tq; r0 = s->built_upto; m = s->count - r0;
-        if (!t || s->idx || m <= 0 || t->n != r0) { pthread_rwlock_unlock(&s->lock); break; }
+        if (!t || m <= 0 || t->n != r0) { pthread_rwlock_unlock(&s->lock); break; }
         if (m > STORE_LIVE_CHUNK) m = STORE_LIVE_CHUNK;
         store_snap_(s, r0 + m, 0, &sn);
         pthread_rwlock_unlock(&s->lock);
@@ -74,7 +74,7 @@ static void store_index_locked_(RagStore *s)
     TqCol sc, col;
     TqAdd ad;
     i32 r0 = s->built_upto, m = s->count - r0;
-    if (!s->tq || s->idx || m <= 0 || s->tq->n != r0) return;
+    if (!s->tq || m <= 0 || s->tq->n != r0) return;
     col = store_vcol_(s, &sc);
     if (s->tq->nc > 1 && !(s->tq->fit0 > 0.0f)) tq_fit0(s->tq, &col);
     if (tq_add_prep(s->tq, &col, r0, m, store_ncpu_(s), &ad) != 0) return;
@@ -99,7 +99,7 @@ static i32 store_split_(RagStore *s)
     Tq *t = s->tq;
     i32 nc = store_nclusters_(s->live), lim, done;
     TqCol sc, col;
-    if (!s->split_on || !t || t->nc <= 1 || s->idx || nc <= 1 || t->n != s->built_upto) return 0;
+    if (!s->split_on || !t || t->nc <= 1 || nc <= 1 || t->n != s->built_upto) return 0;
     lim = (i32)(STORE_SPLIT_X * (f64)s->live / (f64)nc);
     col = store_vcol_(s, &sc);
     done = tq_split_big(t, &col, s->dead, lim, STORE_SPLIT_STEP);
@@ -123,7 +123,7 @@ static i32 store_rebuild_(RagStore *s, i32 nth)
     pthread_mutex_lock(&s->rb_mu);
     pthread_rwlock_rdlock(&s->lock);
     n = s->count; live = s->live; dead = n - live; bits = s->codebits; seed = s->goal.seed; cas = s->cascade;
-    if (live <= 0 || s->idx) {
+    if (live <= 0) {
         pthread_rwlock_unlock(&s->lock); pthread_mutex_unlock(&s->rb_mu); store_stat_set_(&s->rebuilding, 0); return -1;
     }
     store_snap_(s, n, 1, &sn);
@@ -192,7 +192,7 @@ static i32 store_due_(const RagStore *s)
 {
     const Tq *t = s->tq;
     i32 dead = s->count - s->live - s->dead_built;
-    if (s->idx || s->mods == store_stat_get_(&s->rebuilt_mods)) return 0;   /* an engine index: store_build's business */
+    if (s->mods == store_stat_get_(&s->rebuilt_mods)) return 0;
     if (!t) return s->live >= STORE_LIVE_MIN ? 1 : 0;
     if (s->live_grow <= 0.0f) return 0;
     if (t->nc <= 1) return store_nclusters_(s->live) > 1 ? 2 : 0;

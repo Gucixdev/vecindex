@@ -1433,6 +1433,9 @@ i32 tq_cascade_on(Tq *t, i32 nth)
 
 #include "scratch.h"
 
+/* searches of this process that found no memory for their working buffers and returned no hits */
+i64 tq_oom_count(void) { return scr_oom_count_(); }
+
 #include "tq_scan.c"
 
 #include "tq_add.c"

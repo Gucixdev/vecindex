@@ -1,7 +1,7 @@
 /* diff.c - vecindex's C kernels on the inputs of the Lean oracle, for lean4/run. It includes the whole store, so its
  * static functions are in reach, and the kernels TrustLean printed (gen/trustlean.c).
  *
- *   diff gf | digits | vd | layout | chunks     the lines `vecindex-oracle CMD` prints, from the C code
+ *   diff gf | vd | layout | chunks     the lines `vecindex-oracle CMD` prints, from the C code
  *   diff crc < MSGS | block < CASES | topk < CASES
  *   diff cases-crc N SEED | cases-block N SEED | cases-topk N SEED   random inputs for both sides
  *   diff props N SEED                            what is checked in C alone; "ok ..." lines, exit 1 on a failure
@@ -51,20 +51,6 @@ static void gf_out_(void)
     for (k = 1; k <= 128; ++k) for (p = 0; p < 64; ++p) for (i = 0; i < k; ++i)
         h = (h ^ (u64)gf_coef_(k, p, i)) * 1099511628211u;
     fputs("coef ", stdout); put_u64_(h); putchar('\n');
-}
-
-static void digits_out_(void)
-{
-    const u8 *t[5];
-    const i32 R[5] = { 2, 4, 3, 16, 256 }, D[5] = { 8, 4, 5, 2, 1 };
-    i32 q, b, s;
-    t[0] = q1_digits_(); t[1] = q2_digits_(); t[2] = q3_digits_(); t[3] = q4_digits_(); t[4] = q5_digits_();
-    for (q = 0; q < 5; ++q)
-        for (b = 0; b < 256; ++b) {
-            printf("digits %d %d", (int)R[q], (int)b);
-            for (s = 0; s < D[q]; ++s) sp_u64_(t[q][b * D[q] + s]);
-            putchar('\n');
-        }
 }
 
 static void vd_out_(void)
@@ -192,7 +178,7 @@ static void topk_in_(void)
         have = 0;
         for (i = 0; i < n; ++i) {
             if (!read_i_(&id) || !read_i_(&sc)) return;
-            q1_topk_insert_(ids, scores, (i32)k, &have, id, (f32)sc);
+            eng_topk_(ids, scores, (i32)k, &have, id, (f32)sc);       /* the store's own insertion (core.c) */
         }
         fputs("topk", stdout);
         for (i = 0; i < have; ++i) { putchar(' '); put_i64_(ids[i]); putchar(':'); put_i64_((i64)scores[i]); }
@@ -308,32 +294,6 @@ static void props_trustlean_(i32 n)
     check_(ok, "TrustLean lane kernel = tq_put_lane_ on every byte, row and code; other bytes untouched");
 }
 
-static void props_scan_(void)
-{
-    static Arena arena;
-    Arena *a = &arena;
-    i32 dim = 37, n = 60, q, i, d, ok = 1;
-    f32 *vec = (f32 *)arena_alloc(a, sizeof(f32) * (size_t)(n * dim));
-    f32 *res = (f32 *)arena_alloc(a, sizeof(f32) * (size_t)dim), *rec = (f32 *)arena_alloc(a, sizeof(f32) * (size_t)dim);
-    f32 *lut = (f32 *)arena_alloc(a, sizeof(f32) * 256 * 64);
-    for (i = 0; i < n * dim; ++i) vec[i] = (f32)((i32)(rnd32_() % 2001u) - 1000) / 500.0f;
-    for (q = 1; q <= 5; ++q) {
-        for (d = 0; d < dim; ++d) res[d] = (f32)((i32)(rnd32_() % 2001u) - 1000) / 700.0f;
-#define VI_SCAN_(Q, T) { T *ix = Q##_build(a, vec, n, dim); Q##_lut_resid(ix, res, lut);                          \
-            for (i = 0; i < n; ++i) { f64 e = 0.0; f32 raw = Q##_code_dot(ix, i, lut);                         \
-                Q##_reconstruct_into(ix, ix->codes + (size_t)i * ix->code_bytes, rec);                         \
-                for (d = 0; d < dim; ++d) e += (f64)res[d] * ((f64)rec[d] - (f64)ix->centroid[d]);            \
-                if (fabs((f64)raw - e) > 1e-4 * (1.0 + fabs(e))) ok = 0; } }
-        if (q == 1) VI_SCAN_(q1, Q1Index)
-        if (q == 2) VI_SCAN_(q2, Q2Index)
-        if (q == 3) VI_SCAN_(q3, Q3Index)
-        if (q == 4) VI_SCAN_(q4, Q4Index)
-        if (q == 5) VI_SCAN_(q5, Q5Index)
-#undef VI_SCAN_
-    }
-    check_(ok, "q1-q5: the table scan is the inner product with the dequantized vector (to f32 rounding)");
-    arena_free(a);
-}
 
 static void props_rotation_(i32 n)
 {
@@ -427,7 +387,6 @@ int main(int argc, char **argv)
     i32 n = argc > 2 ? atoi(argv[2]) : 100;
     if (argc > 3) rs_ = (u64)strtoul(argv[3], (char **)0, 10) * 2654435761u + 1u;
     if (!strcmp(cmd, "gf")) gf_out_();
-    else if (!strcmp(cmd, "digits")) digits_out_();
     else if (!strcmp(cmd, "vd")) vd_out_();
     else if (!strcmp(cmd, "layout")) layout_out_();
     else if (!strcmp(cmd, "chunks")) chunks_out_();
@@ -442,10 +401,9 @@ int main(int argc, char **argv)
     else if (!strcmp(cmd, "props")) {
         props_codes_(n * 1000);
         props_trustlean_(n);
-        props_scan_();
         props_rotation_(n);
         props_rs_(n / 4 > 4 ? n / 4 : 4);
         return fails_;
-    } else { fputs("usage: diff gf|digits|vd|layout|chunks|crc|block|topk|cases-crc|cases-block|cases-topk|props [N SEED]\n", stderr); return 2; }
+    } else { fputs("usage: diff gf|vd|layout|chunks|crc|block|topk|cases-crc|cases-block|cases-topk|props [N SEED]\n", stderr); return 2; }
     return 0;
 }

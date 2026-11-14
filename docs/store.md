@@ -27,9 +27,9 @@ proposes 256+ candidates; the f32 rows the store keeps re-score them exactly, wh
 
 ## Index choice
 
-`store_build` picks automatically: with no memory budget (default) the TurboQuant-style scan (`src/tq.c`);
-with `ENG_MIN_SIZE` or a `max_code_bytes` below the f32 size, the q1-q5 / IVF / HNSW tuner (`engine_build`),
-which is what small-footprint goals need.
+`store_build` builds the one index there is: the TurboQuant-style scan (`src/tq.c`). The q1-q5 / IVF / HNSW tuner
+that small code budgets once selected is retired (`trash/src/`); a small footprint is now `vi_set_layout` (2-bit
+codes, int8 rows). A file saved with the old engine's index still loads: its rows are read and the scan index built.
 
 ## Stemming: Polish and English together
 

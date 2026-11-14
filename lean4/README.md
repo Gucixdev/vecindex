@@ -65,7 +65,6 @@ On a 2-vCPU Xeon with AVX-512, 2026-11-13:
   source scan            ok      no sorry, admit, native_decide, bv_decide or axiom
   gen/trustlean.c        ok      printed by TrustLean from the proved programs
   gf native              ok      260 lines: every table entry and product, the coefficients hashed
-  digits native          ok      1280 lines: every byte, q1-q5
   vd native              ok      3 lines: every even dpad to 4096, 1, 2 and 4 bits
   layout native          ok      1050 lines: a grid of sizes, block sizes, k, m
   chunks native          ok      1024 lines: every dpad from 1 to 1024
@@ -78,7 +77,7 @@ On a 2-vCPU Xeon with AVX-512, 2026-11-13:
   journal                ok      300 cases: journals torn, flipped, past the cap, wrong stamp: random, seed 20261111
   rate                   ok      300 cases: runs of 200 requests, f64 exact: random, seed 20261111
   ... nsset (3000 random cases) on every -march as well ...
-  37 steps, all ok   (122 s)
+  34 steps, all ok   (68 s)
 ```
 
 The nine checks in C alone (`c/diff.c props`): `tq_code_` counts the boundaries below the value (random values,
@@ -106,7 +105,7 @@ m + 1 is reported as damaged, not passed off as rebuilt.
 | `tq_lut_` | `Codes.lean` | `quantized_rank`: before rounding, the u8 tables rank the rows exactly as the scores |
 | q1-q5 packing, `q*_lut_resid`, `vs_lut_gather_dot`, `q*_reconstruct_into` | `Codes.lean` | `digit_pack`, `or_pack`, `pack_lt`: packing levels into a byte and reading them back gives the levels; `scan_eq_dot`: the table scan is the inner product of the residual with the dequantized vector |
 | `tq_wht_`, `tq_rot_`, the shuffle in `tq_build_skip` | `Hadamard.lean` | `pass_dot`, `wht_dot`, `whtN_dot`: each butterfly pass doubles a chunk's inner product, so the scaled transform keeps it; `chunks_cover`: the chunks are powers of two that lie inside `[0, dpad)` and add up to `dpad`; `signs_dot`, `perm_dot`, `shuffle_bijective`: the signs and the permutation keep inner products |
-| `q1_topk_insert_` (and q2-q5) | `TopK.lean` | `topk_correct`: after any sequence of candidates the array holds `min(k, n)` of them, sorted, and no candidate left out is better than one kept; `bubble_eq_ins`: ties keep their arrival order |
+| `eng_topk_` (`core.c`: the store's top-k insertion; the same loop as the retired `q1_topk_insert_`) | `TopK.lean` | `topk_correct`: after any sequence of candidates the array holds `min(k, n)` of them, sorted, and no candidate left out is better than one kept; `bubble_eq_ins`: ties keep their arrival order |
 | `vs_in_`, `vs_out_`, `vs_rin_`, `vs_own_`, the tenant number of `vs_keys_load_` (`vserv_keys.c`) | `Tenant.lean` | `out_in`: a wire id comes back as itself; `in_inj`: no two tenants share a store id; `in_fits`: tenant << 44 stays positive inside i64; `rin_exact`, `rin_none`: a tenant's range reaches exactly its own ids in the range; `own_iff`: the hybrid post-filter keeps exactly the tenant's rows; `parse_iff`: the key file takes a tenant number exactly when it is digits of a value 1 to 524287, `parse_bound`: no intermediate value past 5242879 |
 | `vs_rjtrim_` (`vserv_repl.c`), the frame of `store_jframe_` (`store_batch.c`) | `Journal.lean` | `walk_frames`: a journal of whole frames is kept whole; `walk_take`, `good_take`, `trim_take`: any prefix of the primary's journal (a replica killed mid-write) keeps exactly the frames that arrived whole - the primary's header and first k frames, never a piece of a record; `resume`: the rest from that offset gives the primary's journal back. For any checksum into u32 |
 | `vs_bucket_` (`vserv_keys.c`) | `Rate.lean` | `step_inv`: the tokens stay in [0, qps]; `window`: of any run of requests from t1 to t2 at most qps + qps (t2 - t1) get through, whatever came before; `wait_ok`: after 1/qps of quiet a request is let through |
@@ -145,7 +144,7 @@ cryptography and has no counterpart in vecindex; it is not imported.
   `k + p > i`, and `gf_invert_` inverts only nonzero pivots. `RS/StoreSum.lean` relies on exactly that.
 - **`tq_code_` never reads its sentinel.** The search compares with `TQ_B[0..14]` only (`code_congr`);
   `TQ_B[15] = 1e30f` is never read.
-- **`q1_topk_insert_` needs `k >= 1`.** With `k = 0` it would read `scores[-1]`. The entry points checked refuse or
+- **`eng_topk_` (as `q1_topk_insert_` before it) needs `k >= 1`.** With `k = 0` it would read `scores[-1]`. The entry points checked refuse or
   replace a k below 1: `vi_search_ok_` (vecindex.c), the server protocol (vserv_proto.c), the store search.
 - **TrustLean's printer-parser round trip does not build** at the pinned commit on Lean 4.26.0:
   `TrustLean/MicroC/RoundtripExpr.lean` stops with 27 errors (missing cases for the two cast operators, failing
@@ -191,3 +190,7 @@ digest differs from the stored one; a collision is outside the model.
 
 MIT, as vecindex. Fetched by lake, not vendored: Mathlib (Apache-2.0), TrustLean (MIT per its README; the repository
 has no LICENSE file), AMO-Lean (MIT).
+
+Retired with the first engine (2026-11-14, `trash/src/`): the digit tables of q1-q5 (`Codes.lean` still proves them,
+about code no longer built; the oracle's `digits` step and its mutant are gone) and the q1-q5 scan property of the
+harness. The top-k oracle now runs the store's own `eng_topk_`.

@@ -15,14 +15,11 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
                               i64 *out_doc_ids, f32 *out_scores,
                               i64 all_bits, i64 any_bits, int filtered, const StoreCnf *cnf)
 {
-    i32 dim = s->dim, over = filtered ? (k * 4 + 16) : k, Rs;
-    f32 *qn, *rsc;
-    i64 *rid;
+    i32 dim = s->dim, Rs;
+    f32 *qn;
     i32 *rows;
     Scr scr;
-    EngScratch sc;
-    f32 *slut = (f32 *)0;
-    i32 have = 0, i, got, tail;
+    i32 have = 0, i, tail;
     TqCol mcol, ncol, scol;
     TqFilt tf;
     i32 exact;
@@ -33,10 +30,8 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
     Rs = !s->tq ? 1 : filtered ? k * 40 + 256
        : (s->tq_rerank > 0 ? s->tq_rerank : (k * 20 > 256 ? k * 20 : 256) * (s->tq->bits == 1 ? 4 : 1) * (s->metric ? 4 : 1));
     /* the query's working memory from the pool (scratch.h): no malloc on the way; none to be had: no hits */
-    if (scr_get_(&scr, scr_need_((size_t)dim * sizeof(f32)) + scr_need_((size_t)over * sizeof(i64)) + scr_need_((size_t)over * sizeof(f32))
-                       + scr_need_((size_t)Rs * sizeof(i32))) != 0) { pthread_rwlock_unlock(&s->lock); return 0; }
+    if (scr_get_(&scr, scr_need_((size_t)dim * sizeof(f32)) + scr_need_((size_t)Rs * sizeof(i32))) != 0) { pthread_rwlock_unlock(&s->lock); return 0; }
     qn = (f32 *)scr_take_(&scr, (size_t)dim * sizeof(f32));
-    rid = (i64 *)scr_take_(&scr, (size_t)over * sizeof(i64)); rsc = (f32 *)scr_take_(&scr, (size_t)over * sizeof(f32));
     rows = (i32 *)scr_take_(&scr, (size_t)Rs * sizeof(i32));
     memcpy(qn, query, (size_t)dim * sizeof(f32));
     qlen = (f32)eng_sqrt_(eng_ssq_(qn, dim));
@@ -68,34 +63,6 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
             }
             store_rescore_(s, qn, qlen, cnf, rows, z, k, out_doc_ids, out_scores, &have);
         }
-    } else if (s->idx) {
-        i32 sf = engine_scratch_floats(s->idx);
-        slut = (f32 *)malloc((size_t)sf * sizeof(f32));
-        sc.residual = slut;
-        sc.lut      = slut + dim;
-        sc.lids     = (i64 *)malloc((size_t)over * sizeof(i64));
-        sc.lsc      = (f32 *)malloc((size_t)over * sizeof(f32));
-        sc.probe    = (i32 *)malloc(64 * sizeof(i32));
-        got = engine_search_into(s->idx, qn, over, rid, rsc, &sc);
-        for (i = 0; i < got; ++i) {
-            i32 row = (i32)rid[i];
-            if (row < 0 || row >= s->built_upto || STORE_DEAD(s, row)) continue;
-            if (filtered && !store_meta_ok_(STORE_META(s, row), all_bits, any_bits)) continue;
-            if (cnf && !store_cnf_ok_(s, cnf, row)) continue;
-            eng_topk_(out_doc_ids, out_scores, k, &have, (i64)row, s->metric ? store_score_(s, qn, qlen, row) : rsc[i]);
-        }
-        free(sc.lids); free(sc.lsc); free(sc.probe);
-        /* engine path: a very selective filter can exclude the whole neighbourhood - exact filtered scan */
-        if (filtered && have < k) {
-            for (i = 0; i < s->built_upto; ++i) {
-                i32 j, dup = 0;
-                if (STORE_DEAD(s, i) || !store_meta_ok_(STORE_META(s, i), all_bits, any_bits)) continue;
-                if (cnf && !store_cnf_ok_(s, cnf, i)) continue;
-                for (j = 0; j < have; ++j) if (out_doc_ids[j] == i) { dup = 1; break; }
-                if (dup || store_row_bad_(s, i)) continue;
-                eng_topk_(out_doc_ids, out_scores, k, &have, (i64)i, store_score_(s, qn, qlen, i));
-            }
-        }
     }
 
     tail = exact || (cnf && cnf->num && !s->has_num && (cnf->lo > 0 || cnf->hi < 0)) ? 0 : s->count;
@@ -110,7 +77,6 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
 
     pthread_rwlock_unlock(&s->lock);
     scr_put_(&scr);
-    if (slut) free(slut);
     return have;
 }
 
@@ -253,4 +219,4 @@ i32 store_search_grouped(RagStore *s, const f32 *query, i32 k, i32 shift, const 
 }
 
 /* searches of this process that found no memory for their working buffers and returned no hits (scratch.h) */
-i64 store_oom_count(void) { return scr_oom_count_(); }
+i64 store_oom_count(void) { return tq_oom_count(); }

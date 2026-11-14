@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# run - build and test vecindex. Every module in src/ has its self-test in tests/NAME_test.c: the bit-packed
-# quantizers (q1-q5 + qmix), the IVF coarse router + HNSW graph router, the 4-bit fast-scan, the adaptive engine
-# and the store. Then the SIMD kernels per instruction set, the C API, the store under the sanitizers and kill -9,
+# run - build and test vecindex. Every module in src/ has its self-test in tests/NAME_test.c: the id table, the
+# lexical index, the 4-bit scan index (tq) and the store. Then the SIMD kernels per instruction set, the C API, the
+# store under the sanitizers and kill -9,
 # the server end to end and vfind. Each binary goes to .build/ and is rebuilt only when its source or a dependency
 # changed; it is compiled with -Werror and a non-zero exit fails the run.
 #   ./run                      every test, and .build/libvecindex.so / .a (needs bash and gcc; python3 for the server's
 #                              end-to-end tests)
-#   ./run bench                also bench/bench.c (timings vs the Rust port)
-#   ./run stress               also tests/stress.c (churn + oracle + edge cases)
-#   ./run real_val             also bench/real_val.c, the SQuAD + AG-News retrieval benchmark (needs emb/real_data.bin)
 #   ./run lean                 only lean4/run: the Lean 4 proofs, their axiom audit, and the C kernels against the proved
 #                              model (needs lake; ./run all runs it too when lake is installed)
 #   ./run compare DATA [OUT]   only the measurements of docs/benchmarks.md: every library on GloVe-100 through
@@ -18,7 +15,7 @@
 #                              in a venv of its own ($PYTHON_LEANN); a library that cannot import is logged and skipped.
 #                              2-3 hours on 2 cores, ~30 GB in /var/tmp ($VECINDEX_SPILL). The memory limit of the
 #                              published numbers: systemd-run --user --scope -p MemoryMax=5.84G ./run compare DATA
-#   ./run all [DATA [OUT]]     everything: every test, then stress, bench and real_val, the cross-built tests
+#   ./run all [DATA [OUT]]     everything: every test, the cross-built tests
 #                              (tools/cross: the targets whose compiler and qemu are installed), and compare: on DATA, or
 #                              on $COMPARE_DIR/data (default /var/tmp/vecindex-compare) when that exists, without the
 #                              10M/100M runs (SKIP_SCALE= to keep them). real_val builds its corpus into $COMPARE_DIR/emb
@@ -71,7 +68,7 @@ case $mode in
     compare) [[ -n ${2:-} ]] || { echo "usage: ./run compare DATA_DIR [OUT_DIR]" >&2; exit 2; }
              compare "$2" "${3:-}"; exit $? ;;
     lean)    exec lean4/run "${@:2}" ;;
-    all)     more=(stress bench real_val) ;;
+    all)     more=() ;;
     "")      more=() ;;
     *)       more=("$mode") ;;
 esac
@@ -82,12 +79,7 @@ CFLAGS=(-std=c89 -pedantic -Wall -Wextra -Werror
 OUT=.build
 mkdir -p "$OUT"
 
-# q2/q4/q5 and their tests are sed-derived from q1 - fail loudly if they have drifted.
-tools/gen --check
-
-QDEPS=(src/q1.c src/q2.c src/q3.c src/q4.c src/q5.c src/qmix.c src/q4fs.c src/vsimd.h)
-ENG=("${QDEPS[@]}" src/ivf.c src/hnsw.c src/engine*.c)
-STORE=("${ENG[@]}" src/store*.c src/hdict.c src/lex.c src/blake3.c src/tq*.c src/config.h src/scratch.h)
+STORE=(src/core.c src/vsimd.h src/store*.c src/hdict.c src/lex.c src/blake3.c src/tq*.c src/config.h src/scratch.h)
 
 fail=0
 # one line per step for the table at the very end: rec NAME ok|FAIL|skip [note]
@@ -102,16 +94,8 @@ notes() {
     case $n in
         hdict)   echo "id lookup: $(ex $l 'scan [0-9.]+ s, hash [0-9.]+ s')" ;;
         lex)     echo "$(ex $l '[0-9]+ docs, [0-9]+ terms'), $(ex $l '[0-9]+ us/query')" ;;
-        q1|q2|q3|q4|q5) echo "$(ex $l 'code_bytes/vec=[0-9]+') $(ex $l 'recall@10 vs exact f32 = [0-9]+%')" ;;
-        qmix)    echo "$(ex $l 'qmix = [0-9]+%   uniform q2 = [0-9]+%')" ;;
-        q4fs)    echo "fast-scan $(ex $l 'speedup = [0-9.]+x') over plain q4" ;;
-        hnsw)    echo "$(ex $l 'recall@10 = [0-9.]+%') vs brute" ;;
-        ivf)     echo "self routes to own cluster $(ex $l '[0-9]+%$')" ;;
         simd)    echo "$(grep -ac 'simd: ok' $l) kernel sets ok" ;;
-        engine)  echo "$(ex $l 'IVF\+q4 nprobe=4, 48 B/vec, recall [0-9]+%')" ;;
         store)   echo "$(ex $l 'held-out recall@10 [0-9]+/1000' last); $(ex $l 'rows streamed in while searching')" | sed 's/; $//' ;;
-        stress)  echo "$(ex $l 'batch 4000q/[0-9]+T in [0-9]+ us/q'), $(ex $l 'recall@10 vs exact = [0-9]+%')" ;;
-        bench)   echo "$(ex $l 'chosen IVF\+[a-z0-9]+ nprobe=[0-9]+, recall@10 [0-9]+%   query [0-9.]+ us' last)" ;;
         "simd "*) echo "$(grep -ac 'simd: ok' "$OUT/log_simd_${n#simd }.txt") kernel sets ok" ;;
         "C API"*) echo "$(okn "$OUT/log_capi.txt") checks ok" ;;
         "kill -9 crash test") echo "$(ex "$OUT/log_scrash.txt" '[0-9]+ rounds, [0-9]+ ids synced')" ;;
@@ -124,40 +108,19 @@ notes() {
         top)     echo "$(okn "$OUT/log_top.txt") checks: probes through top cells against every centroid" ;;
     esac
 }
-for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd emeans engine store exact split top ${more[@]+"${more[@]}"}; do
+for name in hdict lex simd emeans store exact split top ${more[@]+"${more[@]}"}; do
     bin="$OUT/$name"
     src="tests/${name}_test.c"
     def=()
     case $name in
         hdict)  deps=(src/hdict.c) ;;
         lex)    deps=(src/hdict.c src/lex.c) ;;
-        q1|q2|q3|q4|q5) deps=("src/$name.c" src/vsimd.h) ;;
-        qmix)   deps=(src/q1.c src/q2.c src/q4.c src/qmix.c src/vsimd.h) ;;
-        q4fs)   deps=(src/q4.c src/q4fs.c src/vsimd.h) ;;
-        hnsw)   deps=(src/hnsw.c src/vsimd.h) ;;
-        ivf)    deps=(src/ivf.c) ;;
         simd)   deps=(src/tq*.c src/vsimd.h src/base.h) ;;
         emeans) deps=("${STORE[@]}") ;;
         exact)  deps=("${STORE[@]}") ;;
         split)  deps=("${STORE[@]}") ;;
         top)    deps=("${STORE[@]}") ;;
-        engine) deps=("${ENG[@]}"); def=(-DENGINE_SERIALIZE) ;;   # exercise the .vxi round-trip in the test
         store)  deps=("${STORE[@]}") ;;
-        bench)  src=bench/bench.c; def=(-DBENCH); deps=("${ENG[@]}") ;;
-        stress) src=tests/stress.c; def=(-DSTRESS); deps=("${STORE[@]}") ;;
-        real_val) src=bench/real_val.c; def=(-DREAL_VAL); deps=("${STORE[@]}")
-                  # the real corpus (SQuAD + AG-News, MiniLM embeddings): built once into $EMB (tmp), skipped if that cannot be done
-                  EMB=${EMB_DIR:-$CMP/emb}
-                  [[ -f emb/real_data.bin ]] && EMB=emb
-                  if [[ ! -f $EMB/real_data.bin && $mode == all ]]; then
-                      rp=${PYTHON_EMB:-$CMP/venv-leann/bin/python}
-                      if [[ -x $rp ]]; then
-                          echo "real_val: building the corpus into $EMB (first run only: downloads SQuAD, AG-News and MiniLM)"
-                          mkdir -p "$EMB" && { "$rp" -c 'import datasets, transformers, torch' 2>/dev/null || "$rp" -m pip install -q datasets "transformers<4.58"; } \
-                              && "$rp" py/real_gen.py "$EMB" > "$OUT/log_real_gen.txt" 2>&1 || echo "real_val: py/real_gen.py failed (see $OUT/log_real_gen.txt)"
-                      fi
-                  fi
-                  [[ -f $EMB/real_data.bin ]] || { echo "real_val: $EMB/real_data.bin absent (py/real_gen.py DIR) - skipped"; rec real_val skip "no real_data.bin (py/real_gen.py DIR)"; continue; } ;;
         *)      echo "run: unknown target '$name'" >&2; exit 2 ;;
     esac
     stale=0
@@ -165,7 +128,6 @@ for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd emeans engine store
     for d in "$src" "${deps[@]}"; do [[ $d -nt $bin ]] && stale=1; done
     (( stale )) && "$CC" "${CFLAGS[@]}" "$src" "${def[@]}" -lm -lpthread -o "$bin"
     runargs=()
-    [[ $name == real_val ]] && runargs=("$EMB")
     if ! "./$bin" "${runargs[@]}" 2>&1 | tee "$OUT/log_$name.txt"; then echo "  ^ $name FAILED"; fail=1; rec "$name" FAIL; else rec "$name" ok "$(notes "$name")"; fi
     echo
 done

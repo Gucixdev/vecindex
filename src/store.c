@@ -81,10 +81,9 @@
 #define ARENA_BACKEND 0                 /* WebAssembly has no address space to reserve: regions from malloc */
 #endif
 #define ENGINE_THREADS
-#define ENGINE_SERIALIZE
 #define PRINT_IMPLEMENTATION
 #include "config.h"
-#include "engine.c"
+#include "core.c"
 #include "print.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -231,6 +230,10 @@ typedef struct {
 } STx;
 
 /* the error bytes of search with a proof (store_exact.c): one a row, for one index and one row order */
+/* The build goal of the old adaptive engine, as a file's header stores it (8 words): kept so the header's layout
+ * does not move; seed is the only field read (the index's rotation). */
+typedef struct { i32 mode, k; f32 target_recall; i32 max_code_bytes, eval_queries, n_iters; u32 seed; i32 max_candidates; } StoreGoal;
+
 typedef struct StoreCertOld { u8 *err; struct StoreCertOld *next; } StoreCertOld;
 typedef struct { const void *tq; u32 gen, sgen; i32 n, cap; u8 *err; u8 emax; u8 *serr; StoreCertOld *old; } StoreCert;
 
@@ -293,7 +296,6 @@ typedef struct {
     i32      fast;          /* 1: store_build skips the auto-tuner (engine_build_fast) */
     f32      fast_target;   /* recall@k the fast build grows nprobe to (default 0.9) */
     Arena   *arena;         /* the RagStore struct lives here */
-    Arena    idx_arena;     /* committed engine index; arena_reset each build/load */
     i32      dim;
 
     SCol     vec, idc, metac;   /* the rows: unit vectors, caller doc ids, caller i64 tags (0 = none) */
@@ -313,8 +315,7 @@ typedef struct {
     i32      live;          /* rows that are not tombstoned */
     i32      count;
     i32      built_upto;    /* [0, built_upto) is in the index; the rest pends */
-    EngIndex *idx;
-    EngGoal  goal;
+    StoreGoal goal;         /* what a file's header carries of the old engine's build goal; only seed is used */
     pthread_rwlock_t lock;
     void    *map;           /* store_load's private copy-on-write mapping of the file (columns and tq point in) */
     size_t   map_len;
@@ -875,7 +876,7 @@ RagStore *store_new(Arena *a, i32 dim)
     s->arena = a;
     s->dim = dim;
     s->idmap_ok = 1;
-    s->goal.mode = ENG_MAX_ACC;
+    s->goal.mode = 1;                   /* (the old engine's ENG_MAX_ACC: files keep the field) */
     s->goal.k = 10;
     s->goal.max_code_bytes = 1 << 20;   /* unbounded -> most accurate config */
     s->goal.eval_queries = 0;           /* engine default (128) */
@@ -982,7 +983,6 @@ void store_destroy(RagStore *s)
     sidx_free_(&s->ids_h); h64_free(&s->dup);
     if (s->jf) fclose(s->jf);
     free(s->jpath); s->jpath = (char *)0;
-    arena_free(&s->idx_arena);
     scol_free_(&s->vec); scol_free_(&s->idc); scol_free_(&s->metac); scol_free_(&s->vsc); scol_free_(&s->txo); scol_free_(&s->tck); scol_free_(&s->rck); scol_free_(&s->nrm); scol_free_(&s->numc); scol_free_(&s->nsc);
     store_ns_free_(s); pthread_mutex_destroy(&s->ns_mu);
     store_ex_free_(s); pthread_mutex_destroy(&s->cert_mu);
@@ -1353,7 +1353,6 @@ void store_set_fast(RagStore *s, f32 target_recall)
     pthread_rwlock_wrlock(&s->lock);
     s->fast = 1; s->fast_target = target_recall > 0.0f ? target_recall : 0.9f;
     if (!s->tq && s->count > 0 && s->built_upto == s->count) {   /* a loaded, already-built store */
-        s->idx = (EngIndex *)0;
         store_ex_reap_(s);
         s->tq = store_tq_build_(s, s->count);
     }
@@ -1361,12 +1360,6 @@ void store_set_fast(RagStore *s, f32 target_recall)
     pthread_mutex_unlock(&s->mt_mu);
 }
 
-void store_set_goal(RagStore *s, EngGoal g)
-{
-    pthread_rwlock_wrlock(&s->lock);
-    s->goal = g;
-    pthread_rwlock_unlock(&s->lock);
-}
 
 static void store_jframe_(RagStore *s, const void *const *part, const size_t *plen, i32 np);   /* store_batch.c */
 
@@ -1570,7 +1563,7 @@ i32 store_built(const RagStore *s)
 {
     i32 r;
     pthread_rwlock_rdlock((pthread_rwlock_t *)&s->lock);
-    r = (s->idx || s->tq) && s->built_upto == s->count;
+    r = s->tq && s->built_upto == s->count;
     pthread_rwlock_unlock((pthread_rwlock_t *)&s->lock);
     return r;
 }
@@ -1743,7 +1736,6 @@ static i32 store_compact_(RagStore *s)
         bu = s->built_upto - store_dead_before_(s, pre, s->built_upto);
         if (s->tq) tq_remap(s->tq, s->dead, pre, bu);
         store_ex_reap_(s);                                       /* rows renumbered: their error bytes too */
-        if (s->idx) { s->idx = (EngIndex *)0; arena_reset(&s->idx_arena); bu = 0; }
         s->built_upto = bu;
         s->dead_built = 0;
         free(pre);
@@ -1777,18 +1769,6 @@ static i32 store_compact_(RagStore *s)
 
 static f32 store_tune_run_(RagStore *s, i32 nth);
 
-static i32 store_uses_tq_(const RagStore *s) { return s->fast || (s->goal.mode == ENG_MAX_ACC && s->goal.max_code_bytes >= s->dim * 4); }
-
-/* the engine index (the q1-q5 / IVF / HNSW tuner) over rows [0, w), under the write lock */
-static void store_engine_build_(RagStore *s, i32 w)
-{
-    f32 *flat = (f32 *)malloc((size_t)w * (size_t)s->dim * sizeof(f32));   /* the tuner wants one contiguous array */
-    i32 i;
-    for (i = 0; i < w; ++i) { f32 *dst = flat + (size_t)i * s->dim; const f32 *v = store_row_(s, i, dst); if (v != dst) memcpy(dst, v, (size_t)s->dim * sizeof(f32)); }
-    s->idx = engine_build(&s->idx_arena, flat, w, s->dim, s->goal);
-    free(flat);
-}
-
 void store_build(RagStore *s)
 {
     i32 w;
@@ -1801,14 +1781,8 @@ void store_build(RagStore *s)
     tq_free(s->tq); s->tq = (Tq *)0;                             /* rebuilt below: no use remapping it */
     store_ex_reap_(s);
     w = store_compact_(s);
-    arena_reset(&s->idx_arena);
     s->tuned_n = 0; s->dead_built = 0; s->win_sum = 0.0; s->win_n = 0; s->drifted = 0;
-    /* Auto choice: with no memory budget (the default) the data-oblivious 4-bit scan + exact re-score wins
-     * on accuracy and speed and needs no training. The q1-q5 / IVF / HNSW tuner (engine_build) only earns
-     * its 10-70 s when the goal is a SMALL index (ENG_MIN_SIZE, or a code budget below f32 size). */
-    s->idx = (EngIndex *)0;
-    if (w > 0 && store_uses_tq_(s)) s->tq = store_tq_build_(s, w);
-    else if (w > 0) store_engine_build_(s, w);
+    if (w > 0) s->tq = store_tq_build_(s, w);                    /* the 4-bit scan + exact re-score: the one index there is */
     s->built_upto = w;
     pthread_rwlock_unlock(&s->lock);
     store_tune_run_(s, store_ncpu_(s));                           /* keep the recall asked for, if one is (searches go on) */

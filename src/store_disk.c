@@ -15,7 +15,7 @@
 #define STORE_W64(f, p, n) engs_wle_((f), (p), 8, (n))
 #define STORE_R64(f, p, n) engs_rle_((f), (p), 8, (n))
 
-static int store_goal_w_(FILE *f, const EngGoal *g)
+static int store_goal_w_(FILE *f, const StoreGoal *g)
 {
     i32 w[7]; union { f32 fv; i32 iv; } tr;
     w[0] = (i32)g->mode;    w[1] = g->k;         w[2] = g->max_code_bytes;
@@ -24,11 +24,11 @@ static int store_goal_w_(FILE *f, const EngGoal *g)
     tr.fv = g->target_recall;
     return STORE_W32(f, w, 7) || STORE_W32(f, &tr.iv, 1) ? -1 : 0;
 }
-static int store_goal_r_(FILE *f, EngGoal *g)
+static int store_goal_r_(FILE *f, StoreGoal *g)
 {
     i32 w[7]; union { f32 fv; i32 iv; } tr;
     if (STORE_R32(f, w, 7) || STORE_R32(f, &tr.iv, 1)) return -1;
-    g->mode = (EngMode)w[0]; g->k = w[1];  g->max_code_bytes = w[2];
+    g->mode = w[0]; g->k = w[1];  g->max_code_bytes = w[2];
     g->eval_queries = w[3];  g->n_iters = w[4]; g->seed = (u32)w[5];
     g->max_candidates = w[6];
     g->target_recall = tr.fv;
@@ -495,8 +495,8 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
             free(pre);
         }
     }
-    /* 0: no index (a load rebuilds it), 1: the engine index, 2: the scan index */
-    kind = (u8)(s->idx && all_in && !dead ? 1 : (s->tq && all_in && s->tq->n == live ? 2 : 0));
+    /* 0: no index (a load rebuilds it), 2: the scan index (1 was the old engine's index: read as 0) */
+    kind = (u8)(s->tq && all_in && s->tq->n == live ? 2 : 0);
     f = fopen(tmp, "w+b");                                       /* the old file stays intact until the new one is complete */
     if (!f) return -1;
     hdr[0] = (i32)STORE_MAGIC; hdr[2] = s->dim; hdr[3] = live;
@@ -516,7 +516,6 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
        || (s->has_ns && (store_pad_(f) || store_col_w_live_(f, &s->nsc, s->count, dead)))
        || (s->has_text && (store_pad_(f) || store_col_w_live_(f, &s->tck, s->count, dead)))
        || fwrite(&kind, 1, 1, f) != 1
-       || (kind == 1 && engine_save(s->idx, f))
        || (kind == 2 && store_tq_w_(f, s->tq));
     if (!bad) {                                                  /* the digests and parity of all of it */
         i64 D = (i64)ftello(f);
@@ -531,7 +530,7 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
 i32 store_save(RagStore *s, const char *path)
 {
     char *tmp;
-    i32 live, had_idx, r;
+    i32 r;
     u64 stamp;
     if (s->ro) return -1;
     stamp = store_stamp_new_();
@@ -544,10 +543,8 @@ i32 store_save(RagStore *s, const char *path)
     store_index_pending_(s, store_ncpu_(s));                      /* the pending tail into the index, searches going on */
     pthread_rwlock_wrlock(&s->lock);
     store_index_locked_(s);                                      /* and what came in meanwhile: the file gets the index */
-    had_idx = s->idx != (EngIndex *)0;
-    live = store_compact_(s);                                    /* the scan index follows its rows */
+    store_compact_(s);                                           /* the scan index follows its rows */
     store_tx_compact_(s);                                        /* and the texts of the rows that went */
-    if (had_idx && !s->idx && live > 0) { store_engine_build_(s, live); s->built_upto = live; }   /* an engine index cannot */
     tmp = store_jname_(path, ".tmp");
     store_advise_(s, MADV_SEQUENTIAL);                           /* the save streams every row: read ahead */
     r = store_write_file_(s, path, tmp, stamp, 0);
@@ -1061,19 +1058,12 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     else if (fseeko(f, (off_t)o_kind, SEEK_SET) != 0 || fread(&kind, 1, 1, f) != 1) { fclose(f); store_destroy(s); return (RagStore *)0; }
     if (drop_idx) kind = 0;
 
-    if (kind == 1) {
-        if (fseeko(f, (off_t)(o_kind + 1), SEEK_SET) != 0) { fclose(f); store_destroy(s); return (RagStore *)0; }
-        s->idx = engine_load(&s->idx_arena, f);
-        fclose(f);
-        if (!s->idx || s->idx->dim != s->dim) { store_destroy(s); return (RagStore *)0; }   /* another dimension: not ours */
-        s->built_upto = live;
-    } else {
-        if (kind == 2) s->tq = store_tq_r_(map, len, f, o_kind + 1, live, map ? vz : (const SSum *)0, path, ro);
-        fclose(f);
-        s->fast = 1; s->fast_target = 0.97f;                     /* fast stores are saved without an engine index */
-        if (s->tq) { s->built_upto = live; s->cascade = s->tq->codes1 != (u8 *)0; }   /* saved with the cascade: on */
-        else store_build(s);                                      /* no saved scan index (or an unreadable one): build it */
-    }
+    /* (kind 1, the old engine's index: its rows are all here, so the scan index is built instead) */
+    if (kind == 2) s->tq = store_tq_r_(map, len, f, o_kind + 1, live, map ? vz : (const SSum *)0, path, ro);
+    fclose(f);
+    s->fast = 1; s->fast_target = 0.97f;                     /* fast stores are saved without an engine index */
+    if (s->tq) { s->built_upto = live; s->cascade = s->tq->codes1 != (u8 *)0; }   /* saved with the cascade: on */
+    else store_build(s);                                          /* no saved scan index (or an unreadable one): build it */
     s->stamp = stamp;
     store_journal_replay_(s, path);
     return store_jnewer_(s);
@@ -1147,16 +1137,10 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
     store_reindex_(s);
 
     if (fread(&has_idx, 1, 1, f) != 1) { fclose(f); store_destroy(s); return (RagStore *)0; }
-    if (has_idx) {
-        s->idx = engine_load(&s->idx_arena, f);
-        fclose(f);
-        if (!s->idx || s->idx->dim != s->dim) { store_destroy(s); return (RagStore *)0; }
-        s->built_upto = live;
-    } else {
-        fclose(f);
-        s->fast = 1; s->fast_target = 0.97f;                     /* fast stores are saved without an engine index */
-        store_build(s);
-    }
+    /* (has_idx: the old engine's index follows; the rows are all read, so the scan index is built instead) */
+    fclose(f);
+    s->fast = 1; s->fast_target = 0.97f;                     /* fast stores are saved without an engine index */
+    store_build(s);
     store_journal_replay_(s, path);
     store_lerr_[0] = 0;
     return store_jnewer_(s);
