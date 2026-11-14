@@ -164,18 +164,22 @@ static void store_ex_line_(const RagStore *s, f32 qlen, i32 r, f64 *a, f64 *b)
 typedef struct { f64 sc, base, qr, lutb, inv, step; } StoreExQ;
 
 /* the query's tables (lut: vd * 16 + 32 bytes) and its side of the bound */
-static void store_ex_query_(const Tq *t, const f32 *qn, u8 *lut, StoreExQ *eq)
+static i32 store_ex_query_(const Tq *t, const f32 *qn, u8 *lut, StoreExQ *eq)
 {
-    f32 *rot = (f32 *)malloc((size_t)t->dpad * sizeof(f32)), *tmp = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
-    f32 *lf = (f32 *)malloc((size_t)t->vd * 16 * sizeof(f32)), sc = 1.0f;
+    f32 *rot, *tmp, *lf, sc = 1.0f;
     f64 base = 0.0, qr = 0.0;
     i32 i;
+    Scr a;
+    if (scr_get_(&a, scr_need_((size_t)t->dpad * sizeof(f32)) * 2 + scr_need_((size_t)t->vd * 16 * sizeof(f32))) != 0) return -1;
+    rot = (f32 *)scr_take_(&a, (size_t)t->dpad * sizeof(f32)); tmp = (f32 *)scr_take_(&a, (size_t)t->dpad * sizeof(f32));
+    lf = (f32 *)scr_take_(&a, (size_t)t->vd * 16 * sizeof(f32));
     tq_lut_ex_(t, qn, rot, tmp, lf, lut, &sc, &base);
     for (i = 0; i < t->dpad; ++i) qr += (f64)rot[i] * rot[i];
     eq->sc = sc; eq->base = base; eq->qr = sqrt(qr);                 /* |q'|: sqrt(dim) for a unit query, up to rounding */
     eq->lutb = (f64)t->vd * 0.5 / (f64)sc;                           /* the tables' rounding, in q' . x^ units */
     eq->inv = 1.0 / (f64)t->dim; eq->step = store_ex_step_(t);
-    free(rot); free(tmp); free(lf);
+    scr_put_(&a);
+    return 0;
 }
 
 /* the estimated cosine of a row from its u16 sum */
@@ -316,11 +320,13 @@ static void store_ex_ann_(void *p, i64 a, i64 b, i32 tid)
     RagStore *s = A->s;
     const StoreCnf *cnf = A->cnf;
     i32 R = s->tq_rerank > 0 ? s->tq_rerank : (A->k * 20 > 256 ? A->k * 20 : 256) * (s->tq->bits == 1 ? 4 : 1) * (s->metric ? 4 : 1);
-    i32 *rows = (i32 *)malloc((size_t)R * sizeof(i32)), m, i;
+    i32 *rows, m, i;
+    Scr ra;
     i64 q;
     TqCol ncol, scol;
     TqFilt tf;
     (void)tid;
+    rows = scr_get_(&ra, scr_need_((size_t)R * sizeof(i32))) == 0 ? (i32 *)scr_take_(&ra, (size_t)R * sizeof(i32)) : (i32 *)0;
     memset(&tf, 0, sizeof(tf));
     if (cnf && cnf->num && s->has_num) { ncol = store_tqcol_(&s->numc); tf.num = &ncol; tf.lo = cnf->lo; tf.hi = cnf->hi; }
     if (cnf && cnf->ns_on && s->has_ns) { scol = store_tqcol_(&s->nsc); tf.ns = &scol; tf.nsv = cnf->ns; tf.nss = cnf->nss; tf.nns = cnf->nns; }
@@ -335,7 +341,7 @@ static void store_ex_ann_(void *p, i64 a, i64 b, i32 tid)
         for (i = 0; i < y->ni; ++i) if (!store_ex_ok_(s, cnf, (i32)y->irow[i])) break;
         if (i < y->ni) y->ni = 0;                                            /* never: the scan keeps dead rows out; a bar of rows the search may return only */
     }
-    free(rows);
+    if (rows) scr_put_(&ra);                                                 /* (no memory: no start rows, the pass alone - still exact) */
 }
 
 #define STORE_EX_QB 16              /* queries a pass: each block's codes read once for all of them (1.3x, docs) */
@@ -354,12 +360,16 @@ static i32 store_ex_tq_(RagStore *s, StoreExQy *qy, i32 nq, const StoreCnf *cnf,
     f32 *tsc;
     StoreExPass P;
     StoreExAnn A;
+    Scr pa;
     if (nth < 1) nth = 1;
     if (nth > nb) nth = nb > 0 ? nb : 1;
-    th = (StoreExTh *)calloc((size_t)nth * nq, sizeof(StoreExTh));
-    trow = (i64 *)malloc((size_t)nth * nq * k * sizeof(i64));
-    tsc = (f32 *)malloc((size_t)nth * nq * k * sizeof(f32));
-    if (!th || !trow || !tsc || !err || (!serr && t->nblk > 0)) { free(th); free(trow); free(tsc); return -1; }
+    if (!err || (!serr && t->nblk > 0)) return -1;
+    if (scr_get_(&pa, scr_need_((size_t)nth * nq * sizeof(StoreExTh)) + scr_need_((size_t)nth * nq * k * sizeof(i64))
+                      + scr_need_((size_t)nth * nq * k * sizeof(f32))) != 0) return -1;
+    th = (StoreExTh *)scr_take_(&pa, (size_t)nth * nq * sizeof(StoreExTh));
+    trow = (i64 *)scr_take_(&pa, (size_t)nth * nq * k * sizeof(i64));
+    tsc = (f32 *)scr_take_(&pa, (size_t)nth * nq * k * sizeof(f32));
+    memset(th, 0, (size_t)nth * nq * sizeof(StoreExTh));
     A.s = s; A.cnf = cnf; A.qy = qy; A.k = k;
     A.nth = nq == 1 ? (s->tq->n >= 150000 ? nth : 1) : 1;
     tq_par2_(store_ex_ann_, &A, nq, nq == 1 ? 1 : c);               /* one query: its scan on threads; many: a query a thread */
@@ -387,7 +397,7 @@ static i32 store_ex_tq_(RagStore *s, StoreExQy *qy, i32 nq, const StoreCnf *cnf,
             }
         }
     }
-    free(th); free(trow); free(tsc);
+    scr_put_(&pa);
     return 0;
 }
 
@@ -397,6 +407,8 @@ static i32 store_ex_tq_(RagStore *s, StoreExQy *qy, i32 nq, const StoreCnf *cnf,
 i32 store_search_exact_batch(RagStore *s, const f32 *queries, i32 nq, i32 k, i64 *out_ids, f32 *out_scores, i32 *n, const StoreCnf *cnf, i64 *checked)
 {
     i32 dim = s->dim, q0, q, i, rc = 0, nqb, *hv;
+    size_t lsz;
+    Scr ba;
     f32 *qn, *isc;
     i64 *irow, *chk;
     u8 *lut;
@@ -404,13 +416,17 @@ i32 store_search_exact_batch(RagStore *s, const f32 *queries, i32 nq, i32 k, i64
     if (k < 1 || nq < 1) return 0;
     for (q = 0; q < nq; ++q) if (!store_finite_(queries + (size_t)q * dim, dim)) return -1;
     nqb = nq < STORE_EX_QB ? nq : STORE_EX_QB;
-    qn = (f32 *)malloc((size_t)nq * dim * sizeof(f32));
-    qy = (StoreExQy *)calloc((size_t)nqb, sizeof(StoreExQy));
-    irow = (i64 *)malloc((size_t)nqb * k * sizeof(i64)); isc = (f32 *)malloc((size_t)nqb * k * sizeof(f32));
-    hv = (i32 *)calloc((size_t)nq, sizeof(i32)); chk = (i64 *)calloc((size_t)nq, sizeof(i64));
     pthread_rwlock_rdlock(&s->lock);
-    lut = s->tq ? (u8 *)malloc((size_t)nqb * (s->tq->vd * 16 + 32)) : (u8 *)malloc(1);
-    if (!qn || !qy || !irow || !isc || !hv || !chk || !lut) rc = -1;
+    lsz = s->tq ? (size_t)(s->tq->vd * 16 + 32) : 1;
+    if (scr_get_(&ba, scr_need_((size_t)nq * dim * sizeof(f32)) + scr_need_((size_t)nqb * sizeof(StoreExQy)) + scr_need_((size_t)nqb * k * sizeof(i64))
+                      + scr_need_((size_t)nqb * k * sizeof(f32)) + scr_need_((size_t)nq * sizeof(i32)) + scr_need_((size_t)nq * sizeof(i64))
+                      + scr_need_((size_t)nqb * lsz)) != 0) { pthread_rwlock_unlock(&s->lock); return -1; }
+    qn = (f32 *)scr_take_(&ba, (size_t)nq * dim * sizeof(f32));
+    qy = (StoreExQy *)scr_take_(&ba, (size_t)nqb * sizeof(StoreExQy));
+    irow = (i64 *)scr_take_(&ba, (size_t)nqb * k * sizeof(i64)); isc = (f32 *)scr_take_(&ba, (size_t)nqb * k * sizeof(f32));
+    hv = (i32 *)scr_take_(&ba, (size_t)nq * sizeof(i32)); chk = (i64 *)scr_take_(&ba, (size_t)nq * sizeof(i64));
+    lut = (u8 *)scr_take_(&ba, (size_t)nqb * lsz);
+    memset(qy, 0, (size_t)nqb * sizeof(StoreExQy)); memset(hv, 0, (size_t)nq * sizeof(i32)); memset(chk, 0, (size_t)nq * sizeof(i64));
     for (q = 0; rc == 0 && q < nq; ++q) {
         f32 *v = qn + (size_t)q * dim;
         memcpy(v, queries + (size_t)q * dim, (size_t)dim * sizeof(f32));
@@ -423,9 +439,9 @@ i32 store_search_exact_batch(RagStore *s, const f32 *queries, i32 nq, i32 k, i64
             qy[q].qn = qn + (size_t)(q0 + q) * dim;
             qy[q].qlen = (f32)eng_sqrt_(eng_ssq_(v, dim));
             qy[q].irow = irow + (size_t)q * k; qy[q].isc = isc + (size_t)q * k;
-            if (s->tq && s->built_upto > 0) { qy[q].lut = lut + (size_t)q * (s->tq->vd * 16 + 32); store_ex_query_(s->tq, qy[q].qn, qy[q].lut, &qy[q].eq); }
+            if (s->tq && s->built_upto > 0) { qy[q].lut = lut + (size_t)q * lsz; if (store_ex_query_(s->tq, qy[q].qn, qy[q].lut, &qy[q].eq) != 0) rc = -1; }
         }
-        if (s->tq && s->built_upto > 0) rc = store_ex_tq_(s, qy, m, cnf, k, out_ids + (size_t)q0 * k, out_scores + (size_t)q0 * k, hv + q0, chk + q0);
+        if (rc == 0 && s->tq && s->built_upto > 0) rc = store_ex_tq_(s, qy, m, cnf, k, out_ids + (size_t)q0 * k, out_scores + (size_t)q0 * k, hv + q0, chk + q0);
         for (q = 0; rc == 0 && q < m; ++q) {                     /* the rest (no scan index, or the pending tail): every row */
             i64 *ro = out_ids + (size_t)(q0 + q) * k;
             f32 *so = out_scores + (size_t)(q0 + q) * k;
@@ -439,7 +455,7 @@ i32 store_search_exact_batch(RagStore *s, const f32 *queries, i32 nq, i32 k, i64
     }
     pthread_rwlock_unlock(&s->lock);
     if (rc == 0) for (q = 0; q < nq; ++q) { if (n) n[q] = hv[q]; if (checked) checked[q] = chk[q]; }
-    free(qn); free(qy); free(irow); free(isc); free(hv); free(chk); free(lut);
+    scr_put_(&ba);
     return rc;
 }
 

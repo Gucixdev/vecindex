@@ -239,3 +239,6 @@ i32 store_search_grouped(RagStore *s, const f32 *query, i32 k, i32 shift, const 
     }
     return have;
 }
+
+/* searches of this process that found no memory for their working buffers and returned no hits (scratch.h) */
+i64 store_oom_count(void) { return scr_oom_count_(); }

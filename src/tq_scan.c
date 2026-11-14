@@ -550,6 +550,9 @@ static void tq_probe_(const Tq *t, const f32 *q, i32 np, u8 *scr, i32 *out)
  * (1 + eps) times as far from the query as the closest centroid is; an easy query, close to one centroid, then reads
  * a few clusters and a hard one all np. The closest TQ_PRUNE_KEEP always stay. eps 0: off. pc[0] must be the closest.
  * compact: the kept probes moved to the front and counted; else a dropped probe becomes -1 and np is returned. */
+#ifndef VI_SCAN_THREAD_BLOCKS
+#define VI_SCAN_THREAD_BLOCKS 16384
+#endif
 #ifndef VI_PROBE_PRUNE
 #define VI_PROBE_PRUNE 0.0f
 #endif
@@ -605,7 +608,10 @@ static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *de
         for (i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], blks + nb);
         nblk_scan = nb;
     } else nblk_scan = t->nblk + t->xn;                          /* flat: added blocks hold rows in order too */
-    if (nblk_scan < 64) nthreads = 1;
+    /* a thread is started per query (pthread_create), which costs more than it saves on a short scan: one more
+     * thread per VI_SCAN_THREAD_BLOCKS blocks to read (config.h; GloVe-100, ~3,500 blocks a query: 0.396 ms on one
+     * thread against 0.427 ms on two, p99 1.16 against 1.98) */
+    { i32 mx = 1 + nblk_scan / VI_SCAN_THREAD_BLOCKS; if (nthreads > mx) nthreads = mx; }
     nj = nthreads; per = (nblk_scan + nj - 1) / nj;
     buf = (u64 *)scr_take_(&sc, (size_t)nj * 2 * (size_t)R * sizeof(u64));
     mt = (u64 *)scr_take_(&sc, (size_t)R * sizeof(u64));

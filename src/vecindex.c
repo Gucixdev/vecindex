@@ -674,9 +674,9 @@ VI_API int vi_search(vi_db *db, const float *query, int k, vi_i64 *ids, float *s
     int n;
     if (vi_search_ok_(db, query, k, ids, scores)) return -1;
     if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
-    {   i64 oom = scr_oom_count_();
+    {   i64 oom = store_oom_count();
         n = store_search(db->s, query, (i32)k, (i64 *)ids, scores);
-        if (n == 0 && scr_oom_count_() != oom) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0); }
+        if (n == 0 && store_oom_count() != oom) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0); }
     vi_cos_(db, scores, n);
     return n;
 }

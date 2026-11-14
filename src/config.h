@@ -41,6 +41,13 @@
 #define VI_PROBE_PRUNE 0.0f
 #endif
 
+/* Blocks (of 32 rows) one query's scan must read for each further thread it starts: a thread is created per query
+ * and that costs more than it saves on a short scan. Measured on a 2-vCPU box only; a machine with real cores may
+ * want it lower. */
+#ifndef VI_SCAN_THREAD_BLOCKS
+#define VI_SCAN_THREAD_BLOCKS 16384
+#endif
+
 /* --- the index --------------------------------------------------------------------------------------------- */
 
 /* rows from which the index is clustered (below: one flat scan, exact-ish and fast enough) */
