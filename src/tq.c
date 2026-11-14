@@ -1431,6 +1431,8 @@ i32 tq_cascade_on(Tq *t, i32 nth)
     return 0;
 }
 
+#include "scratch.h"
+
 #include "tq_scan.c"
 
 #include "tq_add.c"

@@ -575,37 +575,40 @@ static i32 tq_prune_(const Tq *t, const f32 *q, i32 *pc, i32 np, i32 compact)
  * probe: IVF clusters to scan (0 = the index default, >= nc = all). slots: their slot numbers instead of rows. */
 static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, const TqFilt *filt, i32 nthreads, i32 probe, i32 slots)
 {
-    i32 *blks = (i32 *)0, nblk_scan, i, nj, per, tot;
+    i32 *blks = (i32 *)0, nblk_scan, i, nj, per, tot, np = 0;
     f32 *rot, *tmp, *lf;
     u8 *lut;
     u64 *buf, *mt;
     TqJob jobs[16];
     TqRes all_r;
     pthread_t th[16];
+    Scr sc;
 
     if (t->n == 0 || R <= 0) return 0;
-    rot = (f32 *)malloc((size_t)t->dpad * sizeof(f32)); tmp = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
-    lf = (f32 *)malloc((size_t)t->vd * 16 * sizeof(f32)); lut = (u8 *)malloc((size_t)t->vd * 16 + 32);
-    tq_lut_(t, q, rot, tmp, lf, lut);
-    if (t->nc > 1) {                                             /* IVF: the blocks of the nprobe clusters closest to the query */
-        i32 np = probe > 0 ? probe : t->nprobe, nb = 0, *pc;
-        u8 *scr = (u8 *)malloc(tq_probe_scr_(t));
-        if (np > t->nc) np = t->nc;
-        pc = (i32 *)malloc((size_t)np * sizeof(i32));
-        tq_probe_(t, q, np, scr, pc);
-        np = tq_prune_(t, q, pc, np, 1);
-        for (i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], (i32 *)0);
-        blks = (i32 *)malloc((size_t)(nb ? nb : 1) * sizeof(i32));
-        for (nb = 0, i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], blks + nb);
-        nblk_scan = nb;
-        free(scr); free(pc);
-    } else nblk_scan = t->nblk + t->xn;                          /* flat: added blocks hold rows in order too */
     if (nthreads < 1) nthreads = 1;
     if (nthreads > 16) nthreads = 16;
+    if (t->nc > 1) { np = probe > 0 ? probe : t->nprobe; if (np > t->nc) np = t->nc; }
+    /* everything the query needs, from one pooled buffer (scratch.h): no malloc on the way, and no memory is an
+     * answer - no hits, counted by scr_oom_count_ - not a crash */
+    if (scr_get_(&sc, scr_need_((size_t)t->dpad * sizeof(f32)) * 2 + scr_need_((size_t)t->vd * 16 * sizeof(f32)) + scr_need_((size_t)t->vd * 16 + 32)
+                      + (t->nc > 1 ? scr_need_(tq_probe_scr_(t)) + scr_need_((size_t)np * sizeof(i32)) + scr_need_((size_t)(t->nblk + t->xn + 1) * sizeof(i32)) : 0)
+                      + scr_need_((size_t)nthreads * 2 * (size_t)R * sizeof(u64)) + scr_need_((size_t)R * sizeof(u64))) != 0) return 0;
+    rot = (f32 *)scr_take_(&sc, (size_t)t->dpad * sizeof(f32)); tmp = (f32 *)scr_take_(&sc, (size_t)t->dpad * sizeof(f32));
+    lf = (f32 *)scr_take_(&sc, (size_t)t->vd * 16 * sizeof(f32)); lut = (u8 *)scr_take_(&sc, (size_t)t->vd * 16 + 32);
+    tq_lut_(t, q, rot, tmp, lf, lut);
+    if (t->nc > 1) {                                             /* IVF: the blocks of the nprobe clusters closest to the query */
+        i32 nb = 0, *pc = (i32 *)scr_take_(&sc, (size_t)np * sizeof(i32));
+        u8 *scr = (u8 *)scr_take_(&sc, tq_probe_scr_(t));
+        blks = (i32 *)scr_take_(&sc, (size_t)(t->nblk + t->xn + 1) * sizeof(i32));   /* (room for every block: pages it never touches) */
+        tq_probe_(t, q, np, scr, pc);
+        np = tq_prune_(t, q, pc, np, 1);
+        for (i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], blks + nb);
+        nblk_scan = nb;
+    } else nblk_scan = t->nblk + t->xn;                          /* flat: added blocks hold rows in order too */
     if (nblk_scan < 64) nthreads = 1;
     nj = nthreads; per = (nblk_scan + nj - 1) / nj;
-    buf = (u64 *)malloc((size_t)nj * 2 * (size_t)R * sizeof(u64));
-    mt = (u64 *)malloc((size_t)R * sizeof(u64));
+    buf = (u64 *)scr_take_(&sc, (size_t)nj * 2 * (size_t)R * sizeof(u64));
+    mt = (u64 *)scr_take_(&sc, (size_t)R * sizeof(u64));
     for (i = 0; i < nj; ++i) {
         jobs[i].t = t; jobs[i].lut = lut; jobs[i].blks = blks; jobs[i].b0 = i * per; jobs[i].b1 = (i + 1) * per < nblk_scan ? (i + 1) * per : nblk_scan;
         if (jobs[i].b0 > jobs[i].b1) jobs[i].b0 = jobs[i].b1;
@@ -623,7 +626,7 @@ static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *de
     }
     tq_res_init_(&all_r, buf, R); all_r.n = tot;
     tot = tq_res_rows_(&all_r, rows, mt);
-    free(buf); free(mt); free(rot); free(tmp); free(lf); free(lut); free(blks);
+    scr_put_(&sc);
     return tot;
 }
 
