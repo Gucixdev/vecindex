@@ -497,6 +497,26 @@ static void tq_pick_(u64 *key, i32 nk, i32 np, u64 *tmp, i32 *out, i32 sorted)
     for (i = 0; i < np; ++i) out[i] = (i32)(u32)key[i];
 }
 
+/* tq_probe_ through the second level (tq_top.c): the top cells closest to q, taken until they hold tq_top_want_(np)
+ * centroids, and f32 scores of those centroids only. */
+static void tq_probe2_(const Tq *t, const f32 *q, i32 np, u64 *key, u64 *tmp, i32 *out)
+{
+    f32 ts[TQ_TOP_KMAX];
+    i32 want = tq_top_want_(np), nk = 0, g, i, taken = 0;
+    for (g = 0; g < t->nk1; ++g) ts[g] = vs_dot(q, t->top + (size_t)g * t->dim, t->dim);
+    while (nk < want && taken < t->nk1) {
+        i32 b = 0;
+        for (g = 1; g < t->nk1; ++g) if (ts[g] > ts[b]) b = g;
+        ts[b] = -4.0f; ++taken;                                  /* (a dot of unit vectors is above -4) */
+        for (i = t->tstart[b]; i < t->tstart[b + 1]; ++i) {
+            i32 c = t->tlist[i];
+            key[nk++] = ((u64)tq_fkey_(vs_dot(q, t->cent + (size_t)c * t->dim, t->dim)) << 32) | (u32)c;
+        }
+    }
+    if (np > nk) np = nk;                                        /* never: want >= np, and every cluster is in a cell */
+    tq_pick_(key, nk, np, tmp, out, 1);
+}
+
 /* The np clusters closest to q into out[np], closest first. VNNI: int8 scores of every centroid, a threshold that
  * keeps the best np + np/4 + 16 or so, exact f32 scores for only those - so the probes are the f32 ones. Otherwise:
  * f32 scores of every centroid. scr: tq_probe_scr_ bytes. */
@@ -507,6 +527,7 @@ static void tq_probe_(const Tq *t, const f32 *q, i32 np, u8 *scr, i32 *out)
     i32 *sc = (i32 *)(void *)(tmp + ng16);
     if (np > nc) np = nc;
     if (np <= 0) return;
+    if (t->top && tq_top_want_(np) < nc) { tq_probe2_(t, q, np, key, tmp, out); return; }
 #if TQ_VNNI
     if (t->c8) {
         i32 *cand = sc + ng16;

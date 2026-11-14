@@ -138,6 +138,10 @@ typedef struct {
     i32   nsplit;           /* clusters split since the build */
     u32   sgen;             /* bumped whenever a built slot loses its row: what a cache of slot-order facts checks */
     i32   pnc, pnp;         /* nc and nprobe when the probe count was last set: nprobe follows nc as clusters split */
+    /* a second level over the centroids (tq_top.c); NULL below tq_top_min_ clusters */
+    f32  *top;              /* [nk1 * dim] top cells, unit */
+    i32  *tstart, *tlist;   /* cell g holds the clusters tlist[tstart[g] .. tstart[g + 1]) */
+    i32   nk1;
 } Tq;
 
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512F__)
@@ -1270,10 +1274,13 @@ static void tq_c8_(Tq *t)
 }
 
 /* after a load: the transposed and int8 centroids are derived, not saved */
+#include "tq_top.c"
+
 static void tq_prepare_(Tq *t)
 {
     if (t->nc > 1 && !t->ct) t->ct = tq_transpose_(t->cent, t->nc, t->dim);
     tq_c8_(t);
+    if (t->nc > 1) tq_top_build_(t);
 }
 
 void tq_free(Tq *t)
@@ -1285,6 +1292,7 @@ void tq_free(Tq *t)
         if (t->cent_own) { free(t->cent); free(t->cstart); }
     }
     free(t->ct); free(t->c8); free(t->c8b); free(t->c8s);
+    tq_top_free_(t);
     free(t->xcodes); free(t->xslot); free(t->xnext); free(t->xhead); free(t->xtail); free(t->csize);
     if (t->c1_own) free(t->codes1);
     free(t->xcodes1);
@@ -1297,6 +1305,7 @@ static i64 tq_ram_(const Tq *t)
     i64 b = 0;
     if (!t) return 0;
     if (t->nc > 1) b += (i64)((t->nc + 15) / 16) * 16 * t->dim * 4;
+    if (t->top) b += (i64)t->nk1 * t->dim * 4 + (i64)(t->nk1 + 1 + t->nc) * 4;
     if (t->c8) b += (i64)((t->nc + 15) / 16) * (t->c8d4 * 64 + 64) + (i64)t->c8d4 * 16;
     if (!t->mapped) {
         b += (i64)t->nblk * t->vd * 16 + (i64)t->dpad * 12;

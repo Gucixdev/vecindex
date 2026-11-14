@@ -351,3 +351,11 @@ as before, without block checks and with the row checks computed at the open, un
 A snapshot costs memory for the pages the parent changes while the child writes, up to a second copy of whatever is
 rewritten meanwhile. Under strict overcommit (`vm.overcommit_memory=2`) `fork` can fail for a store larger than the
 free commit limit; `vi_snapshot` then returns -1 and nothing changes.
+
+## Compile-time settings
+
+`src/config.h` holds every setting fixed at compile time, each with its default and what it trades: no config file,
+no parser - edit the value or pass `-DNAME=value`, and rebuild. `VI_RAM_LIMIT_MB` (0: what the machine or its cgroup
+has) is the RAM the store counts on - past half of it an index loads cold and rows spill to a file sooner;
+`VI_VRAM_LIMIT_MB` is read by the GPU path only, which is not built yet; `VI_RECALL_DEFAULT`, `STORE_IVF_MIN`,
+`STORE_IVF_ROWS`, `STORE_SPLIT_X` and `VI_TOP_MIN` are the search and index defaults.

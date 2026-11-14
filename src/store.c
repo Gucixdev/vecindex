@@ -83,6 +83,7 @@
 #define ENGINE_THREADS
 #define ENGINE_SERIALIZE
 #define PRINT_IMPLEMENTATION
+#include "config.h"
 #include "engine.c"
 #include "print.h"
 #include <stdio.h>
@@ -152,6 +153,7 @@ static i64 store_ram_half_(void)
             if (fgets(b, sizeof(b), f) && b[0] >= '0' && b[0] <= '9') { i64 cap = (i64)strtoll(b, (char **)0, 10); if (cap > 0 && cap < ram) ram = cap; }
             fclose(f);
         }
+        if (VI_RAM_LIMIT_MB > 0 && ((i64)VI_RAM_LIMIT_MB << 20) < ram) ram = (i64)VI_RAM_LIMIT_MB << 20;   /* config.h */
         half = ram / 2;
     }
     return half;

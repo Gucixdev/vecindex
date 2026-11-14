@@ -199,6 +199,7 @@ static i32 tq_split_(Tq *t, i32 c, const TqCol *rows, const u64 *dead)
         }
         free(gm);
     }
+    tq_top_add_(t, nn);                                          /* (c keeps its top cell: its centroid moved a little) */
     ++t->nsplit;
     free(rb); free(cd); free(c1); free(mem); free(x); free(side); free(ca);
     return moved;

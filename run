@@ -87,7 +87,7 @@ tools/gen --check
 
 QDEPS=(src/q1.c src/q2.c src/q3.c src/q4.c src/q5.c src/qmix.c src/q4fs.c src/vsimd.h)
 ENG=("${QDEPS[@]}" src/ivf.c src/hnsw.c src/engine*.c)
-STORE=("${ENG[@]}" src/store*.c src/hdict.c src/lex.c src/blake3.c src/tq*.c)
+STORE=("${ENG[@]}" src/store*.c src/hdict.c src/lex.c src/blake3.c src/tq*.c src/config.h)
 
 fail=0
 # one line per step for the table at the very end: rec NAME ok|FAIL|skip [note]
@@ -121,9 +121,10 @@ notes() {
         emeans)  echo "$(okn "$OUT/log_emeans.txt") checks, $(ex "$OUT/log_emeans.txt" 'e-means error [0-9.]+ < Lloyd.s 8 rounds [0-9.]+')" ;;
         exact)   echo "$(okn "$OUT/log_exact.txt") checks: search with a proof == every row scored, bound held on every row" ;;
         split)   echo "$(okn "$OUT/log_split.txt") checks: clusters split in place, invariants, recall, save/load, live" ;;
+        top)     echo "$(okn "$OUT/log_top.txt") checks: probes through top cells against every centroid" ;;
     esac
 }
-for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd emeans engine store exact split ${more[@]+"${more[@]}"}; do
+for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd emeans engine store exact split top ${more[@]+"${more[@]}"}; do
     bin="$OUT/$name"
     src="tests/${name}_test.c"
     def=()
@@ -139,6 +140,7 @@ for name in hdict lex q1 q2 q3 q4 q5 qmix q4fs hnsw ivf simd emeans engine store
         emeans) deps=("${STORE[@]}") ;;
         exact)  deps=("${STORE[@]}") ;;
         split)  deps=("${STORE[@]}") ;;
+        top)    deps=("${STORE[@]}") ;;
         engine) deps=("${ENG[@]}"); def=(-DENGINE_SERIALIZE) ;;   # exercise the .vxi round-trip in the test
         store)  deps=("${STORE[@]}") ;;
         bench)  src=bench/bench.c; def=(-DBENCH); deps=("${ENG[@]}") ;;
