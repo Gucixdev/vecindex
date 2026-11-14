@@ -96,6 +96,14 @@ int main(void)
     t->top = (f32 *)0; r1 = tp_recall_(s); t->top = top;
     sprintf(msg, "recall@10 at %d probes: %.4f through the top cells, %.4f comparing every centroid", np, r2, r1);
     CHECK(r2 >= r1 - 0.01, msg);
+    {   /* query-aware pruning: fewer clusters read, recall reported (the bound here is loose: it is a setting to measure) */
+        f64 rp;
+        t->top = (f32 *)0;
+        store_set_prune(0.2f); rp = tp_recall_(s); store_set_prune(0.0f);
+        t->top = top;
+        sprintf(msg, "probe pruning at eps 0.2: recall@10 %.4f against %.4f without; off again: %.4f", rp, r1, tp_recall_(s));
+        CHECK(rp >= 0.5 * r1 && rp <= r1 + 0.02 && tp_recall_(s) >= r2 - 1e-9, msg);
+    }
     {   TqCol sc, col = store_vcol_(s, &sc);
         i32 nc0 = t->nc, done;
         pthread_rwlock_wrlock(&s->lock);

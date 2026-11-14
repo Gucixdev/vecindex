@@ -546,6 +546,30 @@ static void tq_probe_(const Tq *t, const f32 *q, i32 np, u8 *scr, i32 *out)
     tq_pick_(key, nk, np, tmp, out, 1);
 }
 
+/* Query-aware pruning of the probes (the SPANN rule): a cluster is scanned only when its centroid is at most
+ * (1 + eps) times as far from the query as the closest centroid is; an easy query, close to one centroid, then reads
+ * a few clusters and a hard one all np. The closest TQ_PRUNE_KEEP always stay. eps 0: off. pc[0] must be the closest.
+ * compact: the kept probes moved to the front and counted; else a dropped probe becomes -1 and np is returned. */
+#ifndef VI_PROBE_PRUNE
+#define VI_PROBE_PRUNE 0.0f
+#endif
+#define TQ_PRUNE_KEEP 4
+static f32 tq_prune_eps_ = VI_PROBE_PRUNE;
+static i32 tq_prune_(const Tq *t, const f32 *q, i32 *pc, i32 np, i32 compact)
+{
+    f32 lim, e = 1.0f + tq_prune_eps_;
+    i32 i, n = 0, kept = 0;
+    if (tq_prune_eps_ <= 0.0f || np <= TQ_PRUNE_KEEP) return np;
+    lim = e * e * (2.0f - 2.0f * vs_dot(q, t->cent + (size_t)pc[0] * t->dim, t->dim));   /* squared distances of unit vectors */
+    for (i = 0; i < np; ++i) {
+        i32 keep = kept < TQ_PRUNE_KEEP || 2.0f - 2.0f * vs_dot(q, t->cent + (size_t)pc[i] * t->dim, t->dim) <= lim;
+        kept += keep;
+        if (compact) { if (keep) pc[n++] = pc[i]; }
+        else if (!keep) pc[i] = -1;
+    }
+    return compact ? n : np;
+}
+
 /* The R best rows (by the quantised inner product) that are alive and pass filt (NULL: no filter); returns how
  * many were found, rows[] best first. dead (a bitset) may be NULL. nthreads > 1 splits the blocks.
  * probe: IVF clusters to scan (0 = the index default, >= nc = all). slots: their slot numbers instead of rows. */
@@ -569,6 +593,7 @@ static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *de
         if (np > t->nc) np = t->nc;
         pc = (i32 *)malloc((size_t)np * sizeof(i32));
         tq_probe_(t, q, np, scr, pc);
+        np = tq_prune_(t, q, pc, np, 1);
         for (i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], (i32 *)0);
         blks = (i32 *)malloc((size_t)(nb ? nb : 1) * sizeof(i32));
         for (nb = 0, i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], blks + nb);
@@ -745,6 +770,7 @@ static void tq_many_one_(const Tq *t, const f32 *Q, i32 nq, i32 R, i32 np, i32 *
     for (q = 0; q < nq && np; ++q) tq_probe_(t, Q + (size_t)q * t->dim, np, scr, m.probes + (size_t)q * np);
     for (q = 0; q < nq && np; ++q) {                             /* each query's closest cluster first: a threshold early */
         i32 b2;
+        tq_prune_(t, Q + (size_t)q * t->dim, m.probes + (size_t)q * np, np, 0);   /* (never drops the first) */
         c = m.probes[(size_t)q * np];
         for (b2 = t->cstart[c]; b2 < t->cstart[c + 1]; ++b2) tq_many_push_(&m, &m.res[q], t->codes + (size_t)b2 * bb, b2, m.luts + (size_t)q * m.lutb);
         for (b2 = t->xhead ? t->xhead[c] : -1; b2 >= 0; b2 = t->xnext[b2])
@@ -755,9 +781,9 @@ static void tq_many_one_(const Tq *t, const f32 *Q, i32 nq, i32 R, i32 np, i32 *
         i32 nx;
         m.cq0 = (i32 *)calloc((size_t)t->nc + 2, sizeof(i32));
         m.cq = (i32 *)malloc((size_t)nq * (size_t)np * sizeof(i32));
-        for (i = 0; i < nq * np; ++i) if (i % np) ++m.cq0[m.probes[i] + 2];
+        for (i = 0; i < nq * np; ++i) if (i % np && m.probes[i] >= 0) ++m.cq0[m.probes[i] + 2];
         for (c = 0; c < t->nc; ++c) m.cq0[c + 2] += m.cq0[c + 1];
-        for (i = 0; i < nq * np; ++i) if (i % np) m.cq[m.cq0[m.probes[i] + 1]++] = i / np;
+        for (i = 0; i < nq * np; ++i) if (i % np && m.probes[i] >= 0) m.cq[m.cq0[m.probes[i] + 1]++] = i / np;
         for (c = 0; c < t->nc; c = nx) {                         /* cluster by cluster: its blocks x its queries */
             i32 b2, x;
             for (nx = c + 1; nx < t->nc && m.cq0[nx] == m.cq0[nx + 1]; ++nx) {}

@@ -34,6 +34,13 @@
 #define VI_RECALL_DEFAULT 0.90f
 #endif
 
+/* Query-aware pruning of the probed clusters (the SPANN rule): 0 off; eps > 0 scans a cluster only when its centroid
+ * is at most (1 + eps) times as far from the query as the closest one. Easy queries then read fewer clusters - on
+ * disk, fewer pages. Off until measured on real data: try 0.1 to 0.3. store_set_prune changes it while running. */
+#ifndef VI_PROBE_PRUNE
+#define VI_PROBE_PRUNE 0.0f
+#endif
+
 /* --- the index --------------------------------------------------------------------------------------------- */
 
 /* rows from which the index is clustered (below: one flat scan, exact-ish and fast enough) */

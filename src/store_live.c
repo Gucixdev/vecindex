@@ -321,6 +321,9 @@ void store_set_split(RagStore *s, i32 on)
     pthread_mutex_unlock(&s->mt_mu);
 }
 
+/* query-aware probe pruning (tq_prune_), for every store of the process: eps 0 off */
+void store_set_prune(f32 eps) { tq_prune_eps_ = eps > 0.0f ? eps : 0.0f; }
+
 /* clusters split in place so far */
 i64 store_splits(RagStore *s) { return store_stat_get_(&s->n_splits); }
 
