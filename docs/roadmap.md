@@ -1,6 +1,6 @@
 # Roadmap
 
-The owner's list and where each item stands (2026-11-01). "Not run" means written and compiled, tests and benchmarks
+The owner's list and where each item stands (2026-11-14). "Not run" means written and compiled, tests and benchmarks
 still to run on his machine.
 
 Scope: vecindex is the vector database alone, with no dependencies, built as one project. The note database, agent
@@ -38,7 +38,63 @@ and `/prometheus` (the Prometheus text format) for the operator, a replica on a 
 its journal, never ahead of the primary's last fsync, a new file fetched and checked block by block after a snapshot,
 failover by starting `vserv` on it), encryption at rest left to LUKS, ZFS or fscrypt (docs/server.md).
 
-Open:
+Done since 2026-11-13 (branch `vecindex-features`; `./run` 27 steps and `lean4/run` 34 steps passing on a 2-vCPU
+Xeon unless a line says otherwise):
+- search with a proof (`vi_search_exact`, `vi_search_exact_batch`, vserv `exact=1` and op 24, Python, Rust, JS): the
+  exact top k with every other row ruled out by a bound proved in `lean4/Vecindex/Exact.lean`. GloVe-100, 1.18M
+  rows: recall@10 1.0000 at 3.7-4.0 ms median against 50-56 ms for every row
+- e-means clustering as the default (`lean4/Vecindex/Emeans.lean`)
+- recall 0.90 as the default target of a store opened without `VI_MANUAL` (speed first, for RAG)
+- clusters split in place as they grow instead of a whole rebuild (`src/tq_split.c`, `tests/split_test.c`).
+  Synthetic data only: 67 splits, no rebuild, recall 0.996 against 0.772 without. Not measured on real data
+- a second level over the centroids from 16384 clusters (`src/tq_top.c`), saved in the file (flag 64).
+  Tested for equal probes and recall on 400k synthetic rows; not measured at the scale it is for (16M rows up)
+- query-aware probe pruning (`VI_PROBE_PRUNE`, off by default): at eps 0.2 recall 0.977 against 0.996 on the
+  synthetic test; how many clusters it saves is not measured
+- scan threads only for long scans (`VI_SCAN_THREAD_BLOCKS`): measured on 2 vCPUs only
+- `src/config.h` (every compile-time setting, the RAM limit among them), `src/format.h` (the file's layout)
+- the rules behind the configurations proved (`lean4/Vecindex/Config.lean`): the cluster count grows as sqrt(n),
+  re-scoring needs finer steps than the scan's codes, more probes never lose a candidate
+- the first engine retired to `trash/` (q1-q5, qmix, q4fs, hnsw, ivf, engine: 4,842 lines nothing reached)
+- no malloc on any search path (`src/scratch.h`) and none in the scan index (`src/mem.h`: arenas over the OS's
+  pages; `tq.c`, `tq_add.c`, `tq_split.c`, `tq_top.c`)
+
+Open, in the order they are planned:
+1. **The rest of the code off malloc** (158 call sites): the store (`store.c`, `store_disk.c`, `store_exact.c`,
+   `store_tune.c`, `store_sum.c`), then the text index and the id table (`lex.c`, `hdict.c`), then the server. A
+   build that runs out of memory should fail with an error everywhere (now: the main arrays are checked, the
+   working ones not all)
+2. **Sparse vectors** (the caller gives dimension-weight pairs, e.g. from SPLADE), indexed on the posting lists of
+   `lex.c` and fused with the dense hits: hybrid search beyond BM25
+3. **Metadata as JSON with indexed fields, and a planner for filters**: a selective filter lists its rows first
+   (pre-filter), a wide one is tested inside the scan (now: tags, 64 labels, one number, namespaces; the pre-filter
+   only for small namespaces)
+4. **Effort chosen per query, no knob**: the scan stops when further clusters stop changing the top k; needs the
+   scan loop rebuilt (its block list is made up front today). Then `VI_PROBE_PRUNE` and the recall target can go
+5. **The tuner**: it searches probe counts assuming recall only rises with them; `Config.lean` has the
+   counterexample (a re-rank depth below the candidate count). Measure each count instead
+6. **Splits, finished**: a moved row should take a free slot of its new cluster (24,000 added rows left 28,500
+   holes, and a quarter of the slots empty forces the rebuild splits were to avoid); merge clusters that shrank
+7. **SPANN, the rest**: rows near a cluster boundary kept in several lists. A row in more than one slot touches
+   search with a proof, compaction and splits - to be done with tests running, not blind
+8. **One measurement at scale**: 100M to 1B rows from disk with the top cells, splits and pruning on; the factor in
+   `4 sqrt(n)` swept (`Config.lean`: the best one is sqrt(b p / a) for the measured costs, 4 is a rule of thumb)
+9. **Profile the query path, then SIMD where it shows**: the per-query tables (rotation, 16 entries a column), the
+   top cells and centroids scored one dot product at a time
+10. **A guarantee from calibration** (conformal): "at most a share alpha of queries below recall r", valid only for
+    queries like the logged ones
+11. **Past one machine**: shards behind a router in vserv (plain and exact search fanned out, top k merged, the
+    merge proved in Lean); then failover by promoting a replica, and read/write/admin roles on keys
+12. **Sparse and multi-vector rows** beyond item 2 (late interaction)
+13. **An optional GPU scan**: a Vulkan compute shader, `libvulkan` opened with dlopen (nothing linked; without it
+    the CPU path), `VI_VRAM_LIMIT_MB` its limit. Tested here on a software Vulkan only; real numbers need his card
+14. **The live visualisation from the real engine** (WASM)
+15. **Ternary codes**, measured before any code: as a first sieve for row-to-centroid comparisons at build and
+    split time (`trash/src/q3.c` has the packing). Not for the scan's codes or the rows: Config.lean shows why
+16. Housekeeping: `Codes.lean` still proves the digit tables of the retired q1-q5; `src/fine_grained.h` (a thread
+    pool) and `src/arena_alloc.h` have no user left in `src/`
+
+Open from before, not yet placed in that order:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a
   hierarchy on the tag's bits, `vi_label*`); relations between rows
 - the file format: zones (parts of a store split by id range, time or tag) and namespaces inside a tenant, one
