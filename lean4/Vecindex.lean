@@ -24,3 +24,4 @@ import Vecindex.Rate
 import Vecindex.NsSet
 import Vecindex.Emeans
 import Vecindex.Exact
+import Vecindex.Config
