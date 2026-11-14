@@ -1165,6 +1165,7 @@ static void tq_count_(Tq *t)
 /* nc <= 1: flat scan of every row. nc > 1: IVF with about nc clusters (nprobe defaults to min(16%, 4 sqrt nc)).
  * skip (a bitset, IVF only, may be NULL): rows that get no slot - the store's tombstones, left out of a rebuild. */
 static void tq_c8_(Tq *t);
+static void tq_top_build_(Tq *t);
 #define TQ_SKIP(s, i) ((s) && (((s)[(size_t)(i) >> 6] >> ((u32)(i) & 63u)) & 1u))
 
 Tq *tq_build_skip(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, i32 bits, const u64 *skip)
@@ -1228,6 +1229,7 @@ Tq *tq_build_skip(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, 
         t->skew0 = tq_skew(t);
         t->ct = tq_transpose_(t->cent, nc, dim);
         tq_c8_(t);
+        tq_top_build_(t);
     } else {
         t->nblk = (n + 31) / 32; nslots = t->nblk * 32;
     }
