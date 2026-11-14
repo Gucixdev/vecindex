@@ -92,7 +92,8 @@ Open, in the order they are planned:
 15. **Ternary codes**, measured before any code: as a first sieve for row-to-centroid comparisons at build and
     split time (`trash/src/q3.c` has the packing). Not for the scan's codes or the rows: Config.lean shows why
 16. Housekeeping: `Codes.lean` still proves the digit tables of the retired q1-q5; `src/fine_grained.h` (a thread
-    pool) and `src/arena_alloc.h` have no user left in `src/`
+    pool) has no user left in `src/`; `src/arena_alloc.h` holds only the store's own struct (`store_new`) and
+    should give way to `mem.h`
 
 Open from before, not yet placed in that order:
 - labels beyond 64 a store: sets of rows as bitmaps, unlimited, with the same hierarchy (now: 64 named labels in a
