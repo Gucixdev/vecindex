@@ -14,8 +14,10 @@ typedef struct { i32 b, k, row; } TqMem;
 /* the live rows of cluster c into out (NULL: count them); dead: tombstones (may be NULL). -1: no memory */
 static i32 tq_members_(const Tq *t, i32 c, const u64 *dead, TqMem *out)
 {
-    i32 *bl = (i32 *)malloc((size_t)(t->nblk + t->xn + 1) * sizeof(i32)), nb, b, k, m = 0;
-    if (!bl) return -1;
+    Gen g;
+    i32 *bl, nb, b, k, m = 0;
+    gen_init_(&g);
+    if (!(bl = (i32 *)gen_alloc_(&g, (size_t)(t->nblk + t->xn + 1) * sizeof(i32)))) { gen_free_(&g); return -1; }
     nb = tq_cblocks_(t, c, bl);
     for (b = 0; b < nb; ++b)
         for (k = 0; k < 32; ++k) {
@@ -24,7 +26,7 @@ static i32 tq_members_(const Tq *t, i32 c, const u64 *dead, TqMem *out)
             if (out) { out[m].b = bl[b]; out[m].k = k; out[m].row = r; }
             ++m;
         }
-    free(bl);
+    gen_free_(&g);
     return m;
 }
 
@@ -74,35 +76,23 @@ static i32 tq_move_(Tq *t, i32 b, i32 k, i32 from, i32 c, u8 *cd, u8 *c1)
 static i32 tq_grow_nc_(Tq *t)
 {
     i32 nc = t->nc, dim = t->dim;
-    f32 *ce;
-    i32 *cs, *sz = (i32 *)0, *xh = (i32 *)0, *xt = (i32 *)0;
-    if (t->mapped && !t->cent_own) {
-        ce = (f32 *)malloc((size_t)(nc + 1) * dim * sizeof(f32)); cs = (i32 *)malloc((size_t)(nc + 2) * sizeof(i32));
-        if (!ce || !cs) { free(ce); free(cs); return -1; }
-        memcpy(ce, t->cent, (size_t)nc * dim * sizeof(f32)); memcpy(cs, t->cstart, (size_t)(nc + 1) * sizeof(i32));
-        if (!t->slot_own) {                                      /* the slots will change too: off the mapping */
-            i32 *sr = (i32 *)malloc((size_t)(t->nblk ? t->nblk : 1) * 32 * sizeof(i32));
-            if (!sr) { free(ce); free(cs); return -1; }
-            memcpy(sr, t->slot_row, (size_t)t->nblk * 32 * sizeof(i32));
-            t->slot_row = sr; t->slot_own = 1;
-        }
-        t->cent_own = 1;
-    } else {
-        if (!(ce = (f32 *)realloc(t->cent, (size_t)(nc + 1) * dim * sizeof(f32)))) return -1;
-        t->cent = ce;
-        if (!(cs = (i32 *)realloc(t->cstart, (size_t)(nc + 2) * sizeof(i32)))) return -1;
+    if (t->ccap < nc + 1 || t->reg[TQ_R_CENT].p != (void *)t->cent) {   /* room for half as many again: a split copies O(1) on average */
+        i32 cap = nc + 1 + nc / 2 + 16;
+        if (reg_fit_(&t->reg[TQ_R_CENT], (void **)&t->cent, (size_t)nc * dim * sizeof(f32), (size_t)cap * dim * sizeof(f32)) != 0
+            || reg_fit_(&t->reg[TQ_R_CSTART], (void **)&t->cstart, (size_t)(nc + 1) * sizeof(i32), (size_t)(cap + 1) * sizeof(i32)) != 0
+            || (t->csize && reg_fit_(&t->reg[TQ_R_CSIZE], (void **)&t->csize, (size_t)nc * sizeof(i32), (size_t)cap * sizeof(i32)) != 0)
+            || (t->xhead && (reg_fit_(&t->reg[TQ_R_XHEAD], (void **)&t->xhead, (size_t)nc * sizeof(i32), (size_t)cap * sizeof(i32)) != 0
+                             || reg_fit_(&t->reg[TQ_R_XTAIL], (void **)&t->xtail, (size_t)nc * sizeof(i32), (size_t)cap * sizeof(i32)) != 0))) return -1;
+        t->ccap = cap;
+        if (t->mapped) t->cent_own = 1;                           /* (off the file mapping: tq_ram_ counts them) */
     }
-    t->cent = ce; t->cstart = cs;
-    cs[nc + 1] = cs[nc];                                         /* no built blocks: only extra ones */
-    if (t->csize && !(sz = (i32 *)realloc(t->csize, (size_t)(nc + 1) * sizeof(i32)))) return -1;
-    if (sz) { t->csize = sz; sz[nc] = 0; }
-    if (t->xhead) {
-        if (!(xh = (i32 *)realloc(t->xhead, (size_t)(nc + 1) * sizeof(i32)))) return -1;
-        t->xhead = xh;
-        if (!(xt = (i32 *)realloc(t->xtail, (size_t)(nc + 1) * sizeof(i32)))) return -1;
-        t->xtail = xt;
-        xh[nc] = xt[nc] = -1;
+    if (t->mapped && !t->slot_own) {                             /* the slots will change too: off the mapping */
+        if (reg_fit_(&t->reg[TQ_R_SLOT], (void **)&t->slot_row, (size_t)t->nblk * 32 * sizeof(i32), (size_t)(t->nblk ? t->nblk : 1) * 32 * sizeof(i32)) != 0) return -1;
+        t->slot_own = 1;
     }
+    t->cstart[nc + 1] = t->cstart[nc];                           /* no built blocks: only extra ones */
+    if (t->csize) t->csize[nc] = 0;
+    if (t->xhead) t->xhead[nc] = t->xtail[nc] = -1;
     t->nc = nc + 1;
     return 0;
 }
@@ -111,8 +101,11 @@ static i32 tq_grow_nc_(Tq *t)
 static i32 tq_near_c_(const Tq *t, const f32 *v, i32 a, i32 b, i32 n, i32 *out)
 {
     i32 c, m = 0, z;
-    f32 *sc = (f32 *)malloc((size_t)(n > 0 ? n : 1) * sizeof(f32));
-    for (c = 0; c < t->nc; ++c) {
+    Gen g;
+    f32 *sc;
+    gen_init_(&g);
+    sc = (f32 *)gen_alloc_(&g, (size_t)(n > 0 ? n : 1) * sizeof(f32));
+    for (c = 0; sc && c < t->nc; ++c) {
         f32 d;
         if (c == a || c == b) continue;
         d = vs_dot(v, t->cent + (size_t)c * t->dim, t->dim);
@@ -120,7 +113,7 @@ static i32 tq_near_c_(const Tq *t, const f32 *v, i32 a, i32 b, i32 n, i32 *out)
         for (z = m < n ? m++ : n - 1; z > 0 && sc[z - 1] < d; --z) { sc[z] = sc[z - 1]; out[z] = out[z - 1]; }
         sc[z] = d; out[z] = c;
     }
-    free(sc);
+    gen_free_(&g);
     return m;
 }
 
@@ -145,16 +138,19 @@ static i32 tq_split_(Tq *t, i32 c, const TqCol *rows, const u64 *dead)
 {
     i32 dim = t->dim, m, i, it, d, nn, moved = 0, near[TQ_SPLIT_NEAR], nnear, j, *side;
     TqMem *mem;
-    f32 *x, *ca, *cb, *rb = (f32 *)malloc((size_t)dim * sizeof(f32));
-    u8 *cd = (u8 *)malloc((size_t)t->vd + 16), *c1 = (u8 *)malloc((size_t)(t->vd1 > 0 ? t->vd1 : 1) + 16);
-    if (!rb || !cd || !c1) { free(rb); free(cd); free(c1); return -1; }
+    f32 *x, *ca, *cb, *rb;
+    u8 *cd, *c1;
+    Gen tmp;                                                     /* the split's working arrays */
     m = tq_members_(t, c, dead, (TqMem *)0);
-    if (m < 64) { free(rb); free(cd); free(c1); return -1; }
-    mem = (TqMem *)malloc((size_t)m * sizeof(TqMem));
-    x = (f32 *)malloc((size_t)m * dim * sizeof(f32));
-    side = (i32 *)malloc((size_t)m * sizeof(i32));
-    ca = (f32 *)malloc((size_t)dim * 2 * sizeof(f32)); cb = ca ? ca + dim : (f32 *)0;
-    if (!mem || !x || !side || !ca) { free(rb); free(cd); free(c1); free(mem); free(x); free(side); free(ca); return -1; }
+    if (m < 64) return -1;
+    gen_init_(&tmp);
+    rb = (f32 *)gen_alloc_(&tmp, (size_t)dim * sizeof(f32));
+    cd = (u8 *)gen_alloc_(&tmp, (size_t)t->vd + 16); c1 = (u8 *)gen_alloc_(&tmp, (size_t)(t->vd1 > 0 ? t->vd1 : 1) + 16);
+    mem = (TqMem *)gen_alloc_(&tmp, (size_t)m * sizeof(TqMem));
+    x = (f32 *)gen_alloc_(&tmp, (size_t)m * dim * sizeof(f32));
+    side = (i32 *)gen_alloc_(&tmp, (size_t)m * sizeof(i32));
+    ca = (f32 *)gen_alloc_(&tmp, (size_t)dim * 2 * sizeof(f32)); cb = ca ? ca + dim : (f32 *)0;
+    if (!rb || !cd || !c1 || !mem || !x || !side || !ca) { gen_free_(&tmp); return -1; }
     tq_members_(t, c, dead, mem);
     for (i = 0; i < m; ++i) {
         const f32 *v = tq_row_(rows, mem[i].row, rb);
@@ -175,7 +171,7 @@ static i32 tq_split_(Tq *t, i32 c, const TqCol *rows, const u64 *dead)
         tq_unit_(ca, dim); tq_unit_(cb, dim);
     }
     for (i = 0, j = 0; i < m; ++i) j += side[i];
-    if (j == 0 || j == m || tq_grow_nc_(t) != 0) { free(rb); free(cd); free(c1); free(mem); free(x); free(side); free(ca); return -1; }
+    if (j == 0 || j == m || tq_grow_nc_(t) != 0) { gen_free_(&tmp); return -1; }
     nn = t->nc - 1;
     nnear = tq_near_c_(t, t->cent + (size_t)c * dim, c, nn, TQ_SPLIT_NEAR, near);   /* around the old centroid */
     memcpy(t->cent + (size_t)c * dim, ca, (size_t)dim * sizeof(f32));
@@ -189,7 +185,7 @@ static i32 tq_split_(Tq *t, i32 c, const TqCol *rows, const u64 *dead)
     }
     for (j = 0; j < nnear; ++j) {                                /* the neighbours' rows nearer one of the halves */
         i32 g = near[j], mg = tq_members_(t, g, dead, (TqMem *)0), q;
-        TqMem *gm = mg >= 0 ? (TqMem *)malloc((size_t)(mg > 0 ? mg : 1) * sizeof(TqMem)) : (TqMem *)0;
+        TqMem *gm = mg >= 0 ? (TqMem *)gen_alloc_(&tmp, (size_t)(mg > 0 ? mg : 1) * sizeof(TqMem)) : (TqMem *)0;
         if (!gm) break;
         tq_members_(t, g, dead, gm);
         for (q = 0; q < mg; ++q) {
@@ -197,11 +193,10 @@ static i32 tq_split_(Tq *t, i32 c, const TqCol *rows, const u64 *dead)
             f32 own = vs_dot(v, t->cent + (size_t)g * dim, dim), sa = vs_dot(v, ca, dim), sb = vs_dot(v, cb, dim);
             if (sa > own || sb > own) { if (tq_move_(t, gm[q].b, gm[q].k, g, sa >= sb ? c : nn, cd, c1) != 0) break; ++moved; }
         }
-        free(gm);
     }
     tq_top_add_(t, nn);                                          /* (c keeps its top cell: its centroid moved a little) */
     ++t->nsplit;
-    free(rb); free(cd); free(c1); free(mem); free(x); free(side); free(ca);
+    gen_free_(&tmp);
     return moved;
 }
 
@@ -219,9 +214,8 @@ i32 tq_split_big(Tq *t, const TqCol *rows, const u64 *dead, i32 limit, i32 maxn)
         if (tq_split_(t, c, rows, dead) >= 0) ++done;
     }
     if (done) {
-        f32 *ct = tq_transpose_(t->cent, t->nc, t->dim);
-        if (ct) { free(t->ct); t->ct = ct; }
-        free(t->c8); free(t->c8b); free(t->c8s); t->c8 = (i8 *)0; t->c8b = (i32 *)0; t->c8s = (f32 *)0;
+        tq_tab_reset_(t);                                        /* the probe tables, from the new centroids */
+        t->ct = tq_transpose_(&t->tab, t->cent, t->nc, t->dim);
         tq_c8_(t);
         {   i32 np = (i32)((f64)t->pnp * (f64)t->nc / (f64)t->pnc + 0.5);
             t->nprobe = np < 1 ? 1 : (np > t->nc ? t->nc : np); }

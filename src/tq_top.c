@@ -21,8 +21,8 @@ static i32 tq_top_want_(i32 np) { i32 w = np * 8; return w < 1024 ? 1024 : w; }
 
 static void tq_top_free_(Tq *t)
 {
-    free(t->top); free(t->tstart); free(t->tlist);
-    t->top = (f32 *)0; t->tstart = (i32 *)0; t->tlist = (i32 *)0; t->nk1 = 0;
+    reg_free_(&t->reg[TQ_R_TLIST]);                              /* (top and tstart stay in the index's arena until it goes) */
+    t->top = (f32 *)0; t->tstart = (i32 *)0; t->tlist = (i32 *)0; t->nk1 = 0; t->tcap = 0;
 }
 
 /* the top cell closest to v */
@@ -40,14 +40,18 @@ static void tq_top_build_(Tq *t)
 {
     i32 nc = t->nc, dim = t->dim, k1, g, c, d, it, *of, *cnt;
     f32 *top, *sum;
+    Gen tmp;
     tq_top_free_(t);
     if (nc < tq_top_min_ || nc < 64) return;
     k1 = (i32)(sqrt((f64)nc) + 0.5);
     if (k1 > TQ_TOP_KMAX) k1 = TQ_TOP_KMAX;
-    top = (f32 *)malloc((size_t)k1 * dim * sizeof(f32)); sum = (f32 *)malloc((size_t)k1 * dim * sizeof(f32));
-    of = (i32 *)malloc((size_t)nc * sizeof(i32)); cnt = (i32 *)malloc((size_t)(k1 + 1) * sizeof(i32));
-    t->tstart = (i32 *)malloc((size_t)(k1 + 1) * sizeof(i32)); t->tlist = (i32 *)malloc((size_t)nc * sizeof(i32));
-    if (!top || !sum || !of || !cnt || !t->tstart || !t->tlist) { free(top); free(sum); free(of); free(cnt); tq_top_free_(t); return; }
+    gen_init_(&tmp);
+    top = (f32 *)gen_alloc_(&t->mem, (size_t)k1 * dim * sizeof(f32)); sum = (f32 *)gen_alloc_(&tmp, (size_t)k1 * dim * sizeof(f32));
+    of = (i32 *)gen_alloc_(&tmp, (size_t)nc * sizeof(i32)); cnt = (i32 *)gen_alloc_(&tmp, (size_t)(k1 + 1) * sizeof(i32));
+    t->tstart = (i32 *)gen_alloc_(&t->mem, (size_t)(k1 + 1) * sizeof(i32));
+    if (!top || !sum || !of || !cnt || !t->tstart
+        || reg_fit_(&t->reg[TQ_R_TLIST], (void **)&t->tlist, 0, (size_t)nc * sizeof(i32)) != 0) { gen_free_(&tmp); tq_top_free_(t); return; }
+    t->tcap = nc;
     for (g = 0; g < k1; ++g)                                     /* the start: every (nc / k1)-th centroid */
         memcpy(top + (size_t)g * dim, t->cent + (size_t)((i64)g * nc / k1) * dim, (size_t)dim * sizeof(f32));
     t->top = top; t->nk1 = k1;
@@ -73,7 +77,7 @@ static void tq_top_build_(Tq *t)
     for (g = 0; g < k1; ++g) t->tstart[g + 1] = t->tstart[g] + cnt[g];
     for (g = 0; g < k1; ++g) cnt[g] = t->tstart[g];
     for (c = 0; c < nc; ++c) t->tlist[cnt[of[c]]++] = c;
-    free(sum); free(of); free(cnt);
+    gen_free_(&tmp);
 }
 
 /* Top cells read from a file: copied in when the lists are whole (starts rising from 0 to nc, every cluster in
@@ -82,15 +86,19 @@ void tq_top_set(Tq *t, i32 k1, const f32 *top, const i32 *ts, const i32 *tl)
 {
     i32 g, i, ok = ts[0] == 0 && ts[k1] == t->nc;
     u8 *seen;
+    Gen tmp;
     tq_top_free_(t);
     for (g = 0; ok && g < k1; ++g) ok = ts[g] <= ts[g + 1];
-    if (!ok || !(seen = (u8 *)calloc((size_t)t->nc, 1))) return;
-    for (i = 0; ok && i < t->nc; ++i) { ok = tl[i] >= 0 && tl[i] < t->nc && !seen[tl[i]]; if (ok) seen[tl[i]] = 1; }
-    free(seen);
     if (!ok) return;
-    t->top = (f32 *)malloc((size_t)k1 * t->dim * sizeof(f32));
-    t->tstart = (i32 *)malloc((size_t)(k1 + 1) * sizeof(i32)); t->tlist = (i32 *)malloc((size_t)t->nc * sizeof(i32));
-    if (!t->top || !t->tstart || !t->tlist) { tq_top_free_(t); return; }
+    gen_init_(&tmp);
+    if (!(seen = (u8 *)gen_alloc_(&tmp, (size_t)t->nc))) { gen_free_(&tmp); return; }
+    for (i = 0; ok && i < t->nc; ++i) { ok = tl[i] >= 0 && tl[i] < t->nc && !seen[tl[i]]; if (ok) seen[tl[i]] = 1; }
+    gen_free_(&tmp);
+    if (!ok) return;
+    t->top = (f32 *)gen_alloc_(&t->mem, (size_t)k1 * t->dim * sizeof(f32));
+    t->tstart = (i32 *)gen_alloc_(&t->mem, (size_t)(k1 + 1) * sizeof(i32));
+    if (!t->top || !t->tstart || reg_fit_(&t->reg[TQ_R_TLIST], (void **)&t->tlist, 0, (size_t)t->nc * sizeof(i32)) != 0) { tq_top_free_(t); return; }
+    t->tcap = t->nc;
     memcpy(t->top, top, (size_t)k1 * t->dim * sizeof(f32));
     memcpy(t->tstart, ts, (size_t)(k1 + 1) * sizeof(i32)); memcpy(t->tlist, tl, (size_t)t->nc * sizeof(i32));
     t->nk1 = k1;
@@ -101,8 +109,12 @@ static void tq_top_add_(Tq *t, i32 c)
 {
     i32 g, i, *tl;
     if (!t->top) return;
-    if (!(tl = (i32 *)realloc(t->tlist, (size_t)t->nc * sizeof(i32)))) { tq_top_free_(t); return; }
-    t->tlist = tl;
+    if (t->tcap < t->nc) {                                       /* room for half as many again */
+        i32 cap = t->nc + t->nc / 2 + 16;
+        if (reg_fit_(&t->reg[TQ_R_TLIST], (void **)&t->tlist, (size_t)(t->nc - 1) * sizeof(i32), (size_t)cap * sizeof(i32)) != 0) { tq_top_free_(t); return; }
+        t->tcap = cap;
+    }
+    tl = t->tlist;
     g = tq_top_near_(t, t->cent + (size_t)c * t->dim);
     for (i = t->tstart[t->nk1]; i > t->tstart[g + 1]; --i) tl[i] = tl[i - 1];
     tl[t->tstart[g + 1]] = c;

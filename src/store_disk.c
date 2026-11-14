@@ -789,16 +789,14 @@ void store_snapshot_info(RagStore *s, i32 *running, i32 *last, i64 *us)
     }
 }
 
-/* n elements of esz bytes at byte offset off: a pointer into the mapping when there is one (no copy), else
- * read (and byte-swapped on a big-endian host) into malloc'd memory. NULL when the range is not inside the file. */
-static void *store_take_(u8 *map, size_t len, FILE *f, size_t off, size_t esz, size_t n)
+/* store_take_ for an index: what is not mapped is read into arena g and goes when the arena does */
+static void *store_take_g_(Gen *g, u8 *map, size_t len, FILE *f, size_t off, size_t esz, size_t n)
 {
     void *p;
     if (off > len || esz * n > len - off) return (void *)0;
     if (map) return (void *)(map + off);
-    p = malloc(esz * (n ? n : 1));
-    if (!p) return (void *)0;
-    if (fseeko(f, (off_t)off, SEEK_SET) != 0 || (n && engs_rle_(f, p, esz, n))) { free(p); return (void *)0; }
+    if (!(p = gen_alloc_(g, esz * (n ? n : 1)))) return (void *)0;
+    if (fseeko(f, (off_t)off, SEEK_SET) != 0 || (n && engs_rle_(f, p, esz, n))) return (void *)0;
     return p;
 }
 
@@ -846,47 +844,44 @@ static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows, const
     size_t o = STORE_AL(off);
     i32 *hp;
     if (vz && ssum_vouch_(vz, path, ro, (u64)o, 32)) return (Tq *)0;
-    hp = (i32 *)store_take_(map, len, f, o, 4, 8);
-    if (!hp) return (Tq *)0;
+    if (!(t = tq_new_())) return (Tq *)0;                         /* what is read rather than mapped goes into its arena */
+    hp = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, 8);
+    if (!hp) { tq_free(t); return (Tq *)0; }
     memcpy(h, hp, sizeof(h));
-    if (!map) free(hp);
-    if (h[0] <= 0 || h[1] < h[0] || h[2] != rows || h[3] < 0 || h[4] < 0) return (Tq *)0;
-    t = (Tq *)calloc(1, sizeof(Tq));
+    if (h[0] <= 0 || h[1] < h[0] || h[2] != rows || h[3] < 0 || h[4] < 0) { tq_free(t); return (Tq *)0; }
     t->dim = h[0]; t->dpad = h[1]; t->n = h[2]; t->nblk = h[3]; t->nc = h[4]; t->nprobe = h[5];
     t->nbuilt = t->n;                                            /* growth counts from the load (fit0: on first add) */
     t->bits = h[7] == 2 || h[7] == 1 ? h[7] : 4; t->vd = tq_vd_(t->dpad, t->bits);
     t->mapped = map != (u8 *)0;
     o = STORE_AL(o + 32);
-    t->s1 = (f32 *)store_take_(map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
-    t->s2 = (f32 *)store_take_(map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
-    t->perm = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
+    t->s1 = (f32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
+    t->s2 = (f32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
+    t->perm = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
     if (t->nc > 1) {
-        t->cent = (f32 *)store_take_(map, len, f, o, 4, (size_t)t->nc * (size_t)t->dim);
+        t->cent = (f32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->nc * (size_t)t->dim);
         o = STORE_AL(o + (size_t)t->nc * (size_t)t->dim * 4);
-        t->cstart = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nc + 1);
+        t->cstart = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->nc + 1);
         o = STORE_AL(o + ((size_t)t->nc + 1) * 4);
     }
     if (t->nc > 1 && (h[6] & 2)) {                               /* the top cells, copied out: tq_top.c owns and grows them */
-        i32 *k1 = (i32 *)store_take_(map, len, f, o, 4, 1), nk1 = k1 ? *k1 : 0;
-        if (k1 && !map) free(k1);
+        i32 *k1 = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, 1), nk1 = k1 ? *k1 : 0;
         o = STORE_AL(o + 4);
         if (nk1 >= 1 && nk1 <= TQ_TOP_KMAX) {
-            f32 *tp = (f32 *)store_take_(map, len, f, o, 4, (size_t)nk1 * (size_t)t->dim);
+            f32 *tp = (f32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)nk1 * (size_t)t->dim);
             i32 *ts, *tl;
             o = STORE_AL(o + (size_t)nk1 * (size_t)t->dim * 4);
-            ts = (i32 *)store_take_(map, len, f, o, 4, (size_t)nk1 + 1); o = STORE_AL(o + ((size_t)nk1 + 1) * 4);
-            tl = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nc); o = STORE_AL(o + (size_t)t->nc * 4);
+            ts = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)nk1 + 1); o = STORE_AL(o + ((size_t)nk1 + 1) * 4);
+            tl = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->nc); o = STORE_AL(o + (size_t)t->nc * 4);
             if (tp && ts && tl) tq_top_set(t, nk1, tp, ts, tl);  /* (lists that do not hold every cluster once: built again) */
-            if (!map) { free(tp); free(ts); free(tl); }
         } else { tq_free(t); return (Tq *)0; }
     }
     if (vz && ssum_vouch_(vz, path, ro, (u64)STORE_AL(off), (u64)(o - STORE_AL(off)))) { tq_free(t); return (Tq *)0; }
-    if (h[6] & 1) { t->slot_row = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nblk * 32); o = STORE_AL(o + (size_t)t->nblk * 128); }
-    t->codes = (u8 *)store_take_(map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd * 16);
+    if (h[6] & 1) { t->slot_row = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->nblk * 32); o = STORE_AL(o + (size_t)t->nblk * 128); }
+    t->codes = (u8 *)store_take_g_(&t->mem, map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd * 16);
     if (h[7] == 5 && t->codes) {                                 /* the cascade's 1-bit codes follow */
         o = STORE_AL(o + (size_t)t->nblk * (size_t)t->vd * 16);
         t->vd1 = tq_vd_(t->dpad, 1);
-        t->codes1 = (u8 *)store_take_(map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd1 * 16);
+        t->codes1 = (u8 *)store_take_g_(&t->mem, map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd1 * 16);
         t->c1_own = !map;
     }
     if (!t->s1 || !t->s2 || !t->perm || (t->nc > 1 && (!t->cent || !t->cstart)) || ((h[6] & 1) && !t->slot_row) || !t->codes

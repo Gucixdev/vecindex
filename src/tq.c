@@ -36,6 +36,7 @@
 
 #include "base.h"
 #include "vsimd.h"
+#include "mem.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -86,6 +87,9 @@ static const f32 *tq_row_(const TqCol *c, i64 r, f32 *buf)
     vs_i8_scale(buf, (const i8 *)(const void *)TQ_AT(c, r), c->dim, *(const f32 *)(const void *)TQ_AT(c->scale, r));
     return buf;
 }
+
+enum { TQ_R_XCODES, TQ_R_XSLOT, TQ_R_XNEXT, TQ_R_XCODES1, TQ_R_CODES1, TQ_R_CENT, TQ_R_CSTART, TQ_R_CSIZE,
+       TQ_R_XHEAD, TQ_R_XTAIL, TQ_R_TLIST, TQ_R_SLOT, TQ_NREG };
 
 typedef struct {
     i32   dim, dpad, n, nblk;
@@ -142,6 +146,11 @@ typedef struct {
     f32  *top;              /* [nk1 * dim] top cells, unit */
     i32  *tstart, *tlist;   /* cell g holds the clusters tlist[tstart[g] .. tstart[g + 1]) */
     i32   nk1;
+    /* memory (mem.h): no array of an index is freed by itself */
+    Gen   mem;              /* what lives as long as the index: rotation, codes, slots, a build's centroids */
+    Gen   tab;              /* the probe tables (ct, c8, c8b, c8s), made again as a whole when clusters split */
+    Reg   reg[TQ_NREG];     /* the arrays that grow while the index is searched (tq_add.c, tq_split.c) */
+    i32   ccap, tcap;       /* clusters the per-cluster regions have room for; entries tlist has room for */
 } Tq;
 
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512F__)
@@ -321,10 +330,24 @@ static void tq_encode_row_(const Tq *t, const f32 *rot, u8 *cd)
 
 /* ---- centroid scoring: 16 centroids per step, centroids transposed in groups ([dim][16] per group) ---- */
 
-static f32 *tq_transpose_(const f32 *cent, i32 nc, i32 dim)
+static size_t tq_transpose_bytes_(i32 nc, i32 dim) { i32 ng = (nc + 15) / 16; return (size_t)(ng ? ng : 1) * (size_t)dim * 16 * sizeof(f32); }
+
+/* into ct, a buffer of tq_transpose_bytes_ (a loop transposes into the same one every round) */
+static void tq_transpose_to_(f32 *ct, const f32 *cent, i32 nc, i32 dim)
 {
     i32 ng = (nc + 15) / 16, g, d, l;
-    f32 *ct = (f32 *)calloc((size_t)(ng ? ng : 1) * (size_t)dim * 16, sizeof(f32));
+    memset(ct, 0, tq_transpose_bytes_(nc, dim));
+    for (g = 0; g < ng; ++g)
+        for (l = 0; l < 16 && g * 16 + l < nc; ++l)
+            for (d = 0; d < dim; ++d) ct[((size_t)g * dim + (size_t)d) * 16 + (size_t)l] = cent[(size_t)(g * 16 + l) * dim + (size_t)d];
+}
+
+/* a fresh one from arena g; NULL when there is no memory */
+static f32 *tq_transpose_(Gen *g_, const f32 *cent, i32 nc, i32 dim)
+{
+    i32 ng = (nc + 15) / 16, g, d, l;
+    f32 *ct = (f32 *)gen_alloc_(g_, tq_transpose_bytes_(nc, dim));
+    if (!ct) return ct;
     for (g = 0; g < ng; ++g)
         for (l = 0; l < 16 && g * 16 + l < nc; ++l)
             for (d = 0; d < dim; ++d) ct[((size_t)g * dim + (size_t)d) * 16 + (size_t)l] = cent[(size_t)(g * 16 + l) * dim + (size_t)d];
@@ -596,18 +619,21 @@ typedef struct { const f32 *x; const f32 *ct; i32 dim, nc; i32 *asg; f32 *sum; i
 static void tq_km_asg_(void *p, i64 a, i64 b, i32 tid)
 {
     TqKm *k = (TqKm *)p;
-    f32 *sc = (f32 *)malloc((size_t)((k->nc + 15) / 16) * 64 * sizeof(f32));
+    Gen g;
+    f32 *sc;
     f32 *sum = k->sum ? k->sum + (size_t)tid * k->nc * k->dim : (f32 *)0;
     i32 *cnt = k->cnt ? k->cnt + (size_t)tid * k->nc : (i32 *)0;
     i64 i;
-    for (i = a; i < b; i += 4) {
+    gen_init_(&g);
+    sc = (f32 *)gen_alloc_(&g, (size_t)((k->nc + 15) / 16) * 64 * sizeof(f32));
+    for (i = a; sc && i < b; i += 4) {
         const f32 *v[4];
         i32 m = b - i < 4 ? (i32)(b - i) : 4, r;
         for (r = 0; r < m; ++r) v[r] = k->x + (size_t)(i + r) * k->dim;
         tq_nearest4_(v, m, k->ct, k->nc, k->dim, sc, k->asg + i);
         if (sum) for (r = 0; r < m; ++r) { i32 c = k->asg[i + r]; tq_acc_(sum + (size_t)c * k->dim, v[r], k->dim); ++cnt[c]; }
     }
-    free(sc);
+    gen_free_(&g);
 }
 
 /* nc unit centroids of the m rows of x into cent[nc x dim]; asg (optional, [m]) gets the final assignment. Every
@@ -615,22 +641,26 @@ static void tq_km_asg_(void *p, i64 a, i64 b, i32 tid)
 static void tq_kmeans_(const f32 *x, i32 m, i32 dim, i32 nc, u32 *rng, f32 *cent, i32 *asg_out, i32 nth)
 {
     i32 nt = nth < 1 ? 1 : (nth > 64 ? 64 : nth), c, it;
-    f32 *sum = (f32 *)malloc((size_t)nt * (size_t)nc * (size_t)dim * sizeof(f32));
-    i32 *asg = asg_out ? asg_out : (i32 *)malloc((size_t)m * sizeof(i32)), *cnt = (i32 *)malloc((size_t)nt * (size_t)nc * sizeof(i32));
+    Gen g;
+    f32 *sum, *ct;
+    i32 *asg, *cnt;
     TqKm k;
+    gen_init_(&g);
+    sum = (f32 *)gen_alloc_(&g, (size_t)nt * (size_t)nc * (size_t)dim * sizeof(f32));
+    asg = asg_out ? asg_out : (i32 *)gen_alloc_(&g, (size_t)m * sizeof(i32)); cnt = (i32 *)gen_alloc_(&g, (size_t)nt * (size_t)nc * sizeof(i32));
+    ct = (f32 *)gen_alloc_(&g, tq_transpose_bytes_(nc, dim));
+    if (!sum || !asg || !cnt || !ct) { gen_free_(&g); return; }   /* no memory: cent as it came */
     for (c = 0; c < nc; ++c) memcpy(cent + (size_t)c * dim, x + (size_t)((i64)m * c / nc + (tq_rng_(rng) % (u32)(m / nc > 0 ? m / nc : 1))) * dim, (size_t)dim * sizeof(f32));
     k.x = x; k.dim = dim; k.nc = nc; k.asg = asg; k.sum = sum; k.cnt = cnt;
     for (it = 0; it < 8; ++it) {
         memset(sum, 0, (size_t)nt * (size_t)nc * (size_t)dim * sizeof(f32)); memset(cnt, 0, (size_t)nt * (size_t)nc * sizeof(i32));
-        k.ct = tq_transpose_(cent, nc, dim);
+        tq_transpose_to_(ct, cent, nc, dim); k.ct = ct;
         tq_par_(tq_km_asg_, &k, m, nt);
-        free((void *)k.ct);
         tq_fold_(sum, cnt, nc, dim, nt);
         tq_update_(cent, sum, cnt, nc, dim, x, m, rng);            /* an empty cluster is reseeded on a random row */
     }
-    if (asg_out) { k.sum = (f32 *)0; k.cnt = (i32 *)0; k.ct = tq_transpose_(cent, nc, dim); tq_par_(tq_km_asg_, &k, m, nt); free((void *)k.ct); }
-    free(sum); free(cnt);
-    if (!asg_out) free(asg);
+    if (asg_out) { k.sum = (f32 *)0; k.cnt = (i32 *)0; tq_transpose_to_(ct, cent, nc, dim); k.ct = ct; tq_par_(tq_km_asg_, &k, m, nt); }
+    gen_free_(&g);
 }
 
 /* ---- spherical e-means: the same job as tq_kmeans_ in fewer passes ----
@@ -786,10 +816,16 @@ static void tq_emeans_(const f32 *x, i32 m, i32 dim, i32 nc, u32 *rng, f32 *cent
     i32 nt = nth < 1 ? 1 : (nth > 64 ? 64 : nth), B, c, d, ep, nep, *perm, *asg, *cnt, revive = dim > 2;
     i64 total = 0, step = 0, rows_ep[64];
     f64 a0, *psum, *pcnt;
-    f32 *pos = (f32 *)malloc((size_t)nc * (size_t)dim * sizeof(f32)), *unit = (f32 *)malloc((size_t)nc * (size_t)dim * sizeof(f32));
-    f32 *mass = (f32 *)malloc((size_t)nc * sizeof(f32)), *xb, *sum;
-    TqEmKey *key = (TqEmKey *)malloc((size_t)nc * sizeof(TqEmKey));
+    Gen g;
+    f32 *pos, *unit, *mass, *xb, *sum, *ct;
+    TqEmKey *key;
     TqKm k;
+    gen_init_(&g);
+    pos = (f32 *)gen_alloc_(&g, (size_t)nc * (size_t)dim * sizeof(f32)); unit = (f32 *)gen_alloc_(&g, (size_t)nc * (size_t)dim * sizeof(f32));
+    mass = (f32 *)gen_alloc_(&g, (size_t)nc * sizeof(f32));
+    key = (TqEmKey *)gen_alloc_(&g, (size_t)nc * sizeof(TqEmKey));
+    ct = (f32 *)gen_alloc_(&g, tq_transpose_bytes_(nc, dim));
+    if (!pos || !unit || !mass || !key || !ct) { gen_free_(&g); return; }   /* no memory: cent as it came */
     if (T <= 0.0) T = TQ_EM_EPOCHS;
     if (T > 60.0) T = 60.0;
     tq_em_recipe_(m, nc, T, dim, &B, &a0);
@@ -797,10 +833,11 @@ static void tq_emeans_(const f32 *x, i32 m, i32 dim, i32 nc, u32 *rng, f32 *cent
     for (ep = 0; ep < nep; ++ep) total += (rows_ep[ep] + B - 1) / B;
     for (c = 0; c < nc; ++c) memcpy(pos + (size_t)c * dim, x + (size_t)((i64)m * c / nc + (tq_rng_(rng) % (u32)(m / nc > 0 ? m / nc : 1))) * dim, (size_t)dim * sizeof(f32));
     for (c = 0; c < nc; ++c) mass[c] = TQ_EM_INIT_MASS;
-    perm = (i32 *)malloc((size_t)m * sizeof(i32)); asg = (i32 *)malloc((size_t)B * sizeof(i32));
-    xb = (f32 *)malloc((size_t)B * (size_t)dim * sizeof(f32));
-    sum = (f32 *)malloc((size_t)nt * (size_t)nc * (size_t)dim * sizeof(f32)); cnt = (i32 *)malloc((size_t)nt * (size_t)nc * sizeof(i32));
-    psum = (f64 *)calloc((size_t)nc * (size_t)dim, sizeof(f64)); pcnt = (f64 *)calloc((size_t)nc, sizeof(f64));
+    perm = (i32 *)gen_alloc_(&g, (size_t)m * sizeof(i32)); asg = (i32 *)gen_alloc_(&g, (size_t)B * sizeof(i32));
+    xb = (f32 *)gen_alloc_(&g, (size_t)B * (size_t)dim * sizeof(f32));
+    sum = (f32 *)gen_alloc_(&g, (size_t)nt * (size_t)nc * (size_t)dim * sizeof(f32)); cnt = (i32 *)gen_alloc_(&g, (size_t)nt * (size_t)nc * sizeof(i32));
+    psum = (f64 *)gen_alloc_(&g, (size_t)nc * (size_t)dim * sizeof(f64)); pcnt = (f64 *)gen_alloc_(&g, (size_t)nc * sizeof(f64));
+    if (!perm || !asg || !xb || !sum || !cnt || !psum || !pcnt) { gen_free_(&g); return; }
     k.dim = dim; k.nc = nc; k.asg = asg; k.sum = sum; k.cnt = cnt; k.x = xb;
     for (ep = 0; ep < nep; ++ep) {
         i32 i, last = ep == nep - 1;
@@ -813,9 +850,8 @@ static void tq_emeans_(const f32 *x, i32 m, i32 dim, i32 nc, u32 *rng, f32 *cent
             for (i = 0; i < bn; ++i) memcpy(xb + (size_t)i * dim, x + (size_t)perm[b0 + i] * dim, (size_t)dim * sizeof(f32));
             memset(sum, 0, (size_t)nt * (size_t)nc * (size_t)dim * sizeof(f32)); memset(cnt, 0, (size_t)nt * (size_t)nc * sizeof(i32));
             tq_em_unit_(pos, nc, dim, unit);                     /* every use sees the centroids at norm 1 */
-            k.ct = tq_transpose_(unit, nc, dim);
+            tq_transpose_to_(ct, unit, nc, dim); k.ct = ct;
             tq_par_(tq_km_asg_, &k, bn, nt);
-            free((void *)k.ct);
             tq_fold_(sum, cnt, nc, dim, nt);
             tq_em_update_(pos, mass, sum, cnt, nc, dim, a, last ? psum : (f64 *)0, pcnt);
             if (revive && (step + 1) % TQ_EM_REVIVE_EVERY == 0) tq_em_revive_(pos, mass, nc, dim, rng, key);
@@ -824,12 +860,11 @@ static void tq_emeans_(const f32 *x, i32 m, i32 dim, i32 nc, u32 *rng, f32 *cent
     for (c = 0; c < nc; ++c) if (pcnt[c] > 0.0)               /* the closing means: the last pass's exact averages */
         for (d = 0; d < dim; ++d) pos[(size_t)c * dim + d] = (f32)(psum[(size_t)c * dim + d] / pcnt[c]);
     tq_em_unit_(pos, nc, dim, cent);
-    free(xb); free(asg); free(perm); free(psum); free(pcnt);
     if (asg_out) {
-        k.x = x; k.asg = asg_out; k.sum = (f32 *)0; k.cnt = (i32 *)0; k.ct = tq_transpose_(cent, nc, dim);
-        tq_par_(tq_km_asg_, &k, m, nt); free((void *)k.ct);
+        k.x = x; k.asg = asg_out; k.sum = (f32 *)0; k.cnt = (i32 *)0; tq_transpose_to_(ct, cent, nc, dim); k.ct = ct;
+        tq_par_(tq_km_asg_, &k, m, nt);
     }
-    free(sum); free(cnt); free(pos); free(unit); free(mass); free(key);
+    gen_free_(&g);
 }
 
 /* the clustering every build uses: e-means by default, Lloyd's 8 rounds with VECINDEX_KMEANS=lloyd; emeans:T sets
@@ -861,6 +896,7 @@ typedef struct {
     f32 **sub_ct;           /* [k1] each cell's centroids, transposed */
     f32 *flat_ct;           /* flat: all centroids transposed */
     i32 T, wide;            /* top cells a row looks in, longest score row */
+    Gen g;                  /* everything above: freed as one (tq_clus_free_) */
 } TqClus;
 
 #define TQ_TMAX 4           /* top cells a row looks in (2 above 128 top cells: past ~16M rows, where each one costs more) */
@@ -868,13 +904,7 @@ typedef struct {
 #define TQ_POLISH 1         /* Lloyd rounds over the whole sample after the per-cell k-means */
 #define TQ_ABATCH 1024      /* rows assigned per batch */
 
-static void tq_clus_free_(TqClus *cl)
-{
-    i32 j;
-    free(cl->top_ct); free(cl->flat_ct); free(cl->sub0); free(cl->subn);
-    if (cl->sub_ct) for (j = 0; j < cl->k1; ++j) free(cl->sub_ct[j]);
-    free(cl->sub_ct);
-}
+static void tq_clus_free_(TqClus *cl) { gen_free_(&cl->g); }
 
 /* the n largest of sc[0..cnt) into out[n] as indices, best first (n <= cnt): n vector argmax passes, each pick then
  * knocked out of sc (sc is scratch) */
@@ -939,34 +969,39 @@ static void tq_pol_rows_(void *p, i64 a, i64 b, i32 tid)
 {
     TqPolJob *j = (TqPolJob *)p;
     i32 dim = j->cl->dim, nc = j->cl->nc;
-    u8 *w = (u8 *)malloc(tq_asg_scr_(j->cl));
+    Gen g;
+    u8 *w;
     f32 *sum = j->sum + (size_t)tid * nc * dim;
     i32 *cnt = j->cnt + (size_t)tid * nc;
     i64 i;
-    for (i = a; i < b; i += TQ_ABATCH) {
+    gen_init_(&g);
+    w = (u8 *)gen_alloc_(&g, tq_asg_scr_(j->cl));
+    for (i = a; w && i < b; i += TQ_ABATCH) {
         i32 m = b - i < TQ_ABATCH ? (i32)(b - i) : TQ_ABATCH, r;
         tq_asg_core_(j->cl, j->x + (size_t)i * dim, m, j->asg + i, w);
         for (r = 0; r < m; ++r) { i32 c = j->asg[i + r]; tq_acc_(sum + (size_t)c * dim, j->x + (size_t)(i + r) * dim, dim); ++cnt[c]; }
     }
-    free(w);
+    gen_free_(&g);
 }
 
 static void tq_clus_polish_(TqClus *cl, const f32 *x, i32 m, i32 rounds, i32 nth)
 {
     i32 dim = cl->dim, nt = nth < 1 ? 1 : (nth > 64 ? 64 : nth), it, j;
     TqPolJob pj;
-    pj.cl = cl; pj.x = x; pj.asg = (i32 *)malloc((size_t)m * sizeof(i32));
-    pj.sum = (f32 *)malloc((size_t)nt * (size_t)cl->nc * (size_t)dim * sizeof(f32));
-    pj.cnt = (i32 *)malloc((size_t)nt * (size_t)cl->nc * sizeof(i32));
-    for (it = 0; it < rounds; ++it) {
+    Gen g;
+    gen_init_(&g);
+    pj.cl = cl; pj.x = x; pj.asg = (i32 *)gen_alloc_(&g, (size_t)m * sizeof(i32));
+    pj.sum = (f32 *)gen_alloc_(&g, (size_t)nt * (size_t)cl->nc * (size_t)dim * sizeof(f32));
+    pj.cnt = (i32 *)gen_alloc_(&g, (size_t)nt * (size_t)cl->nc * sizeof(i32));
+    for (it = 0; pj.asg && pj.sum && pj.cnt && it < rounds; ++it) {
         memset(pj.sum, 0, (size_t)nt * (size_t)cl->nc * (size_t)dim * sizeof(f32)); memset(pj.cnt, 0, (size_t)nt * (size_t)cl->nc * sizeof(i32));
         tq_par_(tq_pol_rows_, &pj, m, nt);
         tq_fold_(pj.sum, pj.cnt, cl->nc, dim, nt);
         tq_update_(cl->cent, pj.sum, pj.cnt, cl->nc, dim, x, m, (u32 *)0);   /* an empty one keeps its place */
-        if (cl->k1) for (j = 0; j < cl->k1; ++j) { free(cl->sub_ct[j]); cl->sub_ct[j] = tq_transpose_(cl->cent + (size_t)cl->sub0[j] * dim, cl->subn[j], dim); }
-        else { free(cl->flat_ct); cl->flat_ct = tq_transpose_(cl->cent, cl->nc, dim); }
+        if (cl->k1) for (j = 0; j < cl->k1; ++j) tq_transpose_to_(cl->sub_ct[j], cl->cent + (size_t)cl->sub0[j] * dim, cl->subn[j], dim);   /* in place: the same sizes */
+        else tq_transpose_to_(cl->flat_ct, cl->cent, cl->nc, dim);
     }
-    free(pj.asg); free(pj.sum); free(pj.cnt);
+    gen_free_(&g);
 }
 
 /* the sub-clusters of a cell: its rows side by side (buf: the largest cell), clustered on one thread */
@@ -977,9 +1012,12 @@ static void tq_cell_job_(void *p, i64 a, i64 b, i32 tid)
     TqCellJob *cj = (TqCellJob *)p;
     TqClus *cl = cj->cl;
     i32 dim = cj->dim, j;
-    f32 *buf = (f32 *)malloc((size_t)cj->big * (size_t)dim * sizeof(f32));
+    Gen g;
+    f32 *buf;
     (void)a; (void)b;
-    for (j = tid; j < cj->k1; j += cj->nth) {
+    gen_init_(&g);
+    buf = (f32 *)gen_alloc_(&g, (size_t)cj->big * (size_t)dim * sizeof(f32));
+    for (j = tid; buf && j < cj->k1; j += cj->nth) {
         i32 cn = cj->cnt[j + 1] - cj->cnt[j], z;
         u32 rr = cj->seed ^ ((u32)(j + 1) * 0x9e3779b9u);
         f32 *dst = cl->cent + (size_t)cl->sub0[j] * dim;
@@ -989,9 +1027,9 @@ static void tq_cell_job_(void *p, i64 a, i64 b, i32 tid)
             for (z = 0; z < cn; ++z) memcpy(buf + (size_t)z * dim, cj->x + (size_t)cj->ord[cj->cnt[j] + z] * dim, (size_t)dim * sizeof(f32));
             tq_cluster_(buf, cn, dim, cl->subn[j], &rr, dst, (i32 *)0, 1);
         }
-        cl->sub_ct[j] = tq_transpose_(dst, cl->subn[j], dim);
+        cl->sub_ct[j] = tq_transpose_(&cl->g, dst, cl->subn[j], dim);
     }
-    free(buf);
+    gen_free_(&g);
 }
 
 static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc, u32 seed, i32 nth)
@@ -1000,13 +1038,15 @@ static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc
     i32 m, i;
     f32 *x;
     u32 r = seed ? seed : 99u;
+    Gen g;                                                       /* the sample and the working arrays */
     memset(cl, 0, sizeof(*cl));
+    gen_init_(&cl->g); gen_init_(&g);
     cl->dim = dim;
     m = nc * TQ_SAMPLE_PER > 40000 ? nc * TQ_SAMPLE_PER : 40000;
     if ((size_t)m > cap) m = (i32)cap;
     if (m > n) m = n;
     if (nc > m) nc = m;
-    x = (f32 *)malloc((size_t)m * (size_t)dim * sizeof(f32));
+    x = (f32 *)gen_alloc_(&g, (size_t)m * (size_t)dim * sizeof(f32));
     for (i = 0; i < m; ++i) {                                            /* an even spread of rows */
         f32 *dst = x + (size_t)i * dim;
         const f32 *src = tq_row_(rows, (i64)n * i / m, dst);
@@ -1014,37 +1054,35 @@ static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc
     }
     if (nc <= TQ_FLAT_MAX) {
         cl->nc = nc;
-        cl->cent = (f32 *)malloc((size_t)nc * (size_t)dim * sizeof(f32));
+        cl->cent = (f32 *)gen_alloc_(&cl->g, (size_t)nc * (size_t)dim * sizeof(f32));
         tq_cluster_(x, m, dim, nc, &r, cl->cent, (i32 *)0, nth);
-        cl->flat_ct = tq_transpose_(cl->cent, nc, dim);
+        cl->flat_ct = tq_transpose_(&cl->g, cl->cent, nc, dim);
     } else {
-        i32 k1 = (i32)sqrt((f64)nc), j, tot = 0, *asg = (i32 *)malloc((size_t)m * sizeof(i32)), *cnt, *ord, *at;
+        i32 k1 = (i32)sqrt((f64)nc), j, tot = 0, *asg = (i32 *)gen_alloc_(&g, (size_t)m * sizeof(i32)), *cnt, *ord, *at;
         f64 t0 = tq_now_(), tsub;
-        f32 *top = (f32 *)malloc((size_t)k1 * (size_t)dim * sizeof(f32));
+        f32 *top = (f32 *)gen_alloc_(&g, (size_t)k1 * (size_t)dim * sizeof(f32));
         {   /* the top cells need far fewer rows than the sub-clusters: k-means on every st-th sample row (at most 1024
              * a cell), then one pass puts every sample row in its cell */
             i32 st = m / (k1 * 1024) > 1 ? m / (k1 * 1024) : 1, ms = (m + st - 1) / st;
             if (st == 1) tq_cluster_(x, m, dim, k1, &r, top, asg, nth);
             else {
-                f32 *xs = (f32 *)malloc((size_t)ms * (size_t)dim * sizeof(f32));
+                f32 *xs = (f32 *)gen_alloc_(&g, (size_t)ms * (size_t)dim * sizeof(f32));
                 TqKm k;
                 for (i = 0; i < ms; ++i) memcpy(xs + (size_t)i * dim, x + (size_t)i * st * dim, (size_t)dim * sizeof(f32));
                 tq_cluster_(xs, ms, dim, k1, &r, top, (i32 *)0, nth);
-                free(xs);
-                k.x = x; k.dim = dim; k.nc = k1; k.asg = asg; k.sum = (f32 *)0; k.cnt = (i32 *)0; k.ct = tq_transpose_(top, k1, dim);
+                k.x = x; k.dim = dim; k.nc = k1; k.asg = asg; k.sum = (f32 *)0; k.cnt = (i32 *)0; k.ct = tq_transpose_(&g, top, k1, dim);
                 tq_par_(tq_km_asg_, &k, m, nth);
-                free((void *)k.ct);
             }
         }
         tsub = tq_now_();
-        cnt = (i32 *)calloc((size_t)k1 + 1, sizeof(i32));
+        cnt = (i32 *)gen_alloc_(&g, ((size_t)k1 + 1) * sizeof(i32));
         for (i = 0; i < m; ++i) ++cnt[asg[i] + 1];
         for (j = 0; j < k1; ++j) cnt[j + 1] += cnt[j];                      /* cnt[j] = first member of cell j in ord */
-        ord = (i32 *)malloc((size_t)m * sizeof(i32)); at = (i32 *)malloc((size_t)k1 * sizeof(i32));
+        ord = (i32 *)gen_alloc_(&g, (size_t)m * sizeof(i32)); at = (i32 *)gen_alloc_(&g, (size_t)k1 * sizeof(i32));
         memcpy(at, cnt, (size_t)k1 * sizeof(i32));
         for (i = 0; i < m; ++i) ord[at[asg[i]]++] = i;
         cl->k1 = k1;
-        cl->sub0 = (i32 *)malloc((size_t)k1 * sizeof(i32)); cl->subn = (i32 *)malloc((size_t)k1 * sizeof(i32));
+        cl->sub0 = (i32 *)gen_alloc_(&cl->g, (size_t)k1 * sizeof(i32)); cl->subn = (i32 *)gen_alloc_(&cl->g, (size_t)k1 * sizeof(i32));
         for (j = 0; j < k1; ++j) {                                          /* sub-clusters in proportion to the cell's share */
             i32 cn = cnt[j + 1] - cnt[j], kj = (i32)(((i64)nc * cn + m / 2) / m);
             if (kj < 1) kj = 1;
@@ -1052,8 +1090,8 @@ static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc
             cl->sub0[j] = tot; cl->subn[j] = kj; tot += kj;
         }
         cl->nc = tot;
-        cl->cent = (f32 *)malloc((size_t)tot * (size_t)dim * sizeof(f32));
-        cl->sub_ct = (f32 **)calloc((size_t)k1, sizeof(f32 *));
+        cl->cent = (f32 *)gen_alloc_(&cl->g, (size_t)tot * (size_t)dim * sizeof(f32));
+        cl->sub_ct = (f32 **)gen_alloc_(&cl->g, (size_t)k1 * sizeof(f32 *));
         {   /* the cells are independent: the threads take every nth-th one, each cell with a generator of its own,
              * so the result does not depend on the thread count */
             TqCellJob cj;
@@ -1062,8 +1100,7 @@ static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc
             for (j = 0; j < k1; ++j) if (cnt[j + 1] - cnt[j] > cj.big) cj.big = cnt[j + 1] - cnt[j];
             tq_par2_(tq_cell_job_, &cj, cj.nth, cj.nth);
         }
-        cl->top_ct = tq_transpose_(top, k1, dim);
-        free(top); free(asg); free(cnt); free(ord); free(at);
+        cl->top_ct = tq_transpose_(&cl->g, top, k1, dim);
         if (getenv("TQ_VERBOSE")) fprintf(stderr, "tq_clus_train_: top cells %.2fs, sub-clusters %.2fs\n", tsub - t0, tq_now_() - tsub);
     }
     cl->T = cl->k1 > 128 ? 2 : TQ_TMAX;
@@ -1071,7 +1108,7 @@ static void tq_clus_train_(TqClus *cl, const TqCol *rows, i32 n, i32 dim, i32 nc
     cl->wide = cl->nc;
     if (cl->k1) { i32 j; cl->wide = cl->k1; for (j = 0; j < cl->k1; ++j) if (cl->subn[j] > cl->wide) cl->wide = cl->subn[j]; }
     if (cl->k1) { f64 tp = tq_now_(); tq_clus_polish_(cl, x, m, TQ_POLISH, nth); if (getenv("TQ_VERBOSE")) fprintf(stderr, "tq_clus_train_: polish %.2fs\n", tq_now_() - tp); }
-    free(x);
+    gen_free_(&g);
 }
 
 /* ---- the build ---- */
@@ -1082,10 +1119,14 @@ static void tq_asg_rows_(void *p, i64 a, i64 b, i32 tid)
     TqAsgJob *j = (TqAsgJob *)p;
     const TqClus *cl = j->cl;
     i32 dim = cl->dim, *cnt = j->cnt + (size_t)tid * j->nc;
-    f32 *xb = (f32 *)malloc((size_t)TQ_ABATCH * (size_t)dim * sizeof(f32));
-    u8 *w = (u8 *)malloc(tq_asg_scr_(cl));
+    Gen g;
+    f32 *xb;
+    u8 *w;
     i64 x;
-    for (x = a; x < b; x += TQ_ABATCH) {
+    gen_init_(&g);
+    xb = (f32 *)gen_alloc_(&g, (size_t)TQ_ABATCH * (size_t)dim * sizeof(f32));
+    w = (u8 *)gen_alloc_(&g, tq_asg_scr_(cl));
+    for (x = a; xb && w && x < b; x += TQ_ABATCH) {
         i32 m = b - x < TQ_ABATCH ? (i32)(b - x) : TQ_ABATCH, i;
         for (i = 0; i < m; ++i) {                                /* the batch side by side (int8 rows dequantised) */
             f32 *dst = xb + (size_t)i * dim;
@@ -1095,7 +1136,7 @@ static void tq_asg_rows_(void *p, i64 a, i64 b, i32 tid)
         tq_asg_core_(cl, xb, m, j->asg + x, w);
         for (i = 0; i < m; ++i) ++cnt[j->asg[x + i]];
     }
-    free(xb); free(w);
+    gen_free_(&g);
 }
 
 typedef struct { const TqCol *rows; Tq *t; const i32 *slot; i32 n, nth; } TqEncJob;
@@ -1107,11 +1148,16 @@ static void tq_enc_rows_(void *p, i64 a, i64 b, i32 tid)
     TqEncJob *j = (TqEncJob *)p;
     Tq *t = j->t;
     i64 lo = (i64)t->nblk * tid / j->nth * 32, hi = (i64)t->nblk * (tid + 1) / j->nth * 32, i;
-    f32 *rot = (f32 *)malloc((size_t)t->dpad * sizeof(f32)), *tmp = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
-    f32 *rb = (f32 *)malloc((size_t)t->dim * sizeof(f32));
-    u8 *cd = (u8 *)malloc((size_t)t->dpad + 16);
+    Gen g;
+    f32 *rot, *tmp, *rb;
+    u8 *cd;
     i32 d, vd = t->vd;
     (void)a; (void)b;
+    gen_init_(&g);
+    rot = (f32 *)gen_alloc_(&g, (size_t)t->dpad * sizeof(f32)); tmp = (f32 *)gen_alloc_(&g, (size_t)t->dpad * sizeof(f32));
+    rb = (f32 *)gen_alloc_(&g, (size_t)t->dim * sizeof(f32));
+    cd = (u8 *)gen_alloc_(&g, (size_t)t->dpad + 16);
+    if (!rot || !tmp || !rb || !cd) { gen_free_(&g); return; }
     for (i = j->slot ? 0 : lo; i < (j->slot ? j->n : (hi < j->n ? hi : j->n)); ++i) {   /* flat: slot == row, walk only our range */
         i64 s = j->slot ? j->slot[i] : i;
         i32 r;
@@ -1124,7 +1170,7 @@ static void tq_enc_rows_(void *p, i64 a, i64 b, i32 tid)
         if (r < 16) for (d = 0; d < vd; ++d) { u8 *q = blk + (size_t)d * 16 + r; *q = (u8)((*q & 0xf0) | cd[d]); }
         else for (d = 0; d < vd; ++d) { u8 *q = blk + (size_t)d * 16 + (r - 16); *q = (u8)((*q & 0x0f) | (cd[d] << 4)); }
     }
-    free(rot); free(tmp); free(cd); free(rb);
+    gen_free_(&g);
 }
 
 static i32 tq_default_probe_(i32 nc)
@@ -1150,37 +1196,60 @@ static i32 tq_srow_(const Tq *t, i32 b, i32 k);
 static void tq_count_(Tq *t)
 {
     i32 c, b, k, *bl;
+    Gen g;
     if (t->nc <= 1) return;
-    if (!t->csize) t->csize = (i32 *)malloc((size_t)t->nc * sizeof(i32));
-    bl = (i32 *)malloc((size_t)(t->nblk + t->xn > 0 ? t->nblk + t->xn : 1) * sizeof(i32));
+    if (!t->csize) t->csize = (i32 *)gen_alloc_(&t->mem, (size_t)t->nc * sizeof(i32));
+    gen_init_(&g);
+    bl = (i32 *)gen_alloc_(&g, (size_t)(t->nblk + t->xn > 0 ? t->nblk + t->xn : 1) * sizeof(i32));
+    if (!t->csize || !bl) { t->csize = (i32 *)0; gen_free_(&g); return; }
     t->csum = t->csq = 0.0;
     for (c = 0; c < t->nc; ++c) {
         i32 nb = tq_cblocks_(t, c, bl), z = 0;
         for (b = 0; b < nb; ++b) for (k = 0; k < 32; ++k) { i32 r = tq_srow_(t, bl[b], k); z += r >= 0 && r < t->n; }
         t->csize[c] = z; t->csum += z; t->csq += (f64)z * z;
     }
-    free(bl);
+    gen_free_(&g);
 }
 
 /* nc <= 1: flat scan of every row. nc > 1: IVF with about nc clusters (nprobe defaults to min(16%, 4 sqrt nc)).
  * skip (a bitset, IVF only, may be NULL): rows that get no slot - the store's tombstones, left out of a rebuild. */
 static void tq_c8_(Tq *t);
 static void tq_top_build_(Tq *t);
+void tq_free(Tq *t);
+
+/* an empty index: the struct on pages of its own, its arenas open; NULL when there is no memory */
+static Tq *tq_new_(void)
+{
+    Tq *t = (Tq *)mem_pages_(sizeof(Tq));
+    if (t) { gen_init_(&t->mem); gen_init_(&t->tab); }
+    return t;
+}
+
+/* the probe tables dropped as a whole (they are made again from the centroids) */
+static void tq_tab_reset_(Tq *t)
+{
+    gen_free_(&t->tab); gen_init_(&t->tab);
+    t->ct = (f32 *)0; t->c8 = (i8 *)0; t->c8b = (i32 *)0; t->c8s = (f32 *)0;
+}
 #define TQ_SKIP(s, i) ((s) && (((s)[(size_t)(i) >> 6] >> ((u32)(i) & 63u)) & 1u))
 
 Tq *tq_build_skip(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, i32 bits, const u64 *skip)
 {
-    Tq *t = (Tq *)calloc(1, sizeof(Tq));
+    Tq *t = tq_new_();
+    Gen g;                                                       /* the build's working arrays */
     f64 t0 = tq_now_();
     i32 verbose = getenv("TQ_VERBOSE") != (char *)0;
     i32 i, nslots, *slot = (i32 *)0;
     u32 r = seed ? seed : 0x7154u;
     TqEncJob ej;
+    if (!t) return t;
+    gen_init_(&g);
     if (nth < 1) nth = 1;
     t->dim = dim; t->dpad = dim + (dim & 1); t->n = n; t->nbuilt = n;
     t->bits = bits == 2 || bits == 1 ? bits : 4; t->vd = tq_vd_(t->dpad, t->bits);
-    t->s1 = (f32 *)malloc((size_t)t->dpad * sizeof(f32)); t->s2 = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
-    t->perm = (i32 *)malloc((size_t)t->dpad * sizeof(i32));
+    t->s1 = (f32 *)gen_alloc_(&t->mem, (size_t)t->dpad * sizeof(f32)); t->s2 = (f32 *)gen_alloc_(&t->mem, (size_t)t->dpad * sizeof(f32));
+    t->perm = (i32 *)gen_alloc_(&t->mem, (size_t)t->dpad * sizeof(i32));
+    if (!t->s1 || !t->s2 || !t->perm) { gen_free_(&g); tq_free(t); return (Tq *)0; }
     for (i = 0; i < t->dpad; ++i) { t->s1[i] = (tq_rng_(&r) & 1u) ? 1.0f : -1.0f; t->s2[i] = (tq_rng_(&r) & 1u) ? 1.0f : -1.0f; t->perm[i] = i; }
     for (i = t->dpad - 1; i > 0; --i) { i32 k = (i32)(tq_rng_(&r) % (u32)(i + 1)), x = t->perm[i]; t->perm[i] = t->perm[k]; t->perm[k] = x; }
 
@@ -1192,52 +1261,55 @@ Tq *tq_build_skip(const TqCol *rows, i32 n, i32 dim, u32 seed, i32 nc, i32 nth, 
         if (verbose) fprintf(stderr, "tq_build: train %d clusters (k1=%d) %.2fs\n", cl.nc, cl.k1, tq_now_() - t0);
         nc = cl.nc;
         t->nc = nc;
-        t->cent = cl.cent;                                       /* the clustering keeps reading it until it is freed */
-        slot = (i32 *)malloc((size_t)n * sizeof(i32));           /* first the cluster of each row, then its slot */
+        t->cent = (f32 *)gen_alloc_(&t->mem, (size_t)nc * (size_t)dim * sizeof(f32));   /* the index's own copy */
+        slot = (i32 *)gen_alloc_(&g, (size_t)n * sizeof(i32));   /* first the cluster of each row, then its slot */
         aj.rows = rows; aj.cl = &cl; aj.asg = slot; aj.nc = nc;
-        aj.cnt = (i32 *)calloc((size_t)nth * (size_t)nc, sizeof(i32));
+        aj.cnt = (i32 *)gen_alloc_(&g, (size_t)nth * (size_t)nc * sizeof(i32));
+        t->csize = (i32 *)gen_alloc_(&t->mem, (size_t)nc * sizeof(i32));
+        t->cstart = (i32 *)gen_alloc_(&t->mem, (size_t)(nc + 1) * sizeof(i32));
+        if (!t->cent || !cl.cent || !slot || !aj.cnt || !t->csize || !t->cstart) { tq_clus_free_(&cl); gen_free_(&g); tq_free(t); return (Tq *)0; }
+        memcpy(t->cent, cl.cent, (size_t)nc * (size_t)dim * sizeof(f32));
         tq_par_(tq_asg_rows_, &aj, n, nth);
         if (verbose) fprintf(stderr, "tq_build: assign %d rows %.2fs\n", n, tq_now_() - t0);
         tq_clus_free_(&cl);
         for (tt = 1; tt < nth; ++tt) for (c = 0; c < nc; ++c) aj.cnt[c] += aj.cnt[(size_t)tt * nc + c];
         if (skip) for (i = 0; i < n; ++i) if (TQ_SKIP(skip, i)) { --aj.cnt[slot[i]]; slot[i] = -1; --t->nbuilt; }
-        t->csize = (i32 *)malloc((size_t)nc * sizeof(i32));
         for (c = 0; c < nc; ++c) { t->csize[c] = aj.cnt[c]; t->csum += aj.cnt[c]; t->csq += (f64)aj.cnt[c] * aj.cnt[c]; }
         {   /* how far a row sits from its centroid, on up to 4096 rows: what added rows are held against (tq_add_put) */
             f64 sum = 0.0;
             i32 got = 0, step = n > 4096 ? n / 4096 : 1;
-            f32 *rb = (f32 *)malloc((size_t)dim * sizeof(f32));
-            for (i = 0; i < n; i += step) {
+            f32 *rb = (f32 *)gen_alloc_(&g, (size_t)dim * sizeof(f32));
+            for (i = 0; rb && i < n; i += step) {
                 if (slot[i] < 0) continue;
                 sum += 2.0 - 2.0 * (f64)vs_dot(tq_row_(rows, i, rb), t->cent + (size_t)slot[i] * dim, dim);
                 ++got;
             }
             t->fit0 = got ? (f32)(sum / got) : 0.0f;
-            free(rb);
         }
-        t->cstart = (i32 *)malloc((size_t)(nc + 1) * sizeof(i32));
         for (c = 0; c < nc; ++c) { t->cstart[c] = blk; blk += (aj.cnt[c] + 31) / 32; }
         t->cstart[nc] = blk;
         t->nblk = blk; nslots = blk * 32;
-        t->slot_row = (i32 *)malloc((size_t)nslots * sizeof(i32));
+        t->slot_row = (i32 *)gen_alloc_(&t->mem, (size_t)(nslots ? nslots : 1) * sizeof(i32));
+        if (!t->slot_row) { gen_free_(&g); tq_free(t); return (Tq *)0; }
         for (i = 0; i < nslots; ++i) t->slot_row[i] = -1;
         pos = aj.cnt;                                            /* reuse: next free slot of each cluster */
         for (c = 0; c < nc; ++c) pos[c] = t->cstart[c] * 32;
         for (i = 0; i < n; ++i) { i32 s; if (slot[i] < 0) continue; s = pos[slot[i]]++; t->slot_row[s] = i; slot[i] = s; }
-        free(aj.cnt);
         t->nprobe = tq_default_probe_(nc);
         t->skew0 = tq_skew(t);
-        t->ct = tq_transpose_(t->cent, nc, dim);
+        t->ct = tq_transpose_(&t->tab, t->cent, nc, dim);
+        if (!t->ct) { gen_free_(&g); tq_free(t); return (Tq *)0; }
         tq_c8_(t);
         tq_top_build_(t);
     } else {
         t->nblk = (n + 31) / 32; nslots = t->nblk * 32;
     }
-    t->codes = (u8 *)calloc((size_t)(t->nblk ? t->nblk : 1) * (size_t)t->vd * 16, 1);
+    t->codes = (u8 *)gen_alloc_(&t->mem, (size_t)(t->nblk ? t->nblk : 1) * (size_t)t->vd * 16);
+    if (!t->codes) { gen_free_(&g); tq_free(t); return (Tq *)0; }
     ej.rows = rows; ej.t = t; ej.slot = slot; ej.n = n; ej.nth = n >= 4096 ? nth : 1;
     if (ej.nth > 64) ej.nth = 64;
     tq_par_(tq_enc_rows_, &ej, (i64)ej.nth * 4096, ej.nth);     /* every thread walks all rows, keeps its own blocks */
-    free(slot);
+    gen_free_(&g);
     (void)nslots;
     if (verbose) fprintf(stderr, "tq_build: encode done %.2fs\n", tq_now_() - t0);
     return t;
@@ -1254,9 +1326,10 @@ static void tq_c8_(Tq *t)
     f32 *mx;
     if (!TQ_VNNI || nc <= 1 || t->c8) return;
     t->c8d4 = d4;
-    t->c8 = (i8 *)calloc((size_t)ng * (size_t)d4 * 64, 1);
-    t->c8b = (i32 *)calloc((size_t)ng * 16, sizeof(i32));
-    t->c8s = (f32 *)calloc((size_t)d4 * 4, sizeof(f32));
+    t->c8 = (i8 *)gen_alloc_(&t->tab, (size_t)ng * (size_t)d4 * 64);
+    t->c8b = (i32 *)gen_alloc_(&t->tab, (size_t)ng * 16 * sizeof(i32));
+    t->c8s = (f32 *)gen_alloc_(&t->tab, (size_t)d4 * 4 * sizeof(f32));
+    if (!t->c8 || !t->c8b || !t->c8s) { t->c8 = (i8 *)0; t->c8b = (i32 *)0; t->c8s = (f32 *)0; return; }   /* the f32 centroids pick the probes */
     mx = t->c8s;                                                 /* first the largest |value| of each dimension */
     for (c = 0; c < nc; ++c)
         for (d = 0; d < dim; ++d) { f32 v = (f32)fabs((f64)t->cent[(size_t)c * dim + d]); if (v > mx[d]) mx[d] = v; }
@@ -1280,25 +1353,18 @@ static void tq_c8_(Tq *t)
 
 static void tq_prepare_(Tq *t)
 {
-    if (t->nc > 1 && !t->ct) t->ct = tq_transpose_(t->cent, t->nc, t->dim);
+    if (t->nc > 1 && !t->ct) t->ct = tq_transpose_(&t->tab, t->cent, t->nc, t->dim);
     tq_c8_(t);
     if (t->nc > 1 && !t->top) tq_top_build_(t);                  /* (a file may have brought them: tq_top_set) */
 }
 
 void tq_free(Tq *t)
 {
+    i32 i;
     if (!t) return;
-    if (!t->mapped) { free(t->s1); free(t->s2); free(t->perm); free(t->codes); free(t->cent); free(t->cstart); free(t->slot_row); }
-    else {
-        if (t->slot_own) free(t->slot_row);
-        if (t->cent_own) { free(t->cent); free(t->cstart); }
-    }
-    free(t->ct); free(t->c8); free(t->c8b); free(t->c8s);
-    tq_top_free_(t);
-    free(t->xcodes); free(t->xslot); free(t->xnext); free(t->xhead); free(t->xtail); free(t->csize);
-    if (t->c1_own) free(t->codes1);
-    free(t->xcodes1);
-    free(t);
+    gen_free_(&t->mem); gen_free_(&t->tab);                      /* (arrays that point into a file mapping are not ours) */
+    for (i = 0; i < TQ_NREG; ++i) reg_free_(&t->reg[i]);
+    mem_unpages_(t, sizeof(Tq));
 }
 
 /* bytes of RAM the index holds (0 for the parts that live in a file mapping) */
@@ -1386,9 +1452,12 @@ static void tq_c1_blocks_(void *p, i64 a, i64 b, i32 tid)
 {
     TqC1Job *j = (TqC1Job *)p;
     Tq *t = j->t;
-    u8 *cd4 = (u8 *)malloc((size_t)t->vd + 16), *cd1 = (u8 *)malloc((size_t)t->vd1 + 16);
+    Gen g;
+    u8 *cd4, *cd1;
     i64 i;
     i32 k;
+    gen_init_(&g);
+    cd4 = (u8 *)gen_alloc_(&g, (size_t)t->vd + 16); cd1 = (u8 *)gen_alloc_(&g, (size_t)t->vd1 + 16);
     if (!cd4 || !cd1) j->fail[tid] = 1;
     else for (i = a; i < b; ++i) {
         u8 *b1 = tq_bptr1_(t, (i32)i);
@@ -1399,14 +1468,13 @@ static void tq_c1_blocks_(void *p, i64 a, i64 b, i32 tid)
             tq_put_lane_(b1, t->vd1, k, cd1);
         }
     }
-    free(cd4); free(cd1);
+    gen_free_(&g);
 }
 
 /* drops the 1-bit codes: the index scans its 4-bit codes again */
 void tq_cascade_off(Tq *t)
 {
-    if (t->c1_own) free(t->codes1);
-    free(t->xcodes1);
+    reg_free_(&t->reg[TQ_R_CODES1]); reg_free_(&t->reg[TQ_R_XCODES1]);   /* (codes from a file stay in its mapping or arena) */
     t->codes1 = t->xcodes1 = (u8 *)0;
     t->c1_own = 0;
 }
@@ -1420,10 +1488,9 @@ i32 tq_cascade_on(Tq *t, i32 nth)
     if (t->bits != 4) return -1;
     if (t->codes1) return 0;
     t->vd1 = tq_vd_(t->dpad, 1);
-    t->codes1 = (u8 *)malloc((size_t)(t->nblk > 0 ? t->nblk : 1) * (size_t)t->vd1 * 16);
-    if (t->xcap) t->xcodes1 = (u8 *)malloc((size_t)t->xcap * (size_t)t->vd1 * 16);
+    if (reg_fit_(&t->reg[TQ_R_CODES1], (void **)&t->codes1, 0, (size_t)(t->nblk > 0 ? t->nblk : 1) * (size_t)t->vd1 * 16) != 0
+        || (t->xcap && reg_fit_(&t->reg[TQ_R_XCODES1], (void **)&t->xcodes1, 0, (size_t)t->xcap * (size_t)t->vd1 * 16) != 0)) { tq_cascade_off(t); return -1; }
     t->c1_own = 1;
-    if (!t->codes1 || (t->xcap && !t->xcodes1)) { tq_cascade_off(t); return -1; }
     j.t = t;
     memset(j.fail, 0, sizeof(j.fail));
     tq_par_(tq_c1_blocks_, &j, (i64)t->nblk + t->xn, nth);
@@ -1434,7 +1501,7 @@ i32 tq_cascade_on(Tq *t, i32 nth)
 #include "scratch.h"
 
 /* searches of this process that found no memory for their working buffers and returned no hits */
-i64 tq_oom_count(void) { return scr_oom_count_(); }
+i64 tq_oom_count(void) { return scr_oom_count_() + mem_oom_count_(); }
 
 #include "tq_scan.c"
 

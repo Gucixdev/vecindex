@@ -1,4 +1,4 @@
-/* scratch.h - a query's working memory without malloc on the way: a pool of buffers, one taken for the length of
+/* scratch.h - a query's working memory, from the OS's pages (mem.h) and never malloc: a pool of buffers, one taken for the length of
  * a call and handed back. A buffer is allocated once, at the largest size any call asked of it, and reused for
  * every later query; inside a call the memory is handed out by bumping an offset (an arena), all freed at once by
  * scr_put_. SCR_SLOTS calls may hold one at the same time; past that a call gets a buffer of its own, freed on put.
@@ -36,11 +36,11 @@ static i32 scr_get_(Scr *a, size_t size)
     pthread_mutex_unlock(&scr_mu_);
     a->slot = got; a->used = 0;
     if (got < 0) {                                               /* every slot taken: a buffer for this call alone */
-        a->mem = (u8 *)malloc(size); a->cap = size;
+        a->mem = (u8 *)mem_pages_(size); a->cap = size;
     } else {
         if (scr_pool_[got].cap < size) {                         /* grown once, kept */
-            u8 *m = (u8 *)malloc(size + size / 4);
-            if (m) { free(scr_pool_[got].mem); scr_pool_[got].mem = m; scr_pool_[got].cap = size + size / 4; }
+            u8 *m = (u8 *)mem_pages_(size + size / 4);
+            if (m) { mem_unpages_(scr_pool_[got].mem, scr_pool_[got].cap); scr_pool_[got].mem = m; scr_pool_[got].cap = size + size / 4; }
             else { pthread_mutex_lock(&scr_mu_); scr_pool_[got].busy = 0; pthread_mutex_unlock(&scr_mu_); a->mem = (u8 *)0; a->slot = -1; a->cap = 0; }
         }
         if (a->slot >= 0) { a->mem = scr_pool_[got].mem; a->cap = scr_pool_[got].cap; }
@@ -65,7 +65,7 @@ static void *scr_take_(Scr *a, size_t n)
 static void scr_put_(Scr *a)
 {
     if (!a->mem) return;
-    if (a->slot < 0) free(a->mem);
+    if (a->slot < 0) mem_unpages_(a->mem, a->cap);
     else { pthread_mutex_lock(&scr_mu_); scr_pool_[a->slot].busy = 0; pthread_mutex_unlock(&scr_mu_); }
     a->mem = (u8 *)0; a->cap = 0;
 }

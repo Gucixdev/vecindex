@@ -91,14 +91,17 @@ static f64 sp_recall_(RagStore *s, i32 nq, i32 *same)
     return (f64)hit / (nq * 10.0);
 }
 
-typedef struct { RagStore *s; volatile i32 *stop; i32 bad; } SpReader;
+static pthread_mutex_t sp_mu_ = PTHREAD_MUTEX_INITIALIZER;
+static i32 sp_stop_;                                                /* under sp_mu_ */
+static i32 sp_stopped_(void) { i32 v; pthread_mutex_lock(&sp_mu_); v = sp_stop_; pthread_mutex_unlock(&sp_mu_); return v; }
+typedef struct { RagStore *s; i32 bad; } SpReader;
 static void *sp_reader_(void *p)
 {
     SpReader *r = (SpReader *)p;
     i64 id[10], chk;
     f32 sc[10], q[DIM];
     i32 i = 0;
-    while (!*r->stop) {
+    while (!sp_stopped_()) {
         sp_row_(500000 + i++, 6, 100, 77u, q);
         if (store_search(r->s, q, 10, id, sc) < 1) ++r->bad;
         if (store_search_exact(r->s, q, 10, id, sc, (const StoreCnf *)0, &chk) < 1) ++r->bad;
@@ -181,15 +184,14 @@ int main(void)
     {   /* live mode: splits while 4 threads search */
         pthread_t th[4];
         SpReader rd[4];
-        volatile i32 stop = 0;
         i32 bad = 0;
         i64 s0 = store_splits(s);
         store_set_live(s, 1, 0.0f);
-        for (i = 0; i < 4; ++i) { rd[i].s = s; rd[i].stop = &stop; rd[i].bad = 0; pthread_create(&th[i], (const pthread_attr_t *)0, sp_reader_, &rd[i]); }
+        for (i = 0; i < 4; ++i) { rd[i].s = s; rd[i].bad = 0; pthread_create(&th[i], (const pthread_attr_t *)0, sp_reader_, &rd[i]); }
         for (i = 0; i < 12000; ++i) { sp_row_(2000000 + i, 2, 300, 77u, v); store_add(s, v, 2000000 + i); }
         for (w = 0; w < 4000 && store_pending(s) > 0; ++w) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 1000000L; nanosleep(&ts, (struct timespec *)0); }
         { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 300000000L; nanosleep(&ts, (struct timespec *)0); }
-        stop = 1;
+        pthread_mutex_lock(&sp_mu_); sp_stop_ = 1; pthread_mutex_unlock(&sp_mu_);
         for (i = 0; i < 4; ++i) { pthread_join(th[i], (void **)0); bad += rd[i].bad; }
         store_set_live(s, 0, 0.0f);
         i = sp_inv_(s, &holes);
