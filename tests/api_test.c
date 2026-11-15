@@ -7,6 +7,7 @@
 #include <math.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define DIM 32
 #define N 3000
@@ -119,6 +120,42 @@ int main(void)
     sprintf(line, "vi_search_batch == vi_search on %d/100 queries", same);
     check(same == 100, line);
 
+    {   /* vi_search_exact against every live row scored here from vi_get: the same k best cosines */
+        float top[10], *q, c, qq;
+        vi_i64 chk = -1, tchk = 0;
+        int j, t, bad = 0;
+        for (i = 0; i < 40; ++i) {
+            q = qs + (size_t)(i * 37) * DIM;
+            for (j = 0; j < 10; ++j) top[j] = -2.0f;
+            for (qq = 0.0f, j = 0; j < DIM; ++j) qq += q[j] * q[j];
+            qq = (float)sqrt((double)qq);
+            for (t = 0; t < N; ++t) {
+                if (vi_get(db, 1000 + t, w) != 0) continue;
+                for (c = 0.0f, j = 0; j < DIM; ++j) c += w[j] * q[j] / qq;
+                for (j = 9; j >= 0 && top[j] < c; --j) if (j < 9) top[j + 1] = top[j];
+                if (j < 9) top[j + 1] = c;
+            }
+            n = vi_search_exact(db, q, 10, got, sc, &chk);
+            tchk += chk;
+            for (j = 0; j < 10; ++j) if (n != 10 || fabs((double)(sc[j] - top[j])) > 1e-4) bad = 1;
+            for (j = 0; j < n; ++j) if (vi_get(db, got[j], w) != 0) bad = 1;
+        }
+        sprintf(line, "vi_search_exact == every row scored on 40 queries (%d rows scored exactly a query)", (int)(tchk / 40));
+        check(!bad && tchk < (vi_i64)40 * N, line);
+        check(vi_search_exact(db, q, 0, got, sc, &chk) == -1 && vi_search_exact(db, q, 3, got, sc, (vi_i64 *)0) == 3,
+              "vi_search_exact: k 0 refused, checked may be NULL");
+        {   vi_i64 bc[37];
+            for (i = 0, bad = 0; i < 37 * 10; ++i) bi[i] = -7;
+            check(vi_search_exact_batch(db, qs, 37, 10, bi, bs, bc) == 0, "vi_search_exact_batch: 37 queries (two passes of up to 16 and one of 5)");
+            for (i = 0; i < 37; ++i) {
+                n = vi_search_exact(db, qs + (size_t)i * DIM, 10, got, sc, &chk);
+                for (j = 0; j < 10; ++j) if (n != 10 || bi[i * 10 + j] != got[j] || bs[i * 10 + j] != sc[j]) bad = 1;
+                if (bc[i] != chk) bad = 1;
+            }
+            check(!bad, "vi_search_exact_batch == vi_search_exact, query by query: the same hits, scores and counts");
+        }
+    }
+
     check(vi_snapshot(db, (const char *)0) == 0, "vi_snapshot starts a background snapshot of the store's file");
     for (i = 0; i < 200; ++i) { vec_(N + i, v); vi_add(db, 1000 + N + i, v); }
     check(vi_snapshot_wait(db, 1) == 0, "vi_snapshot_wait: written");
@@ -188,6 +225,37 @@ int main(void)
         vec_(17, v);
         k = vi_search_hybrid(db, v, (const char *)0, 0, 3, ids, s2);
         check(k == 3 && ids[0] == (((vi_i64)2 << 20) | 1), "vi_search_hybrid with the vector only");
+        {
+            vi_i64 all[40], best[5], gi[10];
+            float as[40], gs[10];
+            int na, j, ok = 1;
+            for (j = 0; j < 5; ++j) best[j] = -1;
+            na = vi_search(db, v, 40, all, as);                      /* every row ranked: each document's first hit */
+            for (j = 0; j < na; ++j) if (best[all[j] >> 20] < 0) best[all[j] >> 20] = all[j];
+            k = vi_search_grouped(db, v, 3, 20, gi, gs);
+            for (j = 0; j < k; ++j) ok &= gi[j] == best[gi[j] >> 20] && (j == 0 || gs[j] <= gs[j - 1]);
+            check(na == 40 && k == 3 && gi[0] == (((vi_i64)2 << 20) | 1) && ok && (gi[0] >> 20) != (gi[1] >> 20)
+                  && (gi[0] >> 20) != (gi[2] >> 20) && (gi[1] >> 20) != (gi[2] >> 20),
+                  "vi_search_grouped 3, shift 20: three documents, each by its best chunk, best first");
+            k = vi_search_grouped(db, v, 10, 20, gi, gs);
+            for (j = 0, ok = 1; j < k; ++j) ok &= gi[j] == best[gi[j] >> 20];
+            check(k == 5 && ok, "vi_search_grouped 10 over 5 documents: the 5, each once");
+            check(vi_search_grouped(db, v, 3, 0, gi, gs) == 3 && gi[0] == all[0] && gi[1] == all[1], "vi_search_grouped shift 0: vi_search");
+            check(vi_search_grouped(db, v, 3, 64, gi, gs) == -1 && strstr(vi_error(), "shift") != 0, "vi_search_grouped shift 64: refused");
+        }
+        {   /* one document crowds the top: 600 chunks next to the query, three more documents further off */
+            vi_db *m = vi_open((const char *)0, DIM, 0);
+            vi_i64 gi[4];
+            float gs[4], q[DIM];
+            int j, d;
+            vec_(5000, q);
+            for (j = 0; m && j < 600; ++j) { for (d = 0; d < DIM; ++d) w[d] = q[d] + 0.001f * (float)(j % 7) * (d == j % DIM); vi_add(m, j, w); }
+            for (j = 1; m && j <= 3; ++j) { vec_(5000 + j, w); for (d = 0; d < DIM; ++d) w[d] = 0.5f * w[d] + 0.5f * q[d]; vi_add(m, ((vi_i64)j << 20) | 3, w); }
+            k = m ? vi_search_grouped(m, q, 4, 20, gi, gs) : 0;
+            check(k == 4 && (gi[0] >> 20) == 0 && gi[1] != gi[2] && (gi[1] & 0xfffff) == 3 && (gi[2] & 0xfffff) == 3 && (gi[3] & 0xfffff) == 3,
+                  "vi_search_grouped: past a document of 600 chunks to the next three");
+            if (m) vi_close(m);
+        }
         check(vi_add_text(db, ((vi_i64)2 << 20) | 5, v, "replaced text", -1) == 0 && vi_get_text(db, ((vi_i64)2 << 20) | 5, buf, (int)sizeof(buf)) == 13,
               "vi_add_text replaces the text with the row");
         vi_close(db);
@@ -423,10 +491,300 @@ int main(void)
         vi_set_verify(2);
         check(db && vi_count(db) == 3000, "vi_set_verify 1: opens, checking the header's blocks only");
         if (db) vi_close(db);
+        vi_set_verify(3);
+        db = vi_open(fn, 0, 0);
+        vi_set_verify(2);
+        {   vi_i64 ld = 0, lt = 0;
+            int tries;
+            for (tries = 0; db && tries < 400; ++tries) {          /* 16 MB/s: a small file is walked in a moment */
+                vi_lens(db, &ld, &lt);
+                if (lt > 0 && ld >= lt) break;
+                { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 10000000L; nanosleep(&ts, (struct timespec *)0); }
+            }
+            check(db && vi_count(db) == 3000 && lt > 0 && ld == lt, "vi_set_verify 3 (the lens): opens at once, vi_lens walks every block");
+        }
+        if (db) vi_close(db);
         remove(fn); remove(jn);
     }
 
+    /* numbers on rows and range filters: in the scan, the file, the journal and batches */
+    {
+        char fn[64], jn[72];
+        vi_i64 ri[10], all[N], num = -1;
+        float rs[10], as[N];
+        int j, na, ok, want_n, bad;
+        vi_batch *b;
+        vi_health hh;
+        sprintf(fn, "/tmp/vecindex_api_num_%d.vxi", (int)getpid());
+        sprintf(jn, "%s.j", fn);
+        db = vi_open(fn, DIM, 0);
+        for (i = 0; db && i < N; ++i) { vec_(i, v); vi_add(db, i, v); }
+        vec_(1234, v);
+        check(db && vi_search_range(db, v, 5, 0, 0, ri, rs) == 5 && vi_search_range(db, v, 5, 1, 9, ri, rs) == 0,
+              "vi_search_range before any number: every row's is 0");
+        for (i = 0, ok = 1; db && i < N; ++i) ok &= vi_set_num(db, i, (vi_i64)(i % 100) - 50) == 0;
+        check(db && ok && vi_set_num(db, N + 5, 1) == -1 && vi_get_num(db, 1234, &num) == 0 && num == 34 - 50,
+              "vi_set_num on every row, a missing row refused, vi_get_num back");
+        if (db) vi_build(db);
+        na = db ? vi_search(db, v, N, all, as) : 0;              /* every row ranked: the expected answer in order */
+        for (want_n = 0, j = 0; j < na && want_n < 10; ++j) if (all[j] % 100 >= 80) ri[want_n++] = all[j];
+        n = db ? vi_search_range(db, v, 10, 30, 49, got, sc) : 0;
+        for (j = 0, ok = n == 10; j < n; ++j) ok &= got[j] % 100 >= 80 && got[j] == ri[j];
+        check(ok, "vi_search_range [30, 49]: the 10 nearest rows with numbers in it, in order");
+        for (i = 0, ok = 1; db && i < N; i += 3) ok &= vi_label_add(db, i, "legal") == 0;   /* a third of the rows */
+        for (want_n = 0, j = 0; j < na && want_n < 10; ++j) if (all[j] % 100 >= 80 && all[j] % 3 == 0) ri[want_n++] = all[j];
+        n = db ? vi_search_where(db, v, 10, "legal", (const char *)0, (const char *)0, 30, 49, got, sc) : 0;
+        for (j = 0, ok &= n == 10; j < n; ++j) ok &= got[j] == ri[j];
+        check(ok, "vi_search_where legal and [30, 49]: the 10 nearest rows with both, in order");
+        n = db ? vi_search_where(db, v, 10, (const char *)0, (const char *)0, "legal", -16, -16, got, sc) : 0;
+        for (j = 0, ok = n == 10; j < n; ++j) ok &= got[j] % 100 == 34 && got[j] % 3 != 0;
+        check(ok && got[0] == 1234, "vi_search_where none=legal and one number: the query's own row first, no legal one");
+        check(db && vi_search_where(db, v, 10, "nosuch", (const char *)0, (const char *)0, 0, 9, got, sc) == -1,
+              "vi_search_where with a label that does not exist: -1");
+        n = db ? vi_search_range(db, v, 10, -16, -16, got, sc) : 0;
+        check(n == 10 && got[0] == 1234 && got[1] % 100 == 34, "vi_search_range of one value: the query's own row first");
+        check(db && vi_search_range(db, v, 10, 50, 900, got, sc) == 0 && vi_search_range(db, v, 10, 5, 4, got, sc) == 0,
+              "vi_search_range of no rows, and lo > hi: no hits");
+        if (db) { vec_(7, w); vi_add(db, 7, w); }                /* a replaced row starts again at 0 */
+        check(db && vi_get_num(db, 7, &num) == 0 && num == 0, "vi_add over a numbered row: its number is 0 again");
+        if (db) vi_set_num(db, 7, -43);
+        b = db ? vi_batch_begin(db) : (vi_batch *)0;
+        vec_(N + 1, w);
+        check(b && vi_batch_add(b, N + 1, w) == 0 && vi_batch_set_num(b, N + 1, 777) == 0 && vi_batch_set_num(b, 99, 778) == 0
+              && vi_batch_set_num(b, N + 9, 1) == 0 && vi_batch_commit(b, 1) == 4,
+              "vi_batch_set_num: on a row the batch adds, a row the store has, a missing id");
+        check(db && vi_get_num(db, N + 1, &num) == 0 && num == 777 && vi_get_num(db, 99, &num) == 0 && num == 778
+              && vi_search_range(db, w, 3, 777, 777, got, sc) == 1 && got[0] == N + 1, "the batch's numbers are in, and searched");
+        if (db) vi_close(db);                                    /* no save: the journal carries every number */
+        db = vi_open(fn, 0, 0);
+        for (i = 0, ok = db != (vi_db *)0; db && i < N; ++i)
+            ok &= vi_get_num(db, i, &num) == 0 && num == (i == 7 ? -43 : (i == 99 ? 778 : (vi_i64)(i % 100) - 50));
+        check(ok && vi_get_num(db, N + 1, &num) == 0 && num == 777, "the journal replayed: every number back");
+        check(db && vi_save(db, (const char *)0) == 0, "vi_save with numbers");
+        if (db) vi_close(db);
+        db = vi_open(fn, 0, 0);
+        for (i = 0, ok = db != (vi_db *)0; db && i < N; ++i)
+            ok &= vi_get_num(db, i, &num) == 0 && num == (i == 7 ? -43 : (i == 99 ? 778 : (vi_i64)(i % 100) - 50));
+        bad = db && vi_integrity(db, &hh) == 0 ? (int)(hh.bad + hh.rows_bad) : -1;
+        n = db ? vi_search_range(db, v, 10, -16, -16, got, sc) : 0;
+        check(ok && bad == 0 && n == 10 && got[0] == 1234, "the saved file: numbers back, checks intact, searched");
+        if (db) { vi_set_num(db, 1234, 5); vi_close(db); }       /* a number set on a row of the mapped file */
+        db = vi_open(fn, 0, 0);
+        check(db && vi_get_num(db, 1234, &num) == 0 && num == 5 && vi_search_range(db, v, 1, 5, 5, got, sc) == 1 && got[0] == 1234,
+              "a number changed after the load: journaled, back after a reopen");
+        if (db) vi_close(db);
+        remove(fn); remove(jn);
+    }
+
+    /* vi_update: a new vector, the tag, number and text kept - live, through the journal, a batch and a save */
+    {
+        char fn[64], jn[72], tb[32];
+        vi_i64 tag = 0, num = 0;
+        float g[DIM];
+        int pass, ok, j, k;
+        vi_batch *b;
+        sprintf(fn, "/tmp/vecindex_api_upd_%d.vxi", (int)getpid());
+        sprintf(jn, "%s.j", fn);
+        db = vi_open(fn, DIM, 0);
+        for (i = 0; db && i < 200; ++i) { vec_(i, v); vi_add(db, i, v); }
+        vec_(900, v);
+        if (db) { vi_add_text(db, 5, v, "zebra quartz", -1); vi_set_tag(db, 5, 0x50); vi_set_num(db, 5, 1999); }
+        vec_(901, w);
+        check(db && vi_update(db, 5, w) == 0 && vi_update(db, 4444, w) == -1 && strstr(vi_error(), "4444") != 0,
+              "vi_update of a row, and of no row: -1 naming the id");
+        for (pass = 0; pass < 3; ++pass) {                       /* live, after a reopen (journal), after save + reopen */
+            ok = db && vi_get(db, 5, g) == 0 && vi_count(db) == 200 && vi_get_tag(db, 5, &tag) == 0 && tag == 0x50
+                 && vi_get_num(db, 5, &num) == 0 && num == 1999 && vi_get_text(db, 5, tb, sizeof tb) == 12 && !memcmp(tb, "zebra quartz", 12);
+            {   double dw = 0.0, ww = 0.0;                       /* the new vector: a cosine store keeps its direction */
+                for (j = 0; j < DIM; ++j) { dw += (double)g[j] * w[j]; ww += (double)w[j] * w[j]; }
+                ok &= dw / sqrt(ww) > 0.999;
+            }
+            k = db ? vi_search_hybrid(db, (const float *)0, "quartz", -1, 1, got, sc) : 0;
+            ok &= k == 1 && got[0] == 5;
+            k = db ? vi_search_range(db, w, 1, 1999, 1999, got, sc) : 0;
+            ok &= k == 1 && got[0] == 5;
+            check(ok, pass == 0 ? "vi_update: the new vector, tag, number and text kept, found by words and range"
+                      : (pass == 1 ? "vi_update after a reopen: the journal replayed it" : "vi_update after a save and a reopen"));
+            if (db) { if (pass == 1) vi_save(db, (const char *)0); vi_close(db); }
+            db = vi_open(fn, 0, 0);
+        }
+        b = db ? vi_batch_begin(db) : (vi_batch *)0;
+        vec_(902, w);
+        vec_(903, g);
+        check(b && vi_batch_add(b, 300, g) == 0 && vi_batch_update(b, 300, w) == 0 && vi_batch_update(b, 5, g) == 0
+              && vi_batch_update(b, 7777, g) == 0 && vi_batch_commit(b, 1) == 4, "vi_batch_update: on a row the batch adds, a row the store has, a missing id");
+        check(db && vi_count(db) == 201 && vi_get_tag(db, 5, &tag) == 0 && tag == 0x50 && vi_get_num(db, 5, &num) == 0 && num == 1999
+              && vi_search(db, g, 1, got, sc) == 1 && got[0] == 5 && vi_search(db, w, 1, got, sc) == 1 && got[0] == 300,
+              "the batch's updates are in, the row's tag and number kept");
+        if (db) vi_close(db);
+        remove(fn); remove(jn);
+    }
+
+    /* namespaces: tenants in one store - a small one searched over its own rows, a big one through the scan with the
+     * namespace inside it; nothing of another namespace ever comes back; moves, replacements, deletes, batches; the
+     * journal and the file keep them */
+    {
+        char fn[64], jn[72];
+        vi_i64 got2[64], all[33000];
+        float sc2[64], as[33000];
+        int pass, j, ok, iso, n1, na, want, hit, tot;
+        vi_batch *b;
+        sprintf(fn, "/tmp/vecindex_api_ns_%d.vxi", (int)getpid());
+        sprintf(jn, "%s.j", fn);
+        db = vi_open(fn, DIM, 0);
+        for (i = 0; db && i < 50; ++i) { vec_(100000 + i, v); vi_add_ns(db, 1, 100000 + i, v, (const char *)0, 0); }
+        for (i = 0; db && i < 30000; ++i) { vec_(200000 + i, v); vi_add_ns(db, 2, 200000 + i, v, i < 3 ? "a text of tenant two" : (const char *)0, -1); }
+        for (i = 0; db && i < 10; ++i) { vec_(300000 + i, v); vi_add_ns(db, 3, 300000 + i, v, (const char *)0, 0); }
+        for (i = 0; db && i < 100; ++i) { vec_(400000 + i, v); vi_add(db, 400000 + i, v); }
+        check(db && vi_count_ns(db, 1) == 50 && vi_count_ns(db, 2) == 30000 && vi_count_ns(db, 3) == 10 && vi_count_ns(db, 0) == 100
+              && vi_count_ns(db, 9) == 0, "vi_add_ns: three namespaces and the rows in none, counted");
+        if (db) vi_build(db);
+        for (pass = 0; pass < 3; ++pass) {                       /* live, after a reopen (journal), after save + reopen */
+            for (j = 0, iso = 1, ok = 1, hit = tot = 0; db && j < 40; ++j) {
+                int q, m;
+                vec_(500000 + j, v);
+                n1 = vi_search_ns(db, 1, v, 10, got2, sc2);
+                for (q = 0; q < n1; ++q) iso &= got2[q] >= 100000 && got2[q] < 100050 && (pass == 0 || got2[q] != 100008);
+                na = vi_search(db, v, 33000, all, as);           /* every row ranked: the exact answer inside each */
+                for (q = want = 0; q < na && want < 10; ++q) if (all[q] >= 100000 && all[q] < 100050 && (pass == 0 || all[q] != 100008)) ok &= all[q] == got2[want++];
+                ok &= n1 == 10 && want == 10;
+                m = vi_search_ns(db, 2, v, 10, got2, sc2);
+                for (q = 0; q < m; ++q) iso &= got2[q] >= 200000 && got2[q] < 230000;
+                for (q = want = 0; q < na && want < 10; ++q) if (all[q] >= 200000 && all[q] < 230000) {
+                    int z; ++want; ++tot;
+                    for (z = 0; z < m; ++z) if (got2[z] == all[q]) { ++hit; break; }
+                }
+                m = vi_search_ns(db, 0, v, 10, got2, sc2);
+                for (q = 0; q < m; ++q) iso &= got2[q] >= 400000;
+            }
+            check(iso, pass == 0 ? "vi_search_ns: never a row of another namespace (40 queries, namespaces 1, 2 and none)"
+                       : (pass == 1 ? "vi_search_ns after a reopen: still none from another" : "vi_search_ns after a save: still none from another"));
+            check(ok, "vi_search_ns, a namespace of 50: the exact 10 nearest of its own rows, in order");
+            check(hit * 10 >= tot * 8, "vi_search_ns, a namespace of 30000: recall@10 against its own rows at least 0.8");
+            vec_(300004, v);
+            check(db && vi_search_ns(db, 3, v, 3, got2, sc2) == 3 && got2[0] == 300004, "vi_search_ns, a namespace of 10: the query's own row first");
+            {   /* several namespaces: 1 and 3 together (60 rows) exactly - the 10 nearest of their rows, in order; 1, 2 and
+                 * 0 through the scan: only rows of the three; one namespace is vi_search_ns; none is refused */
+                vi_i64 s13[3], s120[4], g3[10];
+                float c3[10];
+                int q, m3, okin = 1, okex = 1, ok1 = 1;
+                s13[0] = 3; s13[1] = 1; s13[2] = 3;
+                s120[0] = 2; s120[1] = 0; s120[2] = 1; s120[3] = 2;
+                for (j = 0; db && j < 20; ++j) {
+                    vec_(600000 + j, v);
+                    m3 = vi_search_in(db, s13, 3, v, 10, g3, c3);
+                    na = vi_search(db, v, 33000, all, as);
+                    for (q = want = 0; q < na && want < 10; ++q)
+                        if ((all[q] >= 100000 && all[q] < 100050) || (all[q] >= 300000 && all[q] < 300010))   /* 100008 moves to 3: still in */
+                            okex &= want < m3 && all[q] == g3[want++];
+                    okex &= m3 == 10 && want == 10;
+                    m3 = vi_search_in(db, s120, 4, v, 10, g3, c3);
+                    for (q = 0; q < m3; ++q) okin &= (g3[q] >= 100000 && g3[q] < 100050) || (g3[q] >= 200000 && g3[q] < 230000) || g3[q] >= 400000;
+                    okin &= m3 == 10;
+                    m3 = vi_search_in(db, s13 + 1, 1, v, 10, g3, c3);
+                    n1 = vi_search_ns(db, 1, v, 10, got2, sc2);
+                    ok1 &= m3 == n1;
+                    for (q = 0; q < m3 && q < n1; ++q) ok1 &= g3[q] == got2[q];
+                }
+                check(okex, "vi_search_in {3, 1, 3}: the exact 10 nearest of the two namespaces' rows, in order");
+                check(okin, "vi_search_in {2, 0, 1, 2}: only rows of those namespaces (1, 2 and none)");
+                check(ok1 && db && vi_search_in(db, s13, 0, v, 10, g3, c3) == -1, "vi_search_in of one namespace is vi_search_ns; of none, refused");
+            }
+            if (pass == 0) {
+                vec_(100007, w); w[0] += 0.01f;
+                check(db && vi_add(db, 100007, w) == 0 && vi_get_ns(db, 100007, &tag) == 0 && tag == 1 && vi_count_ns(db, 1) == 50,
+                      "vi_add over a row of namespace 1: it stays in namespace 1");
+                check(db && vi_set_ns(db, 100008, 3) == 0 && vi_count_ns(db, 1) == 49 && vi_count_ns(db, 3) == 11, "vi_set_ns: a row moves from 1 to 3");
+                vec_(100008, v);
+                check(db && vi_search_ns(db, 3, v, 1, got2, sc2) == 1 && got2[0] == 100008 && vi_search_ns(db, 1, v, 1, got2, sc2) == 1 && got2[0] != 100008,
+                      "after the move: found in 3, not in 1");
+                b = db ? vi_batch_begin(db) : (vi_batch *)0;
+                vec_(600000, v);
+                check(b && vi_batch_add(b, 600000, v) == 0 && vi_batch_set_ns(b, 600000, 4) == 0 && vi_batch_commit(b, 1) == 2
+                      && vi_count_ns(db, 4) == 1 && vi_search_ns(db, 4, v, 5, got2, sc2) == 1 && got2[0] == 600000, "vi_batch_set_ns: a fourth namespace");
+                check(db && vi_get_text(db, 200001, (char *)got2, 64) == 20, "vi_add_ns with a text");
+            }
+            if (db) { if (pass == 1) vi_save(db, (const char *)0); vi_close(db); }
+            db = vi_open(fn, 0, 0);
+            check(db && vi_count_ns(db, 1) == 49 && vi_count_ns(db, 3) == 11 && vi_count_ns(db, 4) == 1, "after the reopen: the namespaces counted the same");
+        }
+        check(db && vi_delete_ns(db, 3) == 11 && vi_count_ns(db, 3) == 0 && vi_search_ns(db, 3, v, 5, got2, sc2) == 0
+              && vi_count_ns(db, 1) == 49 && vi_delete_ns(db, 0) == -1, "vi_delete_ns: all 11 rows of namespace 3, the rest stay; namespace 0 refused");
+        if (db) vi_close(db);
+        db = vi_open(fn, 0, 0);
+        check(db && vi_count_ns(db, 3) == 0 && vi_count_ns(db, 2) == 30000, "vi_delete_ns replayed from the journal");
+        if (db) vi_close(db);
+        remove(fn); remove(jn);
+    }
+
+    /* shards: rows split over three stores of a directory, one search over all of them, the same hits as one store */
+    {
+        char dp[64], fp[96];
+        const char *nm[3] = { "s0", "s1", "s2" };
+        vi_dir *dir;
+        vi_db *one = vi_open((const char *)0, DIM, 0), *l2;
+        vi_i64 a[10], b[10];
+        float as[10], bs2[10];
+        int j, na, nb, same = 1, q;
+        sprintf(dp, "/tmp/vecindex_api_shards_%d", (int)getpid());
+        mkdir(dp, 0700);
+        dir = vi_dir_open(dp, DIM, 0);
+        for (i = 0; dir && one && i < N; ++i) { vec_(i, v); vi_add(vi_dir_get(dir, nm[i % 3]), 70000 + i, v); vi_add(one, 70000 + i, v); }
+        sprintf(fp, "%s/notes.txt", dp); f = fopen(fp, "w"); if (f) { fputs("not a store\n", f); fclose(f); }
+        for (q = 0; dir && one && q < 20; ++q) {
+            vec_(q * 149 + 3, v);
+            na = vi_dir_search(dir, v, 10, a, as);
+            nb = vi_search(one, v, 10, b, bs2);
+            same &= na == 10 && nb == 10;
+            for (j = 0; j < na && j < nb; ++j) same &= a[j] == b[j] && (j == 0 || as[j] <= as[j - 1]);
+        }
+        check(dir && one && same, "vi_dir_search over 3 shards: the hits of one store with every row, in order");
+        if (dir) vi_dir_close(dir);
+        sprintf(fp, "%s/l2.vxi", dp);
+        l2 = vi_open(fp, DIM, VI_L2);
+        if (l2) { vec_(1, v); vi_add(l2, 1, v); vi_close(l2); }
+        dir = vi_dir_open(dp, DIM, 0);
+        vec_(3, v);
+        check(dir && vi_dir_search(dir, v, 10, a, as) == -1 && strstr(vi_error(), "another dimension or metric") != 0,
+              "vi_dir_search with a store of another metric: -1, and why");
+        if (dir) vi_dir_close(dir);
+        for (j = 0; j < 4; ++j) {
+            sprintf(fp, "%s/%s.vxi", dp, j < 3 ? nm[j] : "l2"); remove(fp);
+            sprintf(fp, "%s/%s.vxi.j", dp, j < 3 ? nm[j] : "l2"); remove(fp);
+        }
+        sprintf(fp, "%s/notes.txt", dp); remove(fp);
+        rmdir(dp);
+        if (one) vi_close(one);
+    }
+
     free(qs); free(bi); free(bs);
+    {   /* a row added after a save that dropped deleted rows, in a store with numbers and namespaces: its slot still
+         * held a dropped row's number when its check was computed, so the row read as damaged and refused vi_set_tag
+         * (found by tests/compat_test.c; this fails on the code before the fix) */
+        char fn2[128];
+        float v2[DIM];
+        vi_i64 t2 = 0, n2 = 0;
+        int i2, okp = 1;
+        vi_db *d2;
+        sprintf(fn2, "/tmp/vecindex_api_slot_%d.vxi", (int)getpid());
+        remove(fn2);
+        d2 = vi_open(fn2, DIM, 0);
+        for (i2 = 1; d2 && i2 <= 50; ++i2) { vec_(i2, v2); vi_add(d2, i2, v2); vi_set_num(d2, i2, 1000 + i2); vi_set_ns(d2, i2, 5); }
+        for (i2 = 1; d2 && i2 <= 50; i2 += 10) vi_delete(d2, i2);
+        if (!d2 || vi_save(d2, fn2) != 0) okp = 0;
+        for (i2 = 51; d2 && i2 <= 60; ++i2) {
+            vec_(i2, v2);
+            if (vi_add(d2, i2, v2) != 0 || vi_set_tag(d2, i2, 0x700) != 0 || vi_set_num(d2, i2, 7) != 0) okp = 0;
+        }
+        if (d2) vi_close(d2);
+        d2 = vi_open(fn2, DIM, 0);
+        for (i2 = 51; d2 && i2 <= 60; ++i2)
+            if (vi_get_tag(d2, i2, &t2) != 0 || t2 != 0x700 || vi_get_num(d2, i2, &n2) != 0 || n2 != 7) okp = 0;
+        check(okp && d2, "rows added after a save that dropped rows: their tags and numbers set, kept after a reopen");
+        if (d2) vi_close(d2);
+        remove(fn2);
+        sprintf(fn2 + strlen(fn2), ".j"); remove(fn2);
+    }
     printf("C API: %s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
 }

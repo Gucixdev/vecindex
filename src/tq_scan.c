@@ -256,7 +256,7 @@ typedef struct {
     const Tq *t; const u8 *lut;
     i32 b0, b1, R;
     const i32 *blks;                 /* IVF: the blocks to scan (b0..b1 index into this list); NULL = blocks b0..b1 */
-    const u64 *dead; const TqCol *meta; i64 all, any; i32 filtered;
+    const u64 *dead; const TqFilt *f;   /* NULL: every live row */
     i32 slots;                       /* keep slot numbers (block * 32 + lane) instead of rows: the cascade's first stage */
     TqRes res;
 } TqJob;
@@ -281,10 +281,20 @@ static void *tq_job_(void *arg)
             row = tq_srow_(t, blk, k);
             if (row < 0 || row >= t->n) continue;                /* padding */
             if (j->dead && ((j->dead[(u32)row >> 6] >> (row & 63)) & 1u)) continue;
-            if (j->filtered) {
-                i64 tag = *(const i64 *)(const void *)TQ_AT(j->meta, row);
-                if ((tag & j->all) != j->all) continue;
-                if (j->any && !(tag & j->any)) continue;
+            if (j->f) {
+                if (j->f->meta) {
+                    i64 tag = *(const i64 *)(const void *)TQ_AT(j->f->meta, row);
+                    if ((tag & j->f->all) != j->f->all) continue;
+                    if (j->f->any && !(tag & j->f->any)) continue;
+                }
+                if (j->f->num) {
+                    i64 v = *(const i64 *)(const void *)TQ_AT(j->f->num, row);
+                    if (v < j->f->lo || v > j->f->hi) continue;
+                }
+                if (j->f->ns) {
+                    i64 v = *(const i64 *)(const void *)TQ_AT(j->f->ns, row);
+                    if (j->f->nns ? !tq_in_set_(j->f->nss, j->f->nns, v) : v != j->f->nsv) continue;
+                }
             }
             tq_res_push_(&j->res, ((u64)sc[k] << 32) | (u64)(u32)(j->slots ? blk * 32 + k : row));
         }
@@ -293,10 +303,12 @@ static void *tq_job_(void *arg)
 }
 
 /* the query's 16-entry tables, one per code column, quantised to u8 (lut: vd * 16 + 32 bytes; rot, tmp: dpad
- * floats; lf: vd * 16 floats) */
-static void tq_lut_(const Tq *t, const f32 *q, f32 *rot, f32 *tmp, f32 *lf, u8 *lut)
+ * floats; lf: vd * 16 floats). sc, base (may be NULL): what turns a row's u16 sum S back into its estimate - the rotated
+ * query dotted with the row's levels is S / sc + base, within vd / (2 sc) (each table entry rounded to the nearest) */
+static void tq_lut_ex_(const Tq *t, const f32 *q, f32 *rot, f32 *tmp, f32 *lf, u8 *lut, f32 *sc, f64 *base)
 {
     f32 maxr = 0.0f, scale;
+    f64 bs = 0.0;
     i32 d, c, i, lutmax;
     tq_rot_(t, q, rot, tmp);
     for (d = 0; d < t->vd; ++d) {
@@ -315,10 +327,18 @@ static void tq_lut_(const Tq *t, const f32 *q, f32 *rot, f32 *tmp, f32 *lf, u8 *
             for (c = 0; c < 16; ++c) { f32 v = rot[d] * TQ_CENT[c]; lf[d * 16 + c] = v; if (v < mn) mn = v; if (v > mx) mx = v; }
         for (c = 0; c < 16; ++c) lf[d * 16 + c] -= mn;
         if (mx - mn > maxr) maxr = mx - mn;
+        bs += mn;
     }
     lutmax = 65535 / t->vd; if (lutmax > 255) lutmax = 255;
     scale = maxr > 0.0f ? (f32)lutmax / maxr : 1.0f;
     for (i = 0; i < t->vd * 16; ++i) { i32 v = (i32)(lf[i] * scale + 0.5f); lut[i] = (u8)(v > lutmax ? lutmax : v); }
+    if (sc) *sc = scale;
+    if (base) *base = bs;
+}
+
+static void tq_lut_(const Tq *t, const f32 *q, f32 *rot, f32 *tmp, f32 *lf, u8 *lut)
+{
+    tq_lut_ex_(t, q, rot, tmp, lf, lut, (f32 *)0, (f64 *)0);
 }
 
 #if TQ_VNNI
@@ -477,6 +497,26 @@ static void tq_pick_(u64 *key, i32 nk, i32 np, u64 *tmp, i32 *out, i32 sorted)
     for (i = 0; i < np; ++i) out[i] = (i32)(u32)key[i];
 }
 
+/* tq_probe_ through the second level (tq_top.c): the top cells closest to q, taken until they hold tq_top_want_(np)
+ * centroids, and f32 scores of those centroids only. */
+static void tq_probe2_(const Tq *t, const f32 *q, i32 np, u64 *key, u64 *tmp, i32 *out)
+{
+    f32 ts[TQ_TOP_KMAX];
+    i32 want = tq_top_want_(np), nk = 0, g, i, taken = 0;
+    for (g = 0; g < t->nk1; ++g) ts[g] = vs_dot(q, t->top + (size_t)g * t->dim, t->dim);
+    while (nk < want && taken < t->nk1) {
+        i32 b = 0;
+        for (g = 1; g < t->nk1; ++g) if (ts[g] > ts[b]) b = g;
+        ts[b] = -4.0f; ++taken;                                  /* (a dot of unit vectors is above -4) */
+        for (i = t->tstart[b]; i < t->tstart[b + 1]; ++i) {
+            i32 c = t->tlist[i];
+            key[nk++] = ((u64)tq_fkey_(vs_dot(q, t->cent + (size_t)c * t->dim, t->dim)) << 32) | (u32)c;
+        }
+    }
+    if (np > nk) np = nk;                                        /* never: want >= np, and every cluster is in a cell */
+    tq_pick_(key, nk, np, tmp, out, 1);
+}
+
 /* The np clusters closest to q into out[np], closest first. VNNI: int8 scores of every centroid, a threshold that
  * keeps the best np + np/4 + 16 or so, exact f32 scores for only those - so the probes are the f32 ones. Otherwise:
  * f32 scores of every centroid. scr: tq_probe_scr_ bytes. */
@@ -487,6 +527,7 @@ static void tq_probe_(const Tq *t, const f32 *q, i32 np, u8 *scr, i32 *out)
     i32 *sc = (i32 *)(void *)(tmp + ng16);
     if (np > nc) np = nc;
     if (np <= 0) return;
+    if (t->top && tq_top_want_(np) < nc) { tq_probe2_(t, q, np, key, tmp, out); return; }
 #if TQ_VNNI
     if (t->c8) {
         i32 *cand = sc + ng16;
@@ -505,45 +546,79 @@ static void tq_probe_(const Tq *t, const f32 *q, i32 np, u8 *scr, i32 *out)
     tq_pick_(key, nk, np, tmp, out, 1);
 }
 
-/* The R best rows (by the quantised inner product) that are alive and pass the meta filter; returns how
- * many were found, rows[] best first. dead (a bitset) / meta may be NULL. nthreads > 1 splits the blocks.
- * probe: IVF clusters to scan (0 = the index default, >= nc = all). slots: their slot numbers instead of rows. */
-static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, const TqCol *meta, i64 all, i64 any, i32 filtered, i32 nthreads, i32 probe, i32 slots)
+/* Query-aware pruning of the probes (the SPANN rule): a cluster is scanned only when its centroid is at most
+ * (1 + eps) times as far from the query as the closest centroid is; an easy query, close to one centroid, then reads
+ * a few clusters and a hard one all np. The closest TQ_PRUNE_KEEP always stay. eps 0: off. pc[0] must be the closest.
+ * compact: the kept probes moved to the front and counted; else a dropped probe becomes -1 and np is returned. */
+#ifndef VI_SCAN_THREAD_BLOCKS
+#define VI_SCAN_THREAD_BLOCKS 16384
+#endif
+#ifndef VI_PROBE_PRUNE
+#define VI_PROBE_PRUNE 0.0f
+#endif
+#define TQ_PRUNE_KEEP 4
+static f32 tq_prune_eps_ = VI_PROBE_PRUNE;
+static i32 tq_prune_(const Tq *t, const f32 *q, i32 *pc, i32 np, i32 compact)
 {
-    i32 *blks = (i32 *)0, nblk_scan, i, nj, per, tot;
+    f32 lim, e = 1.0f + tq_prune_eps_;
+    i32 i, n = 0, kept = 0;
+    if (tq_prune_eps_ <= 0.0f || np <= TQ_PRUNE_KEEP) return np;
+    lim = e * e * (2.0f - 2.0f * vs_dot(q, t->cent + (size_t)pc[0] * t->dim, t->dim));   /* squared distances of unit vectors */
+    for (i = 0; i < np; ++i) {
+        i32 keep = kept < TQ_PRUNE_KEEP || 2.0f - 2.0f * vs_dot(q, t->cent + (size_t)pc[i] * t->dim, t->dim) <= lim;
+        kept += keep;
+        if (compact) { if (keep) pc[n++] = pc[i]; }
+        else if (!keep) pc[i] = -1;
+    }
+    return compact ? n : np;
+}
+
+/* The R best rows (by the quantised inner product) that are alive and pass filt (NULL: no filter); returns how
+ * many were found, rows[] best first. dead (a bitset) may be NULL. nthreads > 1 splits the blocks.
+ * probe: IVF clusters to scan (0 = the index default, >= nc = all). slots: their slot numbers instead of rows. */
+static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, const TqFilt *filt, i32 nthreads, i32 probe, i32 slots)
+{
+    i32 *blks = (i32 *)0, nblk_scan, i, nj, per, tot, np = 0;
     f32 *rot, *tmp, *lf;
     u8 *lut;
     u64 *buf, *mt;
     TqJob jobs[16];
     TqRes all_r;
     pthread_t th[16];
+    Scr sc;
 
     if (t->n == 0 || R <= 0) return 0;
-    rot = (f32 *)malloc((size_t)t->dpad * sizeof(f32)); tmp = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
-    lf = (f32 *)malloc((size_t)t->vd * 16 * sizeof(f32)); lut = (u8 *)malloc((size_t)t->vd * 16 + 32);
-    tq_lut_(t, q, rot, tmp, lf, lut);
-    if (t->nc > 1) {                                             /* IVF: the blocks of the nprobe clusters closest to the query */
-        i32 np = probe > 0 ? probe : t->nprobe, nb = 0, *pc;
-        u8 *scr = (u8 *)malloc(tq_probe_scr_(t));
-        if (np > t->nc) np = t->nc;
-        pc = (i32 *)malloc((size_t)np * sizeof(i32));
-        tq_probe_(t, q, np, scr, pc);
-        for (i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], (i32 *)0);
-        blks = (i32 *)malloc((size_t)(nb ? nb : 1) * sizeof(i32));
-        for (nb = 0, i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], blks + nb);
-        nblk_scan = nb;
-        free(scr); free(pc);
-    } else nblk_scan = t->nblk + t->xn;                          /* flat: added blocks hold rows in order too */
     if (nthreads < 1) nthreads = 1;
     if (nthreads > 16) nthreads = 16;
-    if (nblk_scan < 64) nthreads = 1;
+    if (t->nc > 1) { np = probe > 0 ? probe : t->nprobe; if (np > t->nc) np = t->nc; }
+    /* everything the query needs, from one pooled buffer (scratch.h): no malloc on the way, and no memory is an
+     * answer - no hits, counted by scr_oom_count_ - not a crash */
+    if (scr_get_(&sc, scr_need_((size_t)t->dpad * sizeof(f32)) * 2 + scr_need_((size_t)t->vd * 16 * sizeof(f32)) + scr_need_((size_t)t->vd * 16 + 32)
+                      + (t->nc > 1 ? scr_need_(tq_probe_scr_(t)) + scr_need_((size_t)np * sizeof(i32)) + scr_need_((size_t)(t->nblk + t->xn + 1) * sizeof(i32)) : 0)
+                      + scr_need_((size_t)nthreads * 2 * (size_t)R * sizeof(u64)) + scr_need_((size_t)R * sizeof(u64))) != 0) return 0;
+    rot = (f32 *)scr_take_(&sc, (size_t)t->dpad * sizeof(f32)); tmp = (f32 *)scr_take_(&sc, (size_t)t->dpad * sizeof(f32));
+    lf = (f32 *)scr_take_(&sc, (size_t)t->vd * 16 * sizeof(f32)); lut = (u8 *)scr_take_(&sc, (size_t)t->vd * 16 + 32);
+    tq_lut_(t, q, rot, tmp, lf, lut);
+    if (t->nc > 1) {                                             /* IVF: the blocks of the nprobe clusters closest to the query */
+        i32 nb = 0, *pc = (i32 *)scr_take_(&sc, (size_t)np * sizeof(i32));
+        u8 *scr = (u8 *)scr_take_(&sc, tq_probe_scr_(t));
+        blks = (i32 *)scr_take_(&sc, (size_t)(t->nblk + t->xn + 1) * sizeof(i32));   /* (room for every block: pages it never touches) */
+        tq_probe_(t, q, np, scr, pc);
+        np = tq_prune_(t, q, pc, np, 1);
+        for (i = 0; i < np; ++i) nb += tq_cblocks_(t, pc[i], blks + nb);
+        nblk_scan = nb;
+    } else nblk_scan = t->nblk + t->xn;                          /* flat: added blocks hold rows in order too */
+    /* a thread is started per query (pthread_create), which costs more than it saves on a short scan: one more
+     * thread per VI_SCAN_THREAD_BLOCKS blocks to read (config.h; GloVe-100, ~3,500 blocks a query: 0.396 ms on one
+     * thread against 0.427 ms on two, p99 1.16 against 1.98) */
+    { i32 mx = 1 + nblk_scan / VI_SCAN_THREAD_BLOCKS; if (nthreads > mx) nthreads = mx; }
     nj = nthreads; per = (nblk_scan + nj - 1) / nj;
-    buf = (u64 *)malloc((size_t)nj * 2 * (size_t)R * sizeof(u64));
-    mt = (u64 *)malloc((size_t)R * sizeof(u64));
+    buf = (u64 *)scr_take_(&sc, (size_t)nj * 2 * (size_t)R * sizeof(u64));
+    mt = (u64 *)scr_take_(&sc, (size_t)R * sizeof(u64));
     for (i = 0; i < nj; ++i) {
         jobs[i].t = t; jobs[i].lut = lut; jobs[i].blks = blks; jobs[i].b0 = i * per; jobs[i].b1 = (i + 1) * per < nblk_scan ? (i + 1) * per : nblk_scan;
         if (jobs[i].b0 > jobs[i].b1) jobs[i].b0 = jobs[i].b1;
-        jobs[i].R = R; jobs[i].dead = dead; jobs[i].meta = meta; jobs[i].all = all; jobs[i].any = any; jobs[i].filtered = filtered && meta;
+        jobs[i].R = R; jobs[i].dead = dead; jobs[i].f = filt && (filt->meta || filt->num || filt->ns) ? filt : (const TqFilt *)0;
         jobs[i].slots = slots;
         tq_res_init_(&jobs[i].res, buf + (size_t)i * 2 * (size_t)R, R);
     }
@@ -557,13 +632,13 @@ static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *de
     }
     tq_res_init_(&all_r, buf, R); all_r.n = tot;
     tot = tq_res_rows_(&all_r, rows, mt);
-    free(buf); free(mt); free(rot); free(tmp); free(lf); free(lut); free(blks);
+    scr_put_(&sc);
     return tot;
 }
 
-i32 tq_search(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, const TqCol *meta, i64 all, i64 any, i32 filtered, i32 nthreads, i32 probe)
+i32 tq_search(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *dead, const TqFilt *filt, i32 nthreads, i32 probe)
 {
-    return tq_search_(t, q, R, rows, dead, meta, all, any, filtered, nthreads, probe, 0);
+    return tq_search_(t, q, R, rows, dead, filt, nthreads, probe, 0);
 }
 
 static int tq_key_desc_(const void *a, const void *b)
@@ -575,22 +650,23 @@ static int tq_key_desc_(const void *a, const void *b)
 /* The cascade, on an index with 1-bit codes beside its 4-bit ones (tq_cascade_on): the S best slots by the 1-bit
  * codes (a quarter of the bytes of the 4-bit scan), those S re-scored with their 4-bit codes, and the R best of them
  * as rows, best first. Arguments and result as tq_search; an index without 1-bit codes is searched as by tq_search. */
-i32 tq_search_cascade(const Tq *t, const f32 *q, i32 S, i32 R, i32 *rows, const u64 *dead, const TqCol *meta, i64 all, i64 any, i32 filtered, i32 nthreads, i32 probe)
+i32 tq_search_cascade(const Tq *t, const f32 *q, i32 S, i32 R, i32 *rows, const u64 *dead, const TqFilt *filt, i32 nthreads, i32 probe)
 {
     Tq v;
+    Scr ca;
     i32 *sl, ns, i, d, n;
     f32 *rot, *tmp;
     u64 *key;
-    if (!t->codes1) return tq_search_(t, q, R, rows, dead, meta, all, any, filtered, nthreads, probe, 0);
+    if (!t->codes1) return tq_search_(t, q, R, rows, dead, filt, nthreads, probe, 0);
     if (t->n == 0 || R <= 0) return 0;
     if (S < R) S = R;
     v = *t;                                                      /* the 1-bit view: same slots, clusters and rotation */
     v.codes = t->codes1; v.xcodes = t->xcodes1; v.vd = t->vd1; v.bits = 1;
-    sl = (i32 *)malloc((size_t)S * sizeof(i32));
-    key = (u64 *)malloc((size_t)S * sizeof(u64));
-    rot = (f32 *)malloc((size_t)t->dpad * sizeof(f32)); tmp = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
-    if (!sl || !key || !rot || !tmp) { free(sl); free(key); free(rot); free(tmp); return 0; }
-    ns = tq_search_(&v, q, S, sl, dead, meta, all, any, filtered, nthreads, probe, 1);
+    if (scr_get_(&ca, scr_need_((size_t)S * sizeof(i32)) + scr_need_((size_t)S * sizeof(u64)) + scr_need_((size_t)t->dpad * sizeof(f32)) * 2) != 0) return 0;
+    sl = (i32 *)scr_take_(&ca, (size_t)S * sizeof(i32));
+    key = (u64 *)scr_take_(&ca, (size_t)S * sizeof(u64));
+    rot = (f32 *)scr_take_(&ca, (size_t)t->dpad * sizeof(f32)); tmp = (f32 *)scr_take_(&ca, (size_t)t->dpad * sizeof(f32));
+    ns = tq_search_(&v, q, S, sl, dead, filt, nthreads, probe, 1);
     tq_rot_(t, q, rot, tmp);
     for (i = 0; i < ns; ++i) {                                   /* the inner product with each one's 4-bit codes */
         i32 b = sl[i] >> 5, k = sl[i] & 31;
@@ -604,7 +680,7 @@ i32 tq_search_cascade(const Tq *t, const f32 *q, i32 S, i32 R, i32 *rows, const 
     if (ns > n) tq_sel64_(key, ns, n);
     qsort(key, (size_t)n, sizeof(u64), tq_key_desc_);
     for (i = 0; i < n; ++i) { i32 s = sl[(u32)(key[i] & 0xffffffffu)]; rows[i] = tq_srow_(t, s >> 5, s & 31); }
-    free(sl); free(key); free(rot); free(tmp);
+    scr_put_(&ca);
     return n;
 }
 
@@ -617,7 +693,7 @@ static void tq_cas_many_(void *p, i64 a, i64 b, i32 tid)
     (void)tid;
     for (i = a; i < b; ++i)
         m->cnt[i] = tq_search_cascade(m->t, m->Q + (size_t)i * (size_t)m->t->dim, m->S, m->R, m->rows + (size_t)i * (size_t)m->R,
-                                      m->dead, (const TqCol *)0, 0, 0, 0, 1, m->probe);
+                                      m->dead, (const TqFilt *)0, 1, m->probe);
 }
 void tq_search_many_cascade(const Tq *t, const f32 *Q, i32 nq, i32 S, i32 R, i32 *rows, i32 *cnt, const u64 *dead, i32 nthreads, i32 probe)
 {
@@ -670,22 +746,36 @@ static void tq_many_one_(const Tq *t, const f32 *Q, i32 nq, i32 R, i32 np, i32 *
     TqMany m;
     i32 i, c, q;
     size_t bb = (size_t)t->vd * 16;
-    f32 *rot = (f32 *)malloc((size_t)t->dpad * sizeof(f32)), *tmp = (f32 *)malloc((size_t)t->dpad * sizeof(f32));
-    f32 *lf = (f32 *)malloc((size_t)t->vd * 16 * sizeof(f32));
-    u8 *scr = np ? (u8 *)malloc(tq_probe_scr_(t)) : (u8 *)0;
-    u64 *buf = (u64 *)malloc((size_t)nq * 2 * (size_t)R * sizeof(u64)), *mt = (u64 *)malloc((size_t)R * sizeof(u64));
+    f32 *rot, *tmp, *lf;
+    u8 *scr;
+    u64 *buf, *mt;
+    size_t ng16z = (size_t)((t->nc + 15) / 16 * 16), npz = (size_t)(np > 0 ? np : 1);
+    Scr ma;
+    /* the whole call's working memory from one pooled buffer (scratch.h); none to be had: no hits */
+    if (scr_get_(&ma, scr_need_((size_t)t->dpad * sizeof(f32)) * 2 + scr_need_((size_t)t->vd * 16 * sizeof(f32)) + scr_need_(tq_probe_scr_(t))
+                      + scr_need_((size_t)nq * 2 * (size_t)R * sizeof(u64)) + scr_need_((size_t)R * sizeof(u64))
+                      + scr_need_((size_t)nq * (size_t)(t->vd * 16 + 32)) + scr_need_((size_t)nq * sizeof(TqRes))
+                      + scr_need_((size_t)nq * npz * sizeof(i32)) * 2 + scr_need_((size_t)nq * (size_t)(t->c8d4 > 0 ? t->c8d4 : 1) * sizeof(u32))
+                      + scr_need_(8 * ng16z * sizeof(i32)) + scr_need_(((size_t)t->nc + 2) * sizeof(i32))) != 0) {
+        for (i = 0; i < nq; ++i) cnt[i] = 0;
+        return;
+    }
+    rot = (f32 *)scr_take_(&ma, (size_t)t->dpad * sizeof(f32)); tmp = (f32 *)scr_take_(&ma, (size_t)t->dpad * sizeof(f32));
+    lf = (f32 *)scr_take_(&ma, (size_t)t->vd * 16 * sizeof(f32));
+    scr = (u8 *)scr_take_(&ma, tq_probe_scr_(t));
+    buf = (u64 *)scr_take_(&ma, (size_t)nq * 2 * (size_t)R * sizeof(u64)); mt = (u64 *)scr_take_(&ma, (size_t)R * sizeof(u64));
     memset(&m, 0, sizeof(m));
     m.t = t; m.Q = Q; m.nq = nq; m.R = R; m.np = np; m.dead = dead; m.lutb = t->vd * 16 + 32;
-    m.luts = (u8 *)malloc((size_t)nq * (size_t)m.lutb);
-    m.res = (TqRes *)malloc((size_t)nq * sizeof(TqRes));
+    m.luts = (u8 *)scr_take_(&ma, (size_t)nq * (size_t)m.lutb);
+    m.res = (TqRes *)scr_take_(&ma, (size_t)nq * sizeof(TqRes));
     for (i = 0; i < nq; ++i) tq_res_init_(&m.res[i], buf + (size_t)i * 2 * (size_t)R, R);
-    if (np) m.probes = (i32 *)malloc((size_t)nq * (size_t)np * sizeof(i32));
+    if (np) m.probes = (i32 *)scr_take_(&ma, (size_t)nq * npz * sizeof(i32));
     for (q = 0; q < nq; ++q) tq_lut_(t, Q + (size_t)q * t->dim, rot, tmp, lf, m.luts + (size_t)q * m.lutb);
 #if TQ_VNNI
     if (np && t->c8) {                                           /* probes, 8 queries per pass over the int8 centroids */
         i32 ng16 = (t->nc + 15) / 16 * 16, d4 = t->c8d4, r;
-        u32 *qws = (u32 *)malloc((size_t)nq * (size_t)d4 * sizeof(u32)), *qp[8];
-        i32 *s8 = (i32 *)malloc((size_t)8 * (size_t)ng16 * sizeof(i32)), *sp[8];
+        u32 *qws = (u32 *)scr_take_(&ma, (size_t)nq * (size_t)d4 * sizeof(u32)), *qp[8];
+        i32 *s8 = (i32 *)scr_take_(&ma, (size_t)8 * (size_t)ng16 * sizeof(i32)), *sp[8];
         u64 *key = (u64 *)(void *)scr, *ktmp = key + ng16;
         i32 *cand = (i32 *)(void *)(ktmp + ng16) + ng16;
         for (q = 0; q < nq; ++q) tq_q8_(t, Q + (size_t)q * t->dim, qws + (size_t)q * d4);
@@ -698,12 +788,13 @@ static void tq_many_one_(const Tq *t, const f32 *Q, i32 nq, i32 R, i32 np, i32 *
                 tq_pick_(key, tq_cands_(t, Q + (size_t)(q + r) * t->dim, np, sp[r], key, cand), np, ktmp,   /* scanned in order */
                          m.probes + (size_t)(q + r) * np, 0);
         }
-        free(qws); free(s8);
+
     } else
 #endif
     for (q = 0; q < nq && np; ++q) tq_probe_(t, Q + (size_t)q * t->dim, np, scr, m.probes + (size_t)q * np);
     for (q = 0; q < nq && np; ++q) {                             /* each query's closest cluster first: a threshold early */
         i32 b2;
+        tq_prune_(t, Q + (size_t)q * t->dim, m.probes + (size_t)q * np, np, 0);   /* (never drops the first) */
         c = m.probes[(size_t)q * np];
         for (b2 = t->cstart[c]; b2 < t->cstart[c + 1]; ++b2) tq_many_push_(&m, &m.res[q], t->codes + (size_t)b2 * bb, b2, m.luts + (size_t)q * m.lutb);
         for (b2 = t->xhead ? t->xhead[c] : -1; b2 >= 0; b2 = t->xnext[b2])
@@ -712,11 +803,12 @@ static void tq_many_one_(const Tq *t, const f32 *Q, i32 nq, i32 R, i32 np, i32 *
     }
     if (np) {                                                    /* cluster -> the queries that still have to scan it */
         i32 nx;
-        m.cq0 = (i32 *)calloc((size_t)t->nc + 2, sizeof(i32));
-        m.cq = (i32 *)malloc((size_t)nq * (size_t)np * sizeof(i32));
-        for (i = 0; i < nq * np; ++i) if (i % np) ++m.cq0[m.probes[i] + 2];
+        m.cq0 = (i32 *)scr_take_(&ma, ((size_t)t->nc + 2) * sizeof(i32));
+        memset(m.cq0, 0, ((size_t)t->nc + 2) * sizeof(i32));
+        m.cq = (i32 *)scr_take_(&ma, (size_t)nq * npz * sizeof(i32));
+        for (i = 0; i < nq * np; ++i) if (i % np && m.probes[i] >= 0) ++m.cq0[m.probes[i] + 2];
         for (c = 0; c < t->nc; ++c) m.cq0[c + 2] += m.cq0[c + 1];
-        for (i = 0; i < nq * np; ++i) if (i % np) m.cq[m.cq0[m.probes[i] + 1]++] = i / np;
+        for (i = 0; i < nq * np; ++i) if (i % np && m.probes[i] >= 0) m.cq[m.cq0[m.probes[i] + 1]++] = i / np;
         for (c = 0; c < t->nc; c = nx) {                         /* cluster by cluster: its blocks x its queries */
             i32 b2, x;
             for (nx = c + 1; nx < t->nc && m.cq0[nx] == m.cq0[nx + 1]; ++nx) {}
@@ -743,8 +835,7 @@ static void tq_many_one_(const Tq *t, const f32 *Q, i32 nq, i32 R, i32 np, i32 *
                         tq_many_push_(&m, &m.res[q], tq_bptr_(t, b2), b2, m.luts + (size_t)q * m.lutb);
     }
     for (q = 0; q < nq; ++q) cnt[q] = tq_res_rows_(&m.res[q], rows + (size_t)q * R, mt);   /* best first */
-    free(m.res); free(m.luts); free(m.probes); free(m.cq0); free(m.cq);
-    free(buf); free(mt); free(rot); free(tmp); free(lf); free(scr);
+    scr_put_(&ma);
 }
 
 typedef struct { const Tq *t; const f32 *Q; i32 R, np; i32 *rows, *cnt; const u64 *dead; } TqManyJob;

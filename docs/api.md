@@ -28,6 +28,21 @@ row labelled dog or cat (or anything else under animal) that is not big. A label
 worked out when the search runs, so putting a new label over existing ones (`vi_label(db, "dog", "pet")`) changes no
 row. 64 labels a store; the table is saved in the file and every change is journaled.
 
+Namespaces put many tenants in one store: `vi_add_ns(db, user, id, vec, text, -1)` adds a row with its namespace (any
+i64 - a user id, or `vi_key("acme", -1)` for a name) and `vi_search_ns(db, user, q, 10, ids, scores)` searches only
+that namespace. Most tenants are small, and a namespace up to 20000 rows is searched exactly over a list of its own
+rows - its few rows lie in every cluster of the index, so a filtered scan would read them all; a bigger one goes
+through the scan with the namespace tested inside it. Replacing a row (`vi_add`, `vi_update`, a batch) keeps its
+namespace, so a write never moves a row into another tenant's searches; `vi_set_ns` moves one on purpose, and
+`vi_delete_ns` removes a whole tenant as one journal record. A directory of stores (`vi_dir`) stays for tenants that
+need a file of their own.
+
+A row also carries one 64-bit number for range filters - a time, a price in cents, a version: `vi_set_num(db, id,
+t)`, then `vi_search_range(db, q, 10, from, to, ids, scores)` is the nearest rows with a number in `[from, to]`. The
+range is tested inside the scan, before the candidates are picked, so a range that holds a handful of rows far from
+the query still finds them all. Every row's number is 0 until set; `vi_add` over a row starts it again at 0, and
+`vi_batch_set_num` sets it in the same batch as the row, so a crash never leaves the row without it.
+
 A store compares by cosine unless it is made with `VI_DOT` (the inner product of the vectors as they came: scores
 bigger is better) or `VI_L2` (the Euclidean distance: scores are the distance, smaller is better, still best first).
 Such a store keeps each row's length beside its direction (4 bytes a row); the index finds candidates by direction
@@ -42,6 +57,7 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_open(path, dim, flags)` | opens the store in `path`, or creates it with `dim` dimensions; `path` NULL: in memory; `flags` `VI_LIVE` indexes added rows as they come |
 | `vi_close(db)` | flushes the journal to the disk and frees the handle |
 | `vi_add(db, id, vec)`, `vi_add_batch(db, n, ids, vecs)` | adds rows, or replaces the row with that id (one change: a crash leaves the old row or the new one); a vector with a NaN or an infinity is refused |
+| `vi_update(db, id, vec)`, `vi_batch_update(b, id, vec)` | a new vector for the row - re-embedded by a new model - that keeps its tag, labels, number and text (`vi_add` starts the row over); one journal record |
 | `vi_delete(db, id)` | removes the row with this id |
 | `vi_delete_range(db, lo, hi)` | removes every row with an id in `[lo, hi]`: all the chunks of a document when ids are `doc << 20 \| chunk` |
 | `vi_get(db, id, out)` | the stored, unit-normalised vector |
@@ -49,18 +65,26 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_get_text(db, id, buf, cap)` | the row's text: its length, the first `cap` bytes copied into `buf` |
 | `vi_range(db, lo, hi, ids, max)` | the ids in `[lo, hi]` that have a row, ascending: the chunks of a document |
 | `vi_dir_open(path, dim, flags)`, `vi_dir_get(dir, name)`, `vi_dir_close(dir)` | tenants without a server: a directory with a store per tenant (`path/NAME.vxi`), each opened - or created - on its first `vi_dir_get` and handed back after; names are 1 to 64 of `A-Z a-z 0-9 _ -` |
-| `vi_batch_begin(db)`, `vi_batch_add(b, id, vec)`, `vi_batch_add_text(b, id, vec, text, len)`, `vi_batch_delete(b, id)`, `vi_batch_delete_range(b, lo, hi)` | a write batch: its changes are copied in as they are added and wait |
+| `vi_dir_search(dir, q, k, ids, scores)` | shards: every store of the directory searched, the k best hits of all of them merged; a store holds up to 2^31 - 1 rows, so past that (or past one disk) rows go into several stores and one search covers them |
+| `vi_batch_begin(db)`, `vi_batch_add(b, id, vec)`, `vi_batch_add_text(b, id, vec, text, len)`, `vi_batch_delete(b, id)`, `vi_batch_delete_range(b, lo, hi)`, `vi_batch_set_num(b, id, num)` | a write batch: its changes are copied in as they are added and wait |
 | `vi_batch_commit(b, sync)`, `vi_batch_abort(b)` | applies the batch as one change - searches see none of it before and all of it after, and a crash leaves all or none of it (one journal record with a CRC-32C) - and frees it; `sync` 1: on the disk before it returns. The number of changes, -1 refused with nothing applied (a NaN, a bad text, no memory), -2 applied but the fsync failed |
 | `vi_search_hybrid(db, q, text, tlen, k, ids, scores)` | the vector and the words (BM25 over the texts), fused by rank; either side may be left out |
 | `vi_set_tag`, `vi_get_tag` | a 64-bit tag per row |
+| `vi_set_num(db, id, num)`, `vi_get_num(db, id, &num)`, `vi_search_range(db, q, k, lo, hi, ids, scores)` | a 64-bit number per row (0 until set), and a search over the rows whose number is in `[lo, hi]` |
+| `vi_search_where(db, q, k, all, any, none, lo, hi, ids, scores)` | labels (as `vi_search_labeled`) and a number range in one search, both tested in the scan |
+| `vi_add_ns(db, ns, id, vec, text, len)`, `vi_search_ns(db, ns, q, k, ids, scores)`, `vi_set_ns`, `vi_get_ns`, `vi_delete_ns(db, ns)`, `vi_count_ns(db, ns)`, `vi_batch_set_ns` | namespaces: many tenants in one store; a search in a namespace sees only its rows (a small one searched exactly over its own rows, a big one through the scan with the namespace inside it); `vi_add` over a row keeps its namespace; `vi_delete_ns` drops a tenant in one journal record |
+| `vi_search_in(db, ns, n, q, k, ids, scores)` | the k best of several namespaces at once (`ns[0, n)`, any order, repeats allowed; names through `vi_key`): the set is tested inside the scan, log2 n steps a candidate (`lean4/Vecindex/NsSet.lean` proves that test is membership); namespaces small enough together are searched exactly over their own rows |
 | `vi_error()` | why the calling thread's last failed call failed, in words |
 | `vi_key(s, len)` | a 64-bit id for a string (a path, a URL), the same everywhere |
 | `vi_label(db, name, parent)`, `vi_label_add(db, id, labels)`, `vi_label_remove(db, id, labels)`, `vi_search_labeled(db, q, k, all, any, none, ids, scores)` | labels in a hierarchy on rows, and a search over every label of `all`, one of `any`, none of `none` |
 | `vi_search(db, q, k, ids, scores)` | the k nearest rows, best first |
 | `vi_search_tagged(db, q, k, all, any, ids, scores)` | the same over rows whose tag has every bit of `all` and one of `any` |
+| `vi_search_grouped(db, q, k, shift, ids, scores)` | at most one hit a group (`id >> shift`): with `shift` 20 and ids `doc << 20 \| chunk`, the best chunk of each of the k nearest documents |
 | `vi_search_batch(db, qs, nq, k, ids, scores, threads)` | many queries on several threads |
+| `vi_search_exact(db, q, k, ids, scores, &checked)` | search with a proof: the k best rows by exact score, the same set as scoring every row; `checked` gets how many rows were scored exactly (the scan's proved error bound, `lean4/Vecindex/Exact.lean`, rules out the rest). GloVe-100, 1.18M rows: ~4 ms against ~50 ms for every row, see benchmarks.md |
+| `vi_search_exact_batch(db, qs, nq, k, ids, scores, checked)` | `vi_search_exact` for nq queries, each block of codes read once for up to 16 of them; k slots a query (a missing hit: id -1, score -1), `checked` nq counts or NULL |
 | `vi_build(db)` | builds the index (searches before it scan the new rows exactly) |
-| `vi_set_recall(db, target)` | keeps recall@10 at `target`: every build picks the fewest probes that reach it |
+| `vi_set_recall(db, target)` | keeps recall@10 at `target`: every build picks the fewest probes that reach it. Default 0.90 for a store opened without `VI_MANUAL` (speed first: on GloVe-100 about 8,000 queries a second in a batch against 4,900 at 0.95); 0 turns it off |
 | `vi_set_layout(db, code_bits, row_bytes)` | 4-, 2- or 1-bit scan codes (dim/2, dim/4 or dim/8 bytes a row), f32 or int8 rows, before the first row |
 | `vi_set_aggression(db, a)` | how much of the machine to take, 0..1 (default 1, or `VECINDEX_AGGRESSION`): threads out of the CPUs the process may use (affinity, cgroup quota); background work at nice 10 to 19 |
 | `vi_set_memory(db, tier)` | what stays in RAM whatever the memory pressure (mlock): 0 nothing, the kernel decides (default); 1 what every search scans (codes, slot table, centroids), rows stay on the disk; 2 rows, ids and tags too. -1 when the memlock limit refused part of it |
@@ -202,7 +226,9 @@ with P/Invoke, Zig with `@cImport`, Lua with LuaJIT's FFI); those were not run h
 
 A model answers better from a whole passage than from the sentence that matched, and an embedding matches a short
 chunk better than a long one. So keep both: one row per small chunk, its text beside it, and an id that names the
-document - `doc << 20 | chunk` - so the chunks around a hit, or all of them, come back with one `vi_range`.
+document - `doc << 20 | chunk` - so the chunks around a hit, or all of them, come back with one `vi_range`. When one
+document holds many close chunks, `vi_search_grouped(db, q, k, 20, ids, scores)` returns k documents, each by its
+best chunk, instead of k chunks of the same one.
 
 ```c
 #include "vecindex.h"
@@ -294,9 +320,14 @@ apart at least. `vi_set_parity(db, data, parity)` changes the group for the file
 group, confirmed by its digest and written back to the file (unless the store was opened read-only). When a group has
 more damage than parity: inside the saved index, the index is built again from the rows; anywhere else (rows, ids,
 tags, texts) `vi_open` fails and `vi_open_error()` says where, rather than serving rows that are not the ones written.
-`vi_integrity` reports what the open found. Checking every block reads the whole file once; `vi_set_verify(1)` (or
-`VECINDEX_VERIFY=1`) checks only the header's blocks, for stores too large to read at every start - then run
-`vi_scrub`, which reads every block, the parity and both copies of the table from the disk, and with `repair` rebuilds
+`vi_integrity` reports what the open found. Checking every block reads the whole file once, so that is what a
+file up to half of RAM gets. A larger one opens with the lens (`vi_set_verify(3)`, `VECINDEX_VERIFY=lens`): the open
+checks the header, the index's small arrays and the label table; a text is checked before it is read; a save or a
+snapshot checks every block not checked yet before it copies them; and a thread walks the file one 64 KiB block at a
+time in order (16 MB/s, `vi_lens` shows how far), rebuilding what it finds. Rows and texts (each text has a CRC-32C of its own) are checked on every read at every
+level - a row that fails is rebuilt or left out of the result - so nothing damaged is served while the walk is under
+way; damage beyond repair in the rows then shows as rows left out instead of a refused open. `vi_set_verify(1)` (or
+`VECINDEX_VERIFY=1`) checks only the header's blocks and nothing after - then run `vi_scrub`, which reads every block, the parity and both copies of the table from the disk, and with `repair` rebuilds
 and rewrites what it can, beside a store that has the file open. `VECINDEX_VERIFY=0` opens a file whose checksums are
 gone.
 
@@ -320,3 +351,11 @@ as before, without block checks and with the row checks computed at the open, un
 A snapshot costs memory for the pages the parent changes while the child writes, up to a second copy of whatever is
 rewritten meanwhile. Under strict overcommit (`vm.overcommit_memory=2`) `fork` can fail for a store larger than the
 free commit limit; `vi_snapshot` then returns -1 and nothing changes.
+
+## Compile-time settings
+
+`src/config.h` holds every setting fixed at compile time, each with its default and what it trades: no config file,
+no parser - edit the value or pass `-DNAME=value`, and rebuild. `VI_RAM_LIMIT_MB` (0: what the machine or its cgroup
+has) is the RAM the store counts on - past half of it an index loads cold and rows spill to a file sooner;
+`VI_VRAM_LIMIT_MB` is read by the GPU path only, which is not built yet; `VI_RECALL_DEFAULT`, `STORE_IVF_MIN`,
+`STORE_IVF_ROWS`, `STORE_SPLIT_X` and `VI_TOP_MIN` are the search and index defaults.

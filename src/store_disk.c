@@ -15,7 +15,7 @@
 #define STORE_W64(f, p, n) engs_wle_((f), (p), 8, (n))
 #define STORE_R64(f, p, n) engs_rle_((f), (p), 8, (n))
 
-static int store_goal_w_(FILE *f, const EngGoal *g)
+static int store_goal_w_(FILE *f, const StoreGoal *g)
 {
     i32 w[7]; union { f32 fv; i32 iv; } tr;
     w[0] = (i32)g->mode;    w[1] = g->k;         w[2] = g->max_code_bytes;
@@ -24,11 +24,11 @@ static int store_goal_w_(FILE *f, const EngGoal *g)
     tr.fv = g->target_recall;
     return STORE_W32(f, w, 7) || STORE_W32(f, &tr.iv, 1) ? -1 : 0;
 }
-static int store_goal_r_(FILE *f, EngGoal *g)
+static int store_goal_r_(FILE *f, StoreGoal *g)
 {
     i32 w[7]; union { f32 fv; i32 iv; } tr;
     if (STORE_R32(f, w, 7) || STORE_R32(f, &tr.iv, 1)) return -1;
-    g->mode = (EngMode)w[0]; g->k = w[1];  g->max_code_bytes = w[2];
+    g->mode = w[0]; g->k = w[1];  g->max_code_bytes = w[2];
     g->eval_queries = w[3];  g->n_iters = w[4]; g->seed = (u32)w[5];
     g->max_candidates = w[6];
     g->target_recall = tr.fv;
@@ -42,9 +42,6 @@ static int store_goal_r_(FILE *f, EngGoal *g)
  * there as for a tail, and a copy of the journal is kept as PATH.j.damaged. 'VXJ2' (no header CRC, records not
  * framed) still replays. A file from before v7 has no stamp: its journal is 'VXJ1' base_live(i32) base_bytes(i64)
  * dim(i32), matched on rows and file size. ---- */
-#define STORE_JMAGIC  0x314a5856u
-#define STORE_JMAGIC2 0x324a5856u
-#define STORE_JMAGIC3 0x334a5856u
 
 /* flush a stdio file all the way to the disk */
 static i32 store_fsync_(FILE *f)
@@ -118,9 +115,10 @@ static void store_journal_reset_(RagStore *s, const char *path)
     if (s->jf) { fclose(s->jf); s->jf = (FILE *)0; }
     free(s->jpath); s->jpath = (char *)0;
     s->jf = fopen(jn, "wb");
+    ++s->jgen; s->jdur = 0;
     if (s->jf) {
-        store_jhead_(s->jf, s->dim, s->stamp, s->count, store_file_size_(path));
-        store_fsync_(s->jf);
+        if (store_jhead_(s->jf, s->dim, s->stamp, s->count, store_file_size_(path)) == 0 && store_fsync_(s->jf) == 0)
+            s->jdur = (i64)ftello(s->jf);
         s->jpath = store_jname_(path, "");
     }
     free(jn);
@@ -142,15 +140,19 @@ static i32 store_jrec_play_(RagStore *s, FILE *f, u8 op, f32 *vec, char **txt, i
         }
         if (n && fread(*txt, 1, (size_t)n, f) != (size_t)n) return -1;
         store_put_text(s, vec, id, meta, *txt, (i32)n);
-    } else if (op == 'A' || op == 'P') {
+    } else if (op == 'A' || op == 'P' || op == 'U') {
         if (fread(&id, 8, 1, f) != 1 || fread(&meta, 8, 1, f) != 1 || fread(vec, sizeof(f32), (size_t)s->dim, f) != (size_t)s->dim) return -1;
-        if (op == 'A') store_add_meta(s, vec, id, meta); else store_put(s, vec, id, meta);
+        if (op == 'A') store_add_meta(s, vec, id, meta); else if (op == 'U') store_update(s, vec, id); else store_put(s, vec, id, meta);
     } else if (op == 'D') {
         if (fread(&id, 8, 1, f) != 1) return -1;
         store_delete(s, id);
-    } else if (op == 'M' || op == 'R') {
+    } else if (op == 'M' || op == 'R' || op == 'N' || op == 'S' || op == 'Y') {
         if (fread(&id, 8, 1, f) != 1 || fread(&meta, 8, 1, f) != 1) return -1;
-        if (op == 'M') store_set_meta(s, id, meta); else store_delete_range(s, id, meta);
+        if (op == 'M') store_set_meta(s, id, meta);
+        else if (op == 'N') store_set_num(s, id, meta);
+        else if (op == 'S') store_set_ns(s, id, meta);
+        else if (op == 'Y') store_delete_ns(s, id);
+        else store_delete_range(s, id, meta);
     } else if (op == 'L') {                                      /* a label: its bit, name and parents */
         u8 b;
         char nm[STORE_LABEL_NAME];
@@ -158,7 +160,7 @@ static i32 store_jrec_play_(RagStore *s, FILE *f, u8 op, f32 *vec, char **txt, i
         if (fread(&b, 1, 1, f) != 1 || fread(nm, 1, STORE_LABEL_NAME, f) != STORE_LABEL_NAME || fread(&par, 8, 1, f) != 1) return -1;
         nm[STORE_LABEL_NAME - 1] = 0;
         store_label_set_(s, (i32)b, nm, par);
-    } else return -1;
+    } else { s->jnewer = op; return -3; }                        /* the frame's CRC vouched for it: a newer build's */
     return 0;
 }
 
@@ -178,8 +180,10 @@ static i32 store_jgroup_play_(RagStore *s, FILE *f, f32 *vec, char **txt, i32 *t
     if (fread(g, 1, (size_t)n, f) != (size_t)n) { free(g); return -1; }
     if (store_crc32c_(g, (size_t)n) != crc) { free(g); return -2; }
     if (!(m = fmemopen(g, (size_t)n, "rb"))) { free(g); return -1; }
-    while (fread(&op, 1, 1, m) == 1)                             /* the CRC vouched for the bytes: these are whole */
-        if (store_jrec_play_(s, m, op, vec, txt, txcap) != 0) { r = -2; break; }
+    while (fread(&op, 1, 1, m) == 1) {                          /* the CRC vouched for the bytes: these are whole */
+        i32 q = store_jrec_play_(s, m, op, vec, txt, txcap);
+        if (q != 0) { r = q == -3 ? -3 : -2; break; }
+    }
     fclose(m);
     free(g);
     return r;
@@ -195,7 +199,8 @@ static i32 store_jzeros_(FILE *f)
 
 /* Replays the journal file jn onto a freshly loaded store when it belongs to the file at path. Returns the length of
  * its good part (a torn last record or batch is not in it), -1 when it belongs to another file or cannot be read, -2
- * when its header is damaged. *dmg gets 1 when it stopped at a damaged frame with more journal after it. */
+ * when its header is damaged, -3 when a whole record is of a kind this build does not know (s->jnewer: a newer build
+ * wrote it). *dmg gets 1 when it stopped at a damaged frame with more journal after it. */
 static i64 store_journal_play_(RagStore *s, const char *path, const char *jn, i32 *dmg)
 {
     FILE *f = fopen(jn, "rb");
@@ -234,7 +239,8 @@ static i64 store_journal_play_(RagStore *s, const char *path, const char *jn, i3
         i32 r;
         if (fread(&op, 1, 1, f) != 1) break;
         if (op == 'G') r = store_jgroup_play_(s, f, vec, &txt, &txcap);
-        else r = framed ? -2 : store_jrec_play_(s, f, op, vec, &txt, &txcap);
+        else { r = framed ? -2 : store_jrec_play_(s, f, op, vec, &txt, &txcap); if (r == -3) r = -1; }   /* unframed: torn */
+        if (r == -3) { fclose(f); free(vec); free(txt); return -3; }   /* a newer build's record: touch nothing */
         if (r != 0) { if (r == -2 && !store_jzeros_(f)) *dmg = 1; break; }
         good = (i64)ftello(f);
     }
@@ -282,15 +288,18 @@ static void store_journal_replay_(RagStore *s, const char *path)
     i32 dmg = 0;
     if (s->ro) {                                                 /* read the journals as they are; move, cut, keep nothing */
         good = store_journal_play_(s, path, jn, &dmg);
+        if (good == -3) { free(jn); free(jn2); return; }
         if (good == -2 || dmg) s->jdamaged = 1;
         if (good < 0 && s->stamp && (store_journal_play_(s, path, jn2, &dmg) == -2 || dmg)) s->jdamaged = 1;
         free(jn); free(jn2);
         return;
     }
     good = store_journal_play_(s, path, jn, &dmg);
+    if (good == -3) { free(jn); free(jn2); return; }             /* a newer build's journal: refused, nothing cut or moved */
     if (good == -2) { store_jkeep_(jn, 1); s->jdamaged = 1; good = -1; }   /* its header: moved aside, never overwritten */
     if (good < 0 && s->stamp) {
-        if ((g2 = store_journal_play_(s, path, jn2, &dmg)) == -2) { store_jkeep_(jn2, 1); s->jdamaged = 1; }
+        if ((g2 = store_journal_play_(s, path, jn2, &dmg)) == -3) { free(jn); free(jn2); return; }
+        if (g2 == -2) { store_jkeep_(jn2, 1); s->jdamaged = 1; }
         else if (g2 >= 0) {
             good = g2;
             if (rename(jn2, jn) == 0) store_fsync_dir_(path);
@@ -304,11 +313,22 @@ static void store_journal_replay_(RagStore *s, const char *path)
          * when fopen fails): records appended behind a torn one would never be replayed. */
         if (truncate(use, (off_t)good) == 0) {
             s->jf = fopen(use, "ab");
+            ++s->jgen; s->jdur = good;                           /* read back from the disk: on it */
             if (s->jf) s->jpath = store_jname_(path, "");
         }
     } else
         store_journal_reset_(s, path);
     free(jn); free(jn2);
+}
+
+/* a store whose journal holds a newer build's record: refused, with the reason; its files as they were */
+static RagStore *store_jnewer_(RagStore *s)
+{
+    if (!s->jnewer) return s;
+    sprintf(store_lerr_, "its journal was written by a newer vecindex (a change of kind '%c' this build does not know): "
+                         "open it with that version or later", (s->jnewer >= 33 && s->jnewer < 127) ? s->jnewer : '?');
+    store_destroy(s);
+    return (RagStore *)0;
 }
 
 /* v5+ layout: every array starts on a 64-byte boundary, so store_load can map the file and point straight into it
@@ -362,7 +382,7 @@ static int store_tq_w_(FILE *f, const Tq *t)
     i32 h[8], c, nb, i, nc1 = t->nc > 1 ? t->nc : 1, *bl, *cs, bad = 0;
     size_t bb = (size_t)t->vd * 16;
     h[0] = t->dim; h[1] = t->dpad; h[2] = t->n; h[3] = t->nblk + t->xn; h[4] = t->nc; h[5] = t->nprobe;
-    h[6] = t->slot_row != (i32 *)0;
+    h[6] = (t->slot_row != (i32 *)0) | (t->nc > 1 && t->top ? 2 : 0);   /* bit 1: the top cells follow the cluster starts */
     h[7] = t->codes1 ? 5 : (t->bits == 4 ? 0 : t->bits);        /* 0 = 4-bit (older files); 5 = 4-bit, then the 1-bit codes */
     if (store_pad_(f) || STORE_W32(f, h, 8)
         || store_pad_(f) || STORE_W32(f, t->s1, (size_t)t->dpad)
@@ -374,7 +394,12 @@ static int store_tq_w_(FILE *f, const Tq *t)
     cs[nc1] = nb;
     if (t->nc > 1 && (store_pad_(f) || STORE_W32(f, t->cent, (size_t)t->nc * (size_t)t->dim)
                       || store_pad_(f) || STORE_W32(f, cs, (size_t)t->nc + 1))) bad = 1;
-    if (!bad && h[6]) {
+    if (!bad && (h[6] & 2))                                      /* the second level: no k-means over the centroids at load */
+        bad = store_pad_(f) || STORE_W32(f, &t->nk1, 1)
+           || store_pad_(f) || STORE_W32(f, t->top, (size_t)t->nk1 * (size_t)t->dim)
+           || store_pad_(f) || STORE_W32(f, t->tstart, (size_t)t->nk1 + 1)
+           || store_pad_(f) || STORE_W32(f, t->tlist, (size_t)t->nc);
+    if (!bad && (h[6] & 1)) {
         bad = store_pad_(f) != 0;
         for (i = 0; i < nb && !bad; ++i)
             bad = STORE_W32(f, bl[i] < t->nblk ? t->slot_row + (size_t)bl[i] * 32 : t->xslot + (size_t)(bl[i] - t->nblk) * 32, 32) != 0;
@@ -472,12 +497,14 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
             free(pre);
         }
     }
-    /* 0: no index (a load rebuilds it), 1: the engine index, 2: the scan index */
-    kind = (u8)(s->idx && all_in && !dead ? 1 : (s->tq && all_in && s->tq->n == live ? 2 : 0));
+    /* 0: no index (a load rebuilds it), 2: the scan index (1 was the old engine's index: read as 0) */
+    kind = (u8)(s->tq && all_in && s->tq->n == live ? 2 : 0);
     f = fopen(tmp, "w+b");                                       /* the old file stays intact until the new one is complete */
     if (!f) return -1;
-    hdr[0] = (i32)STORE_MAGIC; hdr[1] = STORE_VERSION9; hdr[2] = s->dim; hdr[3] = live;
-    ext[0] = (s->vbytes == 1 ? 1 : 0) | (s->has_text ? 2 : 0) | (s->nlab ? 4 : 0); ext[1] = s->metric;   /* v9: 0 cosine, 1 dot, 2 L2 */
+    hdr[0] = (i32)STORE_MAGIC; hdr[2] = s->dim; hdr[3] = live;
+    ext[0] = (s->vbytes == 1 ? 1 : 0) | (s->has_text ? 2 : 0) | (s->nlab ? 4 : 0) | (s->has_num ? 8 : 0) | (s->has_ns ? 16 : 0) | (s->has_text ? 32 : 0)
+           | (kind == 2 && s->tq->nc > 1 && s->tq->top ? STORE_F_TOP : 0); ext[1] = s->metric;   /* v9: 0 cosine, 1 dot, 2 L2 */
+    hdr[1] = (ext[0] & ~STORE_FLAGS_V9) ? STORE_VERSION10 : STORE_VERSION9;   /* the oldest version that holds it */
     ext[2] = (i32)(u32)(stamp & 0xffffffffu); ext[3] = (i32)(u32)(stamp >> 32);
     bad = STORE_W32(f, hdr, 4) || STORE_W32(f, ext, 4) || store_goal_w_(f, &s->goal)
        || store_pad_(f) || store_col_w_live_(f, &s->vec, s->count, dead)
@@ -488,8 +515,10 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
        || (s->metric && (store_pad_(f) || store_col_w_live_(f, &s->nrm, s->count, dead)))
        || (s->has_text && store_text_w_(f, s, s->count, dead))
        || (s->nlab && store_labels_w_(f, s))
+       || (s->has_num && (store_pad_(f) || store_col_w_live_(f, &s->numc, s->count, dead)))
+       || (s->has_ns && (store_pad_(f) || store_col_w_live_(f, &s->nsc, s->count, dead)))
+       || (s->has_text && (store_pad_(f) || store_col_w_live_(f, &s->tck, s->count, dead)))
        || fwrite(&kind, 1, 1, f) != 1
-       || (kind == 1 && engine_save(s->idx, f))
        || (kind == 2 && store_tq_w_(f, s->tq));
     if (!bad) {                                                  /* the digests and parity of all of it */
         i64 D = (i64)ftello(f);
@@ -504,10 +533,11 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
 i32 store_save(RagStore *s, const char *path)
 {
     char *tmp;
-    i32 live, had_idx, r;
+    i32 r;
     u64 stamp;
     if (s->ro) return -1;
     stamp = store_stamp_new_();
+    store_lens_finish_(s);                                       /* the lens: every block checked before it is copied */
 
     pthread_mutex_lock(&s->snap_mu);                             /* never beside a snapshot child: it may be reading rows */
     store_snap_reap_(s, 1);                                      /* the compaction below moves, and writing the same file */
@@ -516,10 +546,8 @@ i32 store_save(RagStore *s, const char *path)
     store_index_pending_(s, store_ncpu_(s));                      /* the pending tail into the index, searches going on */
     pthread_rwlock_wrlock(&s->lock);
     store_index_locked_(s);                                      /* and what came in meanwhile: the file gets the index */
-    had_idx = s->idx != (EngIndex *)0;
-    live = store_compact_(s);                                    /* the scan index follows its rows */
+    store_compact_(s);                                           /* the scan index follows its rows */
     store_tx_compact_(s);                                        /* and the texts of the rows that went */
-    if (had_idx && !s->idx && live > 0) { store_engine_build_(s, live); s->built_upto = live; }   /* an engine index cannot */
     tmp = store_jname_(path, ".tmp");
     store_advise_(s, MADV_SEQUENTIAL);                           /* the save streams every row: read ahead */
     r = store_write_file_(s, path, tmp, stamp, 0);
@@ -542,13 +570,17 @@ i32 store_sync(RagStore *s, const char *path)
     if (s->jf && s->jpath && strcmp(s->jpath, path) == 0) {
         int fd[2], i;
         i32 r = 0;
+        u64 gen;
+        i64 sz[2];
         fd[0] = fd[1] = -1;
         pthread_rwlock_wrlock(&s->lock);                         /* adders write these buffers under the same lock */
-        if (fflush(s->jf) != 0) r = -1; else fd[0] = dup(fileno(s->jf));
-        if (s->jf2) { if (fflush(s->jf2) != 0) r = -1; else fd[1] = dup(fileno(s->jf2)); }
+        if (fflush(s->jf) != 0) r = -1; else fd[0] = store_fd_dup_(fileno(s->jf));
+        if (s->jf2) { if (fflush(s->jf2) != 0) r = -1; else fd[1] = store_fd_dup_(fileno(s->jf2)); }
+        gen = store_jmark_(s, sz);
         pthread_rwlock_unlock(&s->lock);
         for (i = 0; i < 2; ++i)
-            if (fd[i] >= 0) { if (fsync(fd[i]) != 0) r = -1; close(fd[i]); }
+            if (fd[i] >= 0) { if (fsync(fd[i]) != 0) r = -1; store_fd_drop_(fd[i]); }
+        if (r == 0) store_jdur_(s, gen, sz);
         return r;
     }
     return store_save(s, path);
@@ -563,7 +595,7 @@ static u64 store_file_stamp_(const char *path)
     i32 h[8];
     u64 st = 0;
     if (!f) return 0;
-    if (!STORE_R32(f, h, 8) && (u32)h[0] == STORE_MAGIC && (h[1] == STORE_VERSION7 || h[1] == STORE_VERSION8 || h[1] == STORE_VERSION9))
+    if (!STORE_R32(f, h, 8) && (u32)h[0] == STORE_MAGIC && (h[1] == STORE_VERSION7 || h[1] == STORE_VERSION8 || STORE_V9UP(h[1])))
         st = (u64)(u32)h[6] | ((u64)(u32)h[7] << 32);
     fclose(f);
     return st;
@@ -610,6 +642,7 @@ static i32 store_snap_reap_(RagStore *s, i32 block)
             free(jn);
             if (s->jf) fclose(s->jf);
             s->jf = s->jf2;
+            s->jdur = s->jdur2; ++s->jgen;
             free(s->jpath); s->jpath = store_jname_(s->snap_path, "");
             s->stamp = s->snap_stamp;
         } else {
@@ -648,6 +681,7 @@ i32 store_snapshot(RagStore *s, const char *path)
     i32 home;
     pid_t pid;
     if (s->ro) return -1;
+    store_lens_finish_(s);                                       /* the lens: every block checked before it is copied */
     if (pthread_mutex_trylock(&s->snap_mu) != 0) return 1;     /* a build or a save holds it: try later */
     if (store_snap_reap_(s, 0) == 1) { pthread_mutex_unlock(&s->snap_mu); return 1; }
     home = !s->jpath || strcmp(s->jpath, path) == 0;
@@ -673,6 +707,7 @@ i32 store_snapshot(RagStore *s, const char *path)
     }
     if (pid > 0) {
         s->jf2 = j2; s->jn2 = jn2;                               /* from here on every record goes to both journals */
+        s->jdur2 = j2 ? (i64)ftello(j2) : 0; ++s->jgen;
         s->snap_pid = (i32)pid; s->snap_stamp = stamp;
         free(s->snap_path); s->snap_path = store_jname_(path, "");
         s->snap_t0_us = store_now_us_();
@@ -754,20 +789,26 @@ void store_snapshot_info(RagStore *s, i32 *running, i32 *last, i64 *us)
     }
 }
 
-/* n elements of esz bytes at byte offset off: a pointer into the mapping when there is one (no copy), else
- * read (and byte-swapped on a big-endian host) into malloc'd memory. NULL when the range is not inside the file. */
-static void *store_take_(u8 *map, size_t len, FILE *f, size_t off, size_t esz, size_t n)
+/* store_take_ for an index: what is not mapped is read into arena g and goes when the arena does */
+static void *store_take_g_(Gen *g, u8 *map, size_t len, FILE *f, size_t off, size_t esz, size_t n)
 {
     void *p;
     if (off > len || esz * n > len - off) return (void *)0;
     if (map) return (void *)(map + off);
-    p = malloc(esz * (n ? n : 1));
-    if (!p) return (void *)0;
-    if (fseeko(f, (off_t)off, SEEK_SET) != 0 || (n && engs_rle_(f, p, esz, n))) { free(p); return (void *)0; }
+    if (!(p = gen_alloc_(g, esz * (n ? n : 1)))) return (void *)0;
+    if (fseeko(f, (off_t)off, SEEK_SET) != 0 || (n && engs_rle_(f, p, esz, n))) return (void *)0;
     return p;
 }
 
 /* a column of `rows` rows at byte offset off: chunks point into the mapping, or are read into fresh chunks */
+/* a column the file does not have (written before it existed): zeros for its rows */
+static i32 store_col_zero_(RagStore *s, SCol *c, i32 rows)
+{
+    i32 nch = (i32)(((i64)rows + STORE_CROWS - 1) >> STORE_CSHIFT);
+    while (c->nchunk < nch) if (scol_push_(s, c)) return -1;
+    return 0;
+}
+
 static i32 store_col_r_(RagStore *s, SCol *c, u8 *map, size_t len, FILE *f, size_t off, i32 rows)
 {
     i32 nch = (i32)(((i64)rows + STORE_CROWS - 1) >> STORE_CSHIFT), i;
@@ -794,49 +835,68 @@ static i32 store_col_r_(RagStore *s, SCol *c, u8 *map, size_t len, FILE *f, size
     return 0;
 }
 
-static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows)
+/* vz (the lens): the blocks under the index's header and small arrays checked before anything is derived from them -
+ * a damaged cluster table would send a scan outside the codes */
+static Tq *store_tq_r_(u8 *map, size_t len, FILE *f, size_t off, i32 rows, const SSum *vz, const char *path, i32 ro)
 {
     i32 h[8];
     Tq *t;
     size_t o = STORE_AL(off);
-    i32 *hp = (i32 *)store_take_(map, len, f, o, 4, 8);
-    if (!hp) return (Tq *)0;
+    i32 *hp;
+    if (vz && ssum_vouch_(vz, path, ro, (u64)o, 32)) return (Tq *)0;
+    if (!(t = tq_new_())) return (Tq *)0;                         /* what is read rather than mapped goes into its arena */
+    hp = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, 8);
+    if (!hp) { tq_free(t); return (Tq *)0; }
     memcpy(h, hp, sizeof(h));
-    if (!map) free(hp);
-    if (h[0] <= 0 || h[1] < h[0] || h[2] != rows || h[3] < 0 || h[4] < 0) return (Tq *)0;
-    t = (Tq *)calloc(1, sizeof(Tq));
+    if (h[0] <= 0 || h[1] < h[0] || h[2] != rows || h[3] < 0 || h[4] < 0) { tq_free(t); return (Tq *)0; }
     t->dim = h[0]; t->dpad = h[1]; t->n = h[2]; t->nblk = h[3]; t->nc = h[4]; t->nprobe = h[5];
     t->nbuilt = t->n;                                            /* growth counts from the load (fit0: on first add) */
     t->bits = h[7] == 2 || h[7] == 1 ? h[7] : 4; t->vd = tq_vd_(t->dpad, t->bits);
     t->mapped = map != (u8 *)0;
     o = STORE_AL(o + 32);
-    t->s1 = (f32 *)store_take_(map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
-    t->s2 = (f32 *)store_take_(map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
-    t->perm = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
+    t->s1 = (f32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
+    t->s2 = (f32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
+    t->perm = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->dpad); o = STORE_AL(o + (size_t)t->dpad * 4);
     if (t->nc > 1) {
-        t->cent = (f32 *)store_take_(map, len, f, o, 4, (size_t)t->nc * (size_t)t->dim);
+        t->cent = (f32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->nc * (size_t)t->dim);
         o = STORE_AL(o + (size_t)t->nc * (size_t)t->dim * 4);
-        t->cstart = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nc + 1);
+        t->cstart = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->nc + 1);
         o = STORE_AL(o + ((size_t)t->nc + 1) * 4);
     }
-    if (h[6]) { t->slot_row = (i32 *)store_take_(map, len, f, o, 4, (size_t)t->nblk * 32); o = STORE_AL(o + (size_t)t->nblk * 128); }
-    t->codes = (u8 *)store_take_(map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd * 16);
+    if (t->nc > 1 && (h[6] & 2)) {                               /* the top cells, copied out: tq_top.c owns and grows them */
+        i32 *k1 = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, 1), nk1 = k1 ? *k1 : 0;
+        o = STORE_AL(o + 4);
+        if (nk1 >= 1 && nk1 <= TQ_TOP_KMAX) {
+            f32 *tp = (f32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)nk1 * (size_t)t->dim);
+            i32 *ts, *tl;
+            o = STORE_AL(o + (size_t)nk1 * (size_t)t->dim * 4);
+            ts = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)nk1 + 1); o = STORE_AL(o + ((size_t)nk1 + 1) * 4);
+            tl = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->nc); o = STORE_AL(o + (size_t)t->nc * 4);
+            if (tp && ts && tl) tq_top_set(t, nk1, tp, ts, tl);  /* (lists that do not hold every cluster once: built again) */
+        } else { tq_free(t); return (Tq *)0; }
+    }
+    if (vz && ssum_vouch_(vz, path, ro, (u64)STORE_AL(off), (u64)(o - STORE_AL(off)))) { tq_free(t); return (Tq *)0; }
+    if (h[6] & 1) { t->slot_row = (i32 *)store_take_g_(&t->mem, map, len, f, o, 4, (size_t)t->nblk * 32); o = STORE_AL(o + (size_t)t->nblk * 128); }
+    t->codes = (u8 *)store_take_g_(&t->mem, map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd * 16);
     if (h[7] == 5 && t->codes) {                                 /* the cascade's 1-bit codes follow */
         o = STORE_AL(o + (size_t)t->nblk * (size_t)t->vd * 16);
         t->vd1 = tq_vd_(t->dpad, 1);
-        t->codes1 = (u8 *)store_take_(map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd1 * 16);
+        t->codes1 = (u8 *)store_take_g_(&t->mem, map, len, f, o, 1, (size_t)t->nblk * (size_t)t->vd1 * 16);
         t->c1_own = !map;
     }
-    if (!t->s1 || !t->s2 || !t->perm || (t->nc > 1 && (!t->cent || !t->cstart)) || (h[6] && !t->slot_row) || !t->codes
+    if (!t->s1 || !t->s2 || !t->perm || (t->nc > 1 && (!t->cent || !t->cstart)) || ((h[6] & 1) && !t->slot_row) || !t->codes
         || (h[7] == 5 && !t->codes1)) {
         tq_free(t);
         return (Tq *)0;
     }
     tq_prepare_(t);
-    if (map) {                    /* what every query scans (the 1-bit codes of a cascade, else the codes): read it now */
+    if (map) {                    /* what every query scans (the 1-bit codes of a cascade, else the codes): read it now -
+                                   * unless it is more than RAM is sure to hold: then a search reads its clusters */
         const u8 *sc = t->codes1 ? t->codes1 : t->codes;
         size_t pg = (size_t)sysconf(_SC_PAGESIZE), a = (size_t)sc & ~(pg - 1);
-        madvise((void *)a, (size_t)sc + (size_t)t->nblk * (size_t)(t->codes1 ? t->vd1 : t->vd) * 16 - a, MADV_WILLNEED);
+        i64 hot = (i64)t->nblk * (t->codes1 ? t->vd1 : t->vd) * 16 + (t->slot_row ? (i64)t->nblk * 128 : 0);
+        if (t->nc > 1 && hot > (store_cold_min_ >= 0 ? store_cold_min_ : store_ram_half_())) t->cold = 1;
+        else madvise((void *)a, (size_t)sc + (size_t)t->nblk * (size_t)(t->codes1 ? t->vd1 : t->vd) * 16 - a, MADV_WILLNEED);
     }
     return t;
 }
@@ -885,13 +945,13 @@ static i32 store_rck_fill_(RagStore *s)
  * pages arrive on first touch, the id lookups are built on first use. dend: where a v9 file's data ends (0: the file's
  * end); ubad: the first byte of a block its checks could not rebuild (~0: none) - before the index the load is refused,
  * inside it the index is built again from the rows. */
-static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *hdr, i32 ro, u64 dend, u64 ubad)
+static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *hdr, i32 ro, u64 dend, u64 ubad, i32 lvl, const SSum *vz)
 {
     RagStore *s;
-    i32 live = hdr[3], dim = hdr[2], ext[4], v7 = hdr[1] == STORE_VERSION7 || hdr[1] == STORE_VERSION8 || hdr[1] == STORE_VERSION9,
+    i32 live = hdr[3], dim = hdr[2], ext[4], v7 = hdr[1] == STORE_VERSION7 || hdr[1] == STORE_VERSION8 || STORE_V9UP(hdr[1]),
         i8rows = hdr[1] == STORE_VERSION_I8, texts = 0, drop_idx = 0;
     struct stat st;
-    size_t len, o_vecs, o_vsc = 0, o_ids, o_meta, o_kind, o_txo = 0, o_heap = 0, o_rck = 0, o_nrm = 0;
+    size_t len, o_vecs, o_vsc = 0, o_ids, o_meta, o_kind, o_txo = 0, o_heap = 0, o_rck = 0, o_nrm = 0, o_num = 0, o_ns = 0, o_tck = 0;
     u8 *map = (u8 *)0, kind = 0;
     u64 stamp = 0, hlen = 0;
 
@@ -905,8 +965,13 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     len = (size_t)st.st_size;
     if (dend && dend < (u64)len) len = (size_t)dend;               /* the digests and parity after it are not data */
     if ((v7 || i8rows) && STORE_R32(f, ext, 4)) { fclose(f); return (RagStore *)0; }
-    if (v7) { i8rows = ext[0] & 1; texts = (hdr[1] == STORE_VERSION8 || hdr[1] == STORE_VERSION9) && (ext[0] & 2); stamp = (u64)(u32)ext[2] | ((u64)(u32)ext[3] << 32); }
+    if (v7) { i8rows = ext[0] & 1; texts = (hdr[1] == STORE_VERSION8 || STORE_V9UP(hdr[1])) && (ext[0] & 2); stamp = (u64)(u32)ext[2] | ((u64)(u32)ext[3] << 32); }
     else if (i8rows && ext[0] != 1) { fclose(f); return (RagStore *)0; }
+    if (v7 && (ext[0] & ~STORE_FLAGS_KNOWN)) {                   /* a feature of a newer build: refused, never misread */
+        sprintf(store_lerr_, "was written by a newer vecindex (features 0x%x this build does not know): open it with that version or later",
+                (unsigned)(ext[0] & ~STORE_FLAGS_KNOWN));
+        fclose(f); return (RagStore *)0;
+    }
     s = store_new(a, dim);
     if (!s->addbuf) {                                            /* not even one row of that dimension fits in memory */
         sprintf(store_lerr_, "no memory for one row of %d dimensions", (int)dim);
@@ -920,8 +985,8 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     else o_ids = STORE_AL(o_vecs + (size_t)live * (size_t)dim * 4);
     o_meta = STORE_AL(o_ids + (size_t)live * 8);
     o_kind = o_meta + (size_t)live * 8;
-    if (hdr[1] == STORE_VERSION9) { o_rck = STORE_AL(o_kind); o_kind = o_rck + (size_t)live * 4; }   /* the rows' checks */
-    if (hdr[1] == STORE_VERSION9 && ext[1]) {                    /* a dot or L2 store: the rows' lengths */
+    if (STORE_V9UP(hdr[1])) { o_rck = STORE_AL(o_kind); o_kind = o_rck + (size_t)live * 4; }   /* the rows' checks */
+    if (STORE_V9UP(hdr[1]) && ext[1]) {                    /* a dot or L2 store: the rows' lengths */
         if (ext[1] < 0 || ext[1] > 2) { fclose(f); store_destroy(s); return (RagStore *)0; }
         s->metric = ext[1];
         o_nrm = STORE_AL(o_kind); o_kind = o_nrm + (size_t)live * 4;
@@ -937,9 +1002,21 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
         o_kind = o_heap + (size_t)hlen;
         s->has_text = 1;
     }
-    if (hdr[1] == STORE_VERSION9 && (ext[0] & 4)) {             /* the label table */
-        if (store_labels_r_(s, f, STORE_AL(o_kind), len) != 0) { fclose(f); store_destroy(s); return (RagStore *)0; }
+    if (STORE_V9UP(hdr[1]) && (ext[0] & 4)) {             /* the label table */
+        if ((vz && ssum_vouch_(vz, path, ro, (u64)STORE_AL(o_kind), (u64)STORE_LABELS * (STORE_LABEL_NAME + 8)))
+            || store_labels_r_(s, f, STORE_AL(o_kind), len) != 0) { fclose(f); store_destroy(s); return (RagStore *)0; }
         o_kind = STORE_AL(o_kind) + (size_t)STORE_LABELS * (STORE_LABEL_NAME + 8);
+    }
+    if (STORE_V9UP(hdr[1]) && (ext[0] & 8)) {             /* the rows' numbers */
+        o_num = STORE_AL(o_kind); o_kind = o_num + (size_t)live * 8;
+        s->has_num = 1;
+    }
+    if (STORE_V9UP(hdr[1]) && (ext[0] & 16)) {            /* the rows' namespaces */
+        o_ns = STORE_AL(o_kind); o_kind = o_ns + (size_t)live * 8;
+        s->has_ns = 1;
+    }
+    if (STORE_V9UP(hdr[1]) && (ext[0] & 32)) {            /* the texts' CRCs */
+        o_tck = STORE_AL(o_kind); o_kind = o_tck + (size_t)live * 4;
     }
     if (o_kind >= len) { fclose(f); store_destroy(s); return (RagStore *)0; }
     if (ubad != ~(u64)0) {                                       /* a block the checks could not rebuild */
@@ -960,7 +1037,10 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
             || (i8rows && store_col_r_(s, &s->vsc, map, len, f, o_vsc, live))
             || (texts && store_col_r_(s, &s->txo, map, len, f, o_txo, live))
             || (o_rck && store_col_r_(s, &s->rck, map, len, f, o_rck, live))
-            || (o_nrm && store_col_r_(s, &s->nrm, map, len, f, o_nrm, live))) { fclose(f); store_destroy(s); return (RagStore *)0; }
+            || (o_nrm && store_col_r_(s, &s->nrm, map, len, f, o_nrm, live))
+            || (o_num && store_col_r_(s, &s->numc, map, len, f, o_num, live))
+            || (o_ns && store_col_r_(s, &s->nsc, map, len, f, o_ns, live))
+            || (texts && (o_tck ? store_col_r_(s, &s->tck, map, len, f, o_tck, live) : store_col_zero_(s, &s->tck, live)))) { fclose(f); store_destroy(s); return (RagStore *)0; }
         s->dead_words = ((i64)live + 63) >> 6;
         s->dead = (u64 *)calloc((size_t)s->dead_words, sizeof(u64));
         if (map) {                                               /* re-scoring reads rows at random: no read-ahead */
@@ -969,7 +1049,7 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
         }
     }
     if (texts && store_heap_r_(s, map, len, f, o_heap, hlen)) { fclose(f); store_destroy(s); return (RagStore *)0; }
-    if (texts && (!dend || store_verify_level_() < 2)) {        /* nothing vouched for the offsets: each inside the heap */
+    if (texts && (!dend || lvl != 2)) {        /* nothing vouched for the offsets: each inside the heap */
         i32 r;                                                   /* (tests/fuzz_store.c: a v8 file's pointed past it, and
                                                                   * the first save read text from a block that is not there) */
         for (r = 0; r < live; ++r) {
@@ -985,26 +1065,20 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     s->live = live;
     if (!o_rck && live > 0 && store_rck_fill_(s)) { fclose(f); store_destroy(s); return (RagStore *)0; }   /* older file */
     s->idmap_ok = live == 0;
+    if (vz && ssum_vouch_(vz, path, ro, (u64)o_kind, 1)) { fclose(f); store_destroy(s); return (RagStore *)0; }
     if (map) kind = map[o_kind];
     else if (fseeko(f, (off_t)o_kind, SEEK_SET) != 0 || fread(&kind, 1, 1, f) != 1) { fclose(f); store_destroy(s); return (RagStore *)0; }
     if (drop_idx) kind = 0;
 
-    if (kind == 1) {
-        if (fseeko(f, (off_t)(o_kind + 1), SEEK_SET) != 0) { fclose(f); store_destroy(s); return (RagStore *)0; }
-        s->idx = engine_load(&s->idx_arena, f);
-        fclose(f);
-        if (!s->idx || s->idx->dim != s->dim) { store_destroy(s); return (RagStore *)0; }   /* another dimension: not ours */
-        s->built_upto = live;
-    } else {
-        if (kind == 2) s->tq = store_tq_r_(map, len, f, o_kind + 1, live);
-        fclose(f);
-        s->fast = 1; s->fast_target = 0.97f;                     /* fast stores are saved without an engine index */
-        if (s->tq) { s->built_upto = live; s->cascade = s->tq->codes1 != (u8 *)0; }   /* saved with the cascade: on */
-        else store_build(s);                                      /* no saved scan index (or an unreadable one): build it */
-    }
+    /* (kind 1, the old engine's index: its rows are all here, so the scan index is built instead) */
+    if (kind == 2) s->tq = store_tq_r_(map, len, f, o_kind + 1, live, map ? vz : (const SSum *)0, path, ro);
+    fclose(f);
+    s->fast = 1; s->fast_target = 0.97f;                     /* fast stores are saved without an engine index */
+    if (s->tq) { s->built_upto = live; s->cascade = s->tq->codes1 != (u8 *)0; }   /* saved with the cascade: on */
+    else store_build(s);                                          /* no saved scan index (or an unreadable one): build it */
     s->stamp = stamp;
     store_journal_replay_(s, path);
-    return s;
+    return store_jnewer_(s);
 }
 
 static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
@@ -1013,6 +1087,7 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
     i32 hdr[4];
     RagStore *s;
     i32 live, i, lvl = store_verify_level_(), sums;
+    struct stat pst;
     u8 has_idx;
     SSum z;
     i64 bad, fixed;
@@ -1020,20 +1095,27 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
     strcpy(store_lerr_, "cannot be read, or not a store file of a version this build knows");
     /* the checks come first, before even the header is trusted: they rebuild a damaged one too */
     memset(&z, 0, sizeof(z));
-    sums = store_sum_load_(path, ro, lvl, &z, &bad, &fixed, &ubad);
+    if (lvl == STORE_VERIFY_AUTO)                                /* every block when the file fits RAM twice, else the lens */
+        lvl = stat(path, &pst) == 0 && (i64)pst.st_size > store_ram_half_() ? 3 : 2;
+    if (lvl == 3 && eng_host_be_()) lvl = 2;                     /* the lens checks the mapping: little-endian hosts only */
+    sums = store_sum_load_(path, ro, lvl == 3 ? 1 : lvl, &z, &bad, &fixed, &ubad);
     if (sums < 0) { strcpy(store_lerr_, "some blocks could not be read to check them"); return (RagStore *)0; }
     if (!(f = fopen(path, "rb"))) { free(z.tab); return (RagStore *)0; }
-    if (STORE_R32(f, hdr, 4) || (u32)hdr[0] != STORE_MAGIC
-        || (hdr[1] != 4 && hdr[1] != STORE_VERSION && hdr[1] != STORE_VERSION_I8 && hdr[1] != STORE_VERSION7
-            && hdr[1] != STORE_VERSION8 && hdr[1] != STORE_VERSION9)) { fclose(f); free(z.tab); return (RagStore *)0; }
-    if (hdr[1] == STORE_VERSION9 && !sums && lvl > 0) {
+    if (STORE_R32(f, hdr, 4) || (u32)hdr[0] != STORE_MAGIC) { fclose(f); free(z.tab); return (RagStore *)0; }
+    if (hdr[1] > STORE_VERSION10) {                              /* a newer format: refused, never misread */
+        sprintf(store_lerr_, "was written by a newer vecindex (file version %d; this build reads 4 to %d)", (int)hdr[1], STORE_VERSION10);
+        fclose(f); free(z.tab); return (RagStore *)0;
+    }
+    if (hdr[1] != 4 && hdr[1] != STORE_VERSION && hdr[1] != STORE_VERSION_I8 && hdr[1] != STORE_VERSION7
+        && hdr[1] != STORE_VERSION8 && !STORE_V9UP(hdr[1])) { fclose(f); free(z.tab); return (RagStore *)0; }
+    if (STORE_V9UP(hdr[1]) && !sums && lvl > 0) {
         strcpy(store_lerr_, "neither copy of its checksums can be read (VECINDEX_VERIFY=0 loads it unchecked)");
         fclose(f);
         return (RagStore *)0;
     }
     if (sums && hdr[1] == 4) { free(z.tab); z.tab = (u8 *)0; }
     if (hdr[1] != 4) {
-        s = store_load_v5_(a, path, f, hdr, ro, sums ? z.D : 0, lvl > 0 ? ubad : ~(u64)0);
+        s = store_load_v5_(a, path, f, hdr, ro, sums ? z.D : 0, lvl > 0 ? ubad : ~(u64)0, lvl, lvl == 3 && sums && z.tab ? &z : (const SSum *)0);
         if (s) {
             store_lerr_[0] = 0;
             if (sums) { s->sum_blocks = (i64)(z.N + z.P); s->sum_bad = bad; s->sum_fixed = fixed; s->sum_k = (i32)z.k; s->sum_m = (i32)z.m; }
@@ -1041,6 +1123,7 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
                 memcpy(s->msum, &z, sizeof(SSum));
                 z.tab = (u8 *)0;
                 s->mfd = open(path, ro ? O_RDONLY : O_RDWR);
+                if (lvl == 3) store_lens_start_(s);              /* the rest of the file: checked as it is needed */
             }
         }
         if (sums) free(z.tab);
@@ -1066,19 +1149,13 @@ static RagStore *store_load_impl_(Arena *a, const char *path, i32 ro)
     store_reindex_(s);
 
     if (fread(&has_idx, 1, 1, f) != 1) { fclose(f); store_destroy(s); return (RagStore *)0; }
-    if (has_idx) {
-        s->idx = engine_load(&s->idx_arena, f);
-        fclose(f);
-        if (!s->idx || s->idx->dim != s->dim) { store_destroy(s); return (RagStore *)0; }
-        s->built_upto = live;
-    } else {
-        fclose(f);
-        s->fast = 1; s->fast_target = 0.97f;                     /* fast stores are saved without an engine index */
-        store_build(s);
-    }
+    /* (has_idx: the old engine's index follows; the rows are all read, so the scan index is built instead) */
+    fclose(f);
+    s->fast = 1; s->fast_target = 0.97f;                     /* fast stores are saved without an engine index */
+    store_build(s);
     store_journal_replay_(s, path);
     store_lerr_[0] = 0;
-    return s;
+    return store_jnewer_(s);
 }
 
 RagStore *store_load(Arena *a, const char *path) { return store_load_impl_(a, path, 0); }

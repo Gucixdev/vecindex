@@ -1,0 +1,16 @@
+{
+  "name": "vecindex",
+  "version": "0.4.0",
+  "description": "A vector database in one C file, as WebAssembly: embedded RAG storage for Node, Deno, Bun and browsers",
+  "type": "module",
+  "main": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": { ".": { "types": "./index.d.ts", "default": "./index.mjs" } },
+  "files": ["index.mjs", "wasi.mjs", "index.d.ts", "vecindex.wasm", "README.md"],
+  "scripts": { "test": "node test/test.mjs", "build": "./build.sh" },
+  "engines": { "node": ">=16" },
+  "keywords": ["vector database", "rag", "embeddings", "similarity search", "wasm", "embedded"],
+  "license": "MIT",
+  "author": "Gucixdev",
+  "repository": { "type": "git", "url": "https://github.com/Gucixdev/vecindex" }
+}

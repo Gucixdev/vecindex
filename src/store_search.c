@@ -5,47 +5,57 @@
 
 /* the scan's R best rows: through the cascade when the index has one (1-bit codes first, a shortlist of
  * STORE_CAS_SHORT x R re-scored with the 4-bit codes) */
-static i32 store_scan_(const RagStore *s, const f32 *qn, i32 R, i32 *rows, const TqCol *mcol, i64 all, i64 any, i32 filtered, i32 nth, i32 probe)
+static i32 store_scan_(const RagStore *s, const f32 *qn, i32 R, i32 *rows, const TqFilt *f, i32 nth, i32 probe)
 {
-    if (s->tq->codes1) return tq_search_cascade(s->tq, qn, STORE_CAS_SHORT * R, R, rows, s->dead, mcol, all, any, filtered, nth, probe);
-    return tq_search(s->tq, qn, R, rows, s->dead, mcol, all, any, filtered, nth, probe);
+    if (s->tq->codes1) return tq_search_cascade(s->tq, qn, STORE_CAS_SHORT * R, R, rows, s->dead, f, nth, probe);
+    return tq_search(s->tq, qn, R, rows, s->dead, f, nth, probe);
 }
 
 static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
                               i64 *out_doc_ids, f32 *out_scores,
                               i64 all_bits, i64 any_bits, int filtered, const StoreCnf *cnf)
 {
-    i32 dim = s->dim, over = filtered ? (k * 4 + 16) : k;
-    f32 *qn  = (f32 *)malloc((size_t)dim * sizeof(f32));
-    i64 *rid = (i64 *)malloc((size_t)over * sizeof(i64));
-    f32 *rsc = (f32 *)malloc((size_t)over * sizeof(f32));
-    EngScratch sc;
-    f32 *slut = (f32 *)0;
-    i32 have = 0, i, got, tail;
-    TqCol mcol;
+    i32 dim = s->dim, Rs;
+    f32 *qn;
+    i32 *rows;
+    Scr scr;
+    i32 have = 0, i, tail;
+    TqCol mcol, ncol, scol;
+    TqFilt tf;
+    i32 exact;
     f32 qlen;
 
+    pthread_rwlock_rdlock(&s->lock);
+    /* candidates re-scored exactly: 20 k, at least 256 - four times that with 1-bit codes, which rank coarsely */
+    Rs = !s->tq ? 1 : filtered ? k * 40 + 256
+       : (s->tq_rerank > 0 ? s->tq_rerank : (k * 20 > 256 ? k * 20 : 256) * (s->tq->bits == 1 ? 4 : 1) * (s->metric ? 4 : 1));
+    /* the query's working memory from the pool (scratch.h): no malloc on the way; none to be had: no hits */
+    if (scr_get_(&scr, scr_need_((size_t)dim * sizeof(f32)) + scr_need_((size_t)Rs * sizeof(i32))) != 0) { pthread_rwlock_unlock(&s->lock); return 0; }
+    qn = (f32 *)scr_take_(&scr, (size_t)dim * sizeof(f32));
+    rows = (i32 *)scr_take_(&scr, (size_t)Rs * sizeof(i32));
     memcpy(qn, query, (size_t)dim * sizeof(f32));
     qlen = (f32)eng_sqrt_(eng_ssq_(qn, dim));
     store_normalise_(qn, dim);
-
-    pthread_rwlock_rdlock(&s->lock);
     if (s->tune_target > 0.0f) store_qlog_(s, qn);
     mcol = store_tqcol_(&s->metac);
+    memset(&tf, 0, sizeof(tf));
+    if (filtered) { tf.meta = &mcol; tf.all = all_bits; tf.any = any_bits; }
+    if (cnf && cnf->num && s->has_num) { ncol = store_tqcol_(&s->numc); tf.num = &ncol; tf.lo = cnf->lo; tf.hi = cnf->hi; }
+    if (cnf && cnf->ns_on && s->has_ns) { scol = store_tqcol_(&s->nsc); tf.ns = &scol; tf.nsv = cnf->ns; tf.nss = cnf->nss; tf.nns = cnf->nns; }
 
-    if (s->tq) {
-        /* candidates re-scored exactly: 20 k, at least 256 - four times that with 1-bit codes, which rank coarsely */
-        i32 R = filtered ? k * 40 + 256
-                         : (s->tq_rerank > 0 ? s->tq_rerank : (k * 20 > 256 ? k * 20 : 256) * (s->tq->bits == 1 ? 4 : 1) * (s->metric ? 4 : 1)), m, nth = 1;
-        i32 *rows = (i32 *)malloc((size_t)R * sizeof(i32));
+    exact = store_ns_exact_(s, cnf, qn, qlen, k, out_doc_ids, out_scores, &have);   /* a small namespace: its own rows */
+    if (exact) {}
+    else if (cnf && cnf->num && !s->has_num && (cnf->lo > 0 || cnf->hi < 0)) {}   /* no numbers yet: every row's is 0 */
+    else if (s->tq) {
+        i32 R = Rs, m, nth = 1;
         if (s->tq_threads > 0) nth = s->tq_threads;
         else if (s->tq->n >= 150000) { i32 c = store_ncpu_(s); nth = c > 4 ? 4 : c; }   /* the scan is memory-bound: 4 threads already saturate the bus */
-        m = store_scan_(s, qn, R, rows, &mcol, all_bits, any_bits, filtered, nth, s->tq_probe);
+        m = store_scan_(s, qn, R, rows, &tf, nth, s->tq_probe);
         store_rescore_(s, qn, qlen, cnf, rows, m, k, out_doc_ids, out_scores, &have);
         /* a selective filter can leave the probed clusters short of k matches: then scan every cluster's codes
          * (RAM, 4 bits a row) for matches, never every f32 row */
         if (filtered && have < k && s->tq->nc > 1) {
-            i32 j, z, n2 = store_scan_(s, qn, R, rows, &mcol, all_bits, any_bits, filtered, nth, s->tq->nc);
+            i32 j, z, n2 = store_scan_(s, qn, R, rows, &tf, nth, s->tq->nc);
             for (j = z = 0; j < n2; ++j) {
                 i32 x, dup = 0;
                 for (x = 0; x < have; ++x) if (out_doc_ids[x] == rows[j]) { dup = 1; break; }
@@ -53,50 +63,20 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
             }
             store_rescore_(s, qn, qlen, cnf, rows, z, k, out_doc_ids, out_scores, &have);
         }
-        free(rows);
-    } else if (s->idx) {
-        i32 sf = engine_scratch_floats(s->idx);
-        slut = (f32 *)malloc((size_t)sf * sizeof(f32));
-        sc.residual = slut;
-        sc.lut      = slut + dim;
-        sc.lids     = (i64 *)malloc((size_t)over * sizeof(i64));
-        sc.lsc      = (f32 *)malloc((size_t)over * sizeof(f32));
-        sc.probe    = (i32 *)malloc(64 * sizeof(i32));
-        got = engine_search_into(s->idx, qn, over, rid, rsc, &sc);
-        for (i = 0; i < got; ++i) {
-            i32 row = (i32)rid[i];
-            if (row < 0 || row >= s->built_upto || STORE_DEAD(s, row)) continue;
-            if (filtered && !store_meta_ok_(STORE_META(s, row), all_bits, any_bits)) continue;
-            if (cnf && !store_cnf_ok_(cnf, STORE_META(s, row))) continue;
-            eng_topk_(out_doc_ids, out_scores, k, &have, (i64)row, s->metric ? store_score_(s, qn, qlen, row) : rsc[i]);
-        }
-        free(sc.lids); free(sc.lsc); free(sc.probe);
-        /* engine path: a very selective filter can exclude the whole neighbourhood - exact filtered scan */
-        if (filtered && have < k) {
-            for (i = 0; i < s->built_upto; ++i) {
-                i32 j, dup = 0;
-                if (STORE_DEAD(s, i) || !store_meta_ok_(STORE_META(s, i), all_bits, any_bits)) continue;
-                if (cnf && !store_cnf_ok_(cnf, STORE_META(s, i))) continue;
-                for (j = 0; j < have; ++j) if (out_doc_ids[j] == i) { dup = 1; break; }
-                if (dup || store_row_bad_(s, i)) continue;
-                eng_topk_(out_doc_ids, out_scores, k, &have, (i64)i, store_score_(s, qn, qlen, i));
-            }
-        }
     }
 
-    tail = s->count;
+    tail = exact || (cnf && cnf->num && !s->has_num && (cnf->lo > 0 || cnf->hi < 0)) ? 0 : s->count;
     for (i = s->built_upto; i < tail; ++i) {                    /* the pending tail: exact */
         if (STORE_DEAD(s, i)) continue;
         if (filtered && !store_meta_ok_(STORE_META(s, i), all_bits, any_bits)) continue;
-        if (cnf && !store_cnf_ok_(cnf, STORE_META(s, i))) continue;
+        if (cnf && !store_cnf_ok_(s, cnf, i)) continue;
         if (store_row_bad_(s, i)) continue;
         eng_topk_(out_doc_ids, out_scores, k, &have, (i64)i, store_score_(s, qn, qlen, i));
     }
     for (i = 0; i < have; ++i) out_doc_ids[i] = STORE_ID(s, out_doc_ids[i]);   /* rows -> doc ids, only for the k kept */
 
     pthread_rwlock_unlock(&s->lock);
-    free(qn); free(rid); free(rsc);
-    if (slut) free(slut);
+    scr_put_(&scr);
     return have;
 }
 
@@ -159,6 +139,7 @@ void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, 
 {
     i32 dim = s->dim, R, off, i;
     f32 *qn, *ql;
+    Scr qa;
     if (nq <= 0 || k <= 0) return;
     if (nthreads < 1) nthreads = 1;
     if (!s->tq) {                                                /* no scan index: one query at a time, in parallel */
@@ -167,8 +148,12 @@ void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, 
         tq_par2_(store_each_, &e, nq, nthreads);
         return;
     }
-    qn = (f32 *)malloc((size_t)nq * (size_t)dim * sizeof(f32));
-    ql = (f32 *)malloc((size_t)nq * sizeof(f32));
+    if (scr_get_(&qa, scr_need_((size_t)nq * (size_t)dim * sizeof(f32)) + scr_need_((size_t)nq * sizeof(f32))) != 0) {
+        for (i = 0; i < nq * k; ++i) { out_ids[i] = -1; out_scores[i] = -1.0f; }   /* no memory: no hits */
+        return;
+    }
+    qn = (f32 *)scr_take_(&qa, (size_t)nq * (size_t)dim * sizeof(f32));
+    ql = (f32 *)scr_take_(&qa, (size_t)nq * sizeof(f32));
     memcpy(qn, Q, (size_t)nq * (size_t)dim * sizeof(f32));
     for (i = 0; i < nq; ++i) {                                   /* a query that is not finite: scanned as zeros */
         f32 *q = qn + (size_t)i * dim;
@@ -180,15 +165,58 @@ void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, 
     R = s->tq_rerank > 0 ? s->tq_rerank : (k * 20 > 256 ? k * 20 : 256) * (s->tq->bits == 1 ? 4 : 1) * (s->metric ? 4 : 1);   /* as one query */
     for (off = 0; off < nq; off += 1024) {                       /* batches of 1024 bound the per-query candidates */
         i32 m = nq - off < 1024 ? nq - off : 1024;
-        i32 *rows = (i32 *)malloc((size_t)m * (size_t)R * sizeof(i32)), *cnt = (i32 *)malloc((size_t)m * sizeof(i32));
+        i32 *rows, *cnt, z;
+        Scr ra;
         StoreBatch j;
+        if (scr_get_(&ra, scr_need_((size_t)m * (size_t)R * sizeof(i32)) + scr_need_((size_t)m * sizeof(i32))) != 0) {
+            for (z = off * k; z < (off + m) * k; ++z) { out_ids[z] = -1; out_scores[z] = -1.0f; }
+            continue;
+        }
+        rows = (i32 *)scr_take_(&ra, (size_t)m * (size_t)R * sizeof(i32)); cnt = (i32 *)scr_take_(&ra, (size_t)m * sizeof(i32));
         if (s->tq->codes1) tq_search_many_cascade(s->tq, qn + (size_t)off * dim, m, STORE_CAS_SHORT * R, R, rows, cnt, s->dead, nthreads, s->tq_probe);
         else tq_search_many(s->tq, qn + (size_t)off * dim, m, R, rows, cnt, s->dead, nthreads, s->tq_probe);
         j.s = s; j.qn = qn + (size_t)off * dim; j.qlen = ql + off; j.k = k; j.R = R; j.rows = rows; j.cnt = cnt;
         j.ids = out_ids + (size_t)off * k; j.sc = out_scores + (size_t)off * k;
         tq_par2_(store_batch_fin_, &j, m, nthreads);
-        free(rows); free(cnt);
+        scr_put_(&ra);
     }
     pthread_rwlock_unlock(&s->lock);
-    free(qn); free(ql);
+    scr_put_(&qa);
 }
+
+#define STORE_GROUP_MAX 65536   /* the most rows a grouped search ranks before it gives up on finding k groups */
+
+/* store_search (cnf: store_search_cnf) with at most one hit a group, the group of an id being (u64)id >> shift (0 to 63): best first from
+ * store_search, so a group's first hit is its best - keep it, skip the rest of the group; too few groups, ask for
+ * four times as many rows, up to STORE_GROUP_MAX or the whole store. Returns how many groups, -1 out of memory. */
+i32 store_search_cnf(RagStore *s, const f32 *query, i32 k, i64 *out_doc_ids, f32 *out_scores, const StoreCnf *c);
+i32 store_search_grouped(RagStore *s, const f32 *query, i32 k, i32 shift, const StoreCnf *cnf, i64 *ids, f32 *scores)
+{
+    i64 total, *ci;
+    f32 *cs;
+    i32 want, n, have, i, j;
+    Scr ga;
+    if (shift <= 0) return cnf ? store_search_cnf(s, query, k, ids, scores, cnf) : store_search(s, query, k, ids, scores);
+    total = store_count(s);
+    want = k > STORE_GROUP_MAX / 4 ? STORE_GROUP_MAX : k * 4;
+    if (want < 64) want = 64;
+    for (;;) {
+        if ((i64)want > total) want = total > 0 ? (i32)total : 1;
+        if (scr_get_(&ga, scr_need_((size_t)want * sizeof(i64)) + scr_need_((size_t)want * sizeof(f32))) != 0) return -1;
+        ci = (i64 *)scr_take_(&ga, (size_t)want * sizeof(i64));
+        cs = (f32 *)scr_take_(&ga, (size_t)want * sizeof(f32));
+        n = cnf ? store_search_cnf(s, query, want, ci, cs, cnf) : store_search(s, query, want, ci, cs);
+        for (i = have = 0; i < n && have < k; ++i) {
+            u64 g = (u64)ci[i] >> shift;
+            for (j = 0; j < have && ((u64)ids[j] >> shift) != g; ++j) {}
+            if (j == have) { ids[have] = ci[i]; scores[have] = cs[i]; ++have; }
+        }
+        scr_put_(&ga);
+        if (have >= k || n < want || (i64)want >= total || want >= STORE_GROUP_MAX) break;
+        want = want > STORE_GROUP_MAX / 4 ? STORE_GROUP_MAX : want * 4;
+    }
+    return have;
+}
+
+/* searches of this process that found no memory for their working buffers and returned no hits (scratch.h) */
+i64 store_oom_count(void) { return tq_oom_count(); }

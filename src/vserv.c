@@ -2,8 +2,9 @@
  * (third_party/bearssl, MIT, no malloc inside). Nothing else.
  *
  *   vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-g AGGRESSION] [-m TIER] [-C] [-d DIM] [-x] [-L] [-r RECALL]
- *         [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT.pem -k KEY.pem [-a CA.pem] [-P] [-T]] [-U]
+ *         [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT.pem -k KEY.pem [-a CA.pem] [-P] [-T]] [-U] [-K KEYS]
  *         STORE.vxi | DIR
+ *   vserv -F HOST:PORT|SOCK [-P] [-f SECONDS] [-l DEST] REPLICA.vxi | DIR      (a replica on a second machine)
  *     STORE.vxi one store; DIR: a store per tenant, DIR/NAME.vxi, opened on a client's first "use NAME" (created
  *               there when it does not exist yet; -d gives every tenant's dimension and is required) and kept open
  *     -s PATH   Unix socket, created mode 0600 (default ./vecindex.sock when -p is not given)
@@ -35,13 +36,25 @@
  *     -l DEST   log connections, every write and every refusal, with who made it (vserv_log.c): syslog, - (stderr)
  *               or a file
  *     -A        log every search as well
- *     -c, -k    TLS: certificate chain and private key (PEM, EC or RSA). The TCP port then takes only TLS: HTTPS,
- *               or the binary protocol inside TLS (-P lets plaintext in too). The Unix socket takes TLS as well and
- *               still accepts plaintext from local clients, unless -T
+ *     -c, -k    TLS: certificate chain and private key (PEM, EC or RSA). Without them a server with a TCP port makes
+ *               its own the first time (vserv_tls_auto.c): vserv.key (0600) and vserv.crt next to the store, a
+ *               self-signed EC P-256 certificate, its fingerprint printed at every start for clients to pin. Either
+ *               way the TCP port takes only TLS: HTTPS, or the binary protocol inside TLS (-P lets plaintext in
+ *               too). The Unix socket takes TLS as well and still accepts plaintext from local clients, unless -T
  *     -a FILE   mutual TLS: a client must present a certificate that chains to one of the CA certificates in FILE
  *               (or is one of them), else the handshake fails; its name goes into the log
  *     -U        with DIR and -a: a client certificate's name is the one tenant it may use - the CA, not the server,
  *               decides who sees which tenant (clients without a certificate, on the Unix socket, may use any)
+ *     -K FILE   API keys, a line each: KEY TENANT (vserv_keys.c). A TCP client shows its key first (auth KEY, binary
+ *               op 20, or Authorization: Bearer KEY on every HTTP request) and reaches only its tenant: with one
+ *               store, a namespace of it with ids of its own (TENANT a number, 1 to 524287); with DIR, the tenant's
+ *               file (TENANT its name); KEY TENANT ROWS QPS adds limits, KEY * is the operator's key. Keys
+ *               cannot build, save, snapshot or scrub, nor read /metrics or /prometheus; the Unix socket needs none
+ *     -F ADDR   be a replica of the primary at ADDR (HOST:PORT over TLS - -P: plaintext - or a Unix socket): copy
+ *               its file and journal into REPLICA.vxi (or every tenant into DIR) every -f seconds, until SIGTERM;
+ *               it serves nothing. The primary's TLS key is pinned in vserv.pin beside the replica on the first
+ *               connection ($VSERV_PIN gives it instead), and a primary that shows another key is refused.
+ *               $VSERV_KEY: the operator's key of a primary with -K. Failover: stop it, start vserv on REPLICA
  *
  * The store is opened with store_load (mmap: ready in milliseconds whatever its size). Every socket speaks three
  * protocols, told apart by the first byte of a request (vserv_proto.c has the details):
@@ -51,9 +64,10 @@
  *   lines (a lowercase letter): "search 10 0.1 0.2 ..." -> "ok 3 42 -0.01 17 -0.12 9 -0.31", one line each way,
  *     for nc, socat and a readline in any language; texts: addt, text, range, hybrid, words
  *   HTTP/1.1 (anything else), for curl and friends; keep-alive, Content-Length bodies:
- *     GET /health | GET /stats | GET /get?id=N | GET /text?id=N | GET /range?lo=A&hi=B | POST /search?k=10 |
+ *     GET /health | GET /stats | GET /get?id=N | GET /text?id=N | GET /range?lo=A&hi=B | POST /search?k=10
+ *     (&exact=1: the k best by exact score with a proof, and "checked": rows scored exactly) |
  *     POST /hybrid?k=10 | POST /add?id=N | POST /delete?id=N (or ?lo=A&hi=B) | POST /build | POST /save |
- *     POST /snapshot; vectors as a JSON array ([0.1, -0.2, ...]), {"vector": [...], "text": "..."}, or raw
+ *     POST /snapshot | GET /metrics (JSON) | GET /prometheus (the Prometheus text format); vectors as a JSON array ([0.1, -0.2, ...]), {"vector": [...], "text": "..."}, or raw
  *     little-endian f32 with Content-Type: application/octet-stream; replies are JSON.
  * An add replaces the row with the same id in every protocol: one row per id. A tenant server first needs the
  * tenant: "use NAME" (lines), op 14 (binary), or a path under /t/NAME/ (HTTP: /t/acme/search?k=10); tenants share
@@ -62,7 +76,7 @@
  * Who may connect is the operating system's business (the socket file's mode and group, the address the port is
  * bound to) and TLS client certificates'; what each connection did goes to the log. Durability: the journal of
  * changes is flushed every second (-f) and folded into the file by background snapshots (store_snapshot), so a
- * restart replays at most what came in since the last snapshot. Replication is a copy of the file and its journal.
+ * restart replays at most what came in since the last snapshot. Replication (-F) copies the file and its journal.
  *
  * TLS (when -c/-k are given): a connection is TLS when its first byte is a handshake record (0x16). TLS 1.2 only,
  * ECDHE key exchange (forward secrecy), AEAD suites only (AES-GCM - AES-NI when the CPU has it - and
@@ -130,7 +144,11 @@ typedef struct VsConn {
     char peer[112];                             /* who is on the other end (vserv_log.c) */
     struct VsTen *t;                            /* the store its requests go to; NULL: a tenant server, none chosen */
     StoreWb *wb;                                /* a batch it began: its writes wait here until commit (or abort) */
+    const struct VsKey *key;                    /* the API key it showed (vserv_keys.c); NULL: none */
+    i64 tn;                                     /* one store with keys: its tenant (a namespace, ids tn << 44 | id); 0: all */
 } VsConn;
+struct VsKey { char key[129]; i32 klen, admin; i64 tn, rows, qps; char name[65]; };   /* an API key (vserv_keys.c) */
+
 
 typedef struct { i32 fd, tcp; } VsListen;       /* epoll data for a listening socket */
 
@@ -331,6 +349,10 @@ static const char *vs_use_(VsConn *c, const char *name, i32 n)
         return "a batch is open: commit or abort it first";
     if (n < 1 || n > VS_TNAME) return "a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -";
     for (i = 0; i < n; ++i) if (!vs_tname_ok_(name[i])) return "a tenant's name is 1 to 64 of A-Z a-z 0-9 _ -";
+    if (c->key && !c->key->admin && (strlen(c->key->name) != (size_t)n || memcmp(c->key->name, name, (size_t)n) != 0)) {
+        vs_log_(c, 1, "use %.*s refused: the key is for another tenant", (int)n, name);
+        return "your key is for another tenant";
+    }
 #ifdef VSERV_TLS
     if (vs_ten_cn && c->tls && c->tls->cn.status > 0
         && (strlen(c->tls->cnbuf) != (size_t)n || memcmp(c->tls->cnbuf, name, (size_t)n) != 0)) {
@@ -525,16 +547,21 @@ static void vs_flush_(VsWorker *w, VsConn *c)
 /* the k nearest rows; their scores as the store's metric gives them: the cosine, the inner product, the L2 distance */
 static i32 vs_search_(VsWorker *w, VsConn *c, const f32 *q, i32 k)
 {
-    i32 n = store_search(c->t->s, q, k, w->ids, w->sc), i;
-    for (i = 0; i < n; ++i) w->sc[i] = store_score_out(c->t->s, w->sc[i]);
+    i32 n = c->tn ? store_search_ns(c->t->s, c->tn, q, k, w->ids, w->sc) : store_search(c->t->s, q, k, w->ids, w->sc), i;
+    for (i = 0; i < n; ++i) { w->sc[i] = store_score_out(c->t->s, w->sc[i]); if (c->tn) w->ids[i] &= ((i64)1 << 44) - 1; }
     return n;
 }
 
+/* rows, dimension, rows not indexed yet, built - a tenant (keys, one store) sees its own rows, and none of the rest */
 static void vs_stats_(VsConn *c, i64 *v)
 {
-    v[0] = store_count(c->t->s); v[1] = vs_dim; v[2] = store_pending(c->t->s); v[3] = store_built(c->t->s);
+    v[0] = c->tn ? store_count_ns(c->t->s, c->tn) : store_count(c->t->s); v[1] = vs_dim;
+    v[2] = c->key ? 0 : store_pending(c->t->s); v[3] = c->key ? 1 : store_built(c->t->s);
 }
 
+#include "vserv_tls_auto.c"
+#include "vserv_metrics.c"
+#include "vserv_keys.c"
 #include "vserv_proto.c"
 
 /* ---- connection lifecycle ---- */
@@ -895,7 +922,7 @@ static void vs_housekeep_(f64 sync_s, f64 snap_s)
 int main(int argc, char **argv)
 {
     const char *sock = (const char *)0, *bind_addr = "127.0.0.1", *cert = (const char *)0, *key = (const char *)0, *ca = (const char *)0;
-    const char *logdest = (const char *)0, *path = (const char *)0;
+    const char *logdest = (const char *)0, *path = (const char *)0, *keys = (const char *)0, *follow = (const char *)0;
     i32 port = 0, nth = 0, dim = 0, save_on_exit = 0, created = 0, memrc = 0, i, j;
     i64 hot = 0, cold = 0;
     f32 aggr = -1.0f;
@@ -925,6 +952,7 @@ int main(int argc, char **argv)
             else { fprintf(stderr, "vserv: -M is cosine, dot or l2, not %s\n", m); return 2; }
         }
         else if (!strcmp(argv[i], "-U")) vs_ten_cn = 1;
+        else if (!strcmp(argv[i], "-K") && i + 1 < argc) keys = argv[++i];
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) vs_recall = (f32)atof(argv[++i]);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) cert = argv[++i];
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) key = argv[++i];
@@ -935,16 +963,19 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-S") && i + 1 < argc) snap_s = atof(argv[++i]);
         else if (!strcmp(argv[i], "-l") && i + 1 < argc) logdest = argv[++i];
         else if (!strcmp(argv[i], "-A")) vs_log_all = 1;
+        else if (!strcmp(argv[i], "-F") && i + 1 < argc) follow = argv[++i];
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else {
             fprintf(stderr, "usage: vserv [-s SOCK] [-p PORT] [-b ADDR] [-t THREADS] [-g A] [-m TIER] [-C] [-d DIM] [-x] [-L] [-r RECALL]\n"
-                            "             [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT -k KEY [-a CA] [-P] [-T]] [-U]\n"
-                            "             STORE.vxi | DIR\n");
+                            "             [-f SECONDS] [-S SECONDS] [-l syslog|-|FILE] [-A] [-c CERT -k KEY [-a CA] [-P] [-T]] [-U] [-K KEYS]\n"
+                            "             STORE.vxi | DIR\n"
+                            "       vserv -F HOST:PORT|SOCK [-P] [-f SECONDS] [-l DEST] REPLICA.vxi | DIR\n");
             return 2;
         }
     }
     if (logdest && vs_log_open_(logdest) != 0) { fprintf(stderr, "vserv: cannot open the log %s: %s\n", logdest, strerror(errno)); return 1; }
     if (!path) { fprintf(stderr, "vserv: no store file or tenant directory given\n"); return 2; }
+    if (follow) return vs_follow_(follow, path, sync_s);            /* a replica: copies, serves nothing (vserv_repl.c) */
     if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {           /* a directory: a store per tenant in it */
         char *d = (char *)malloc(strlen(path) + 1);
         size_t n;
@@ -956,10 +987,22 @@ int main(int argc, char **argv)
         vs_dim = dim;
     }
     if (vs_ten_cn && !vs_dir) { fprintf(stderr, "vserv: -U binds clients to tenants: give a directory\n"); return 2; }
-    if ((cert || key || ca || vs_unix_tls_only) && !(cert && key)) { fprintf(stderr, "vserv: TLS needs both -c CERT and -k KEY\n"); return 2; }
+    if (keys && vs_keys_load_(keys) != 0) return 2;              /* after vs_dir: a key names a tenant or a number */
+    if ((cert || key) && !(cert && key)) { fprintf(stderr, "vserv: TLS needs both -c CERT and -k KEY\n"); return 2; }
 #ifdef VSERV_TLS
+    if (!cert && (port || ca || vs_unix_tls_only)) {             /* TLS with nothing to configure (vserv_tls_auto.c) */
+        if (vs_tls_auto_(path, vs_dir != (const char *)0, &cert, &key) != 0) {
+            if (!vs_plain_ok || ca || vs_unix_tls_only) return 1;
+            fprintf(stderr, "vserv: serving plaintext only (-P)\n");
+        }
+    }
     if (cert) {
+        char pin[64];
         if (vs_tls_load_(cert, key, ca)) return 1;
+        if (vs_pin_of_(vs_chain[0].data, vs_chain[0].data_len, pin) == 0) {
+            fprintf(stderr, "vserv: TLS key %s (curl -k --pinnedpubkey %s; a replica remembers it)\n", pin, pin);
+            vs_log_((const VsConn *)0, 0, "tls key=%s", pin);
+        }
         vs_tls_on = 1;
         vs_cache_mem = (unsigned char *)malloc(VS_CACHE_BYTES);
         br_ssl_session_cache_lru_init(&vs_cache.lru, vs_cache_mem, VS_CACHE_BYTES);
@@ -967,7 +1010,7 @@ int main(int argc, char **argv)
         vs_cache.vtable = &vs_cache_class;
     }
 #else
-    if (cert) { fprintf(stderr, "vserv: built without TLS (VSERV_NO_TLS)\n"); return 2; }
+    if (cert || ca || vs_unix_tls_only) { fprintf(stderr, "vserv: built without TLS (VSERV_NO_TLS)\n"); return 2; }
 #endif
     if (!vs_tls_on) vs_plain_ok = 1;
     if (!sock && !port) sock = "vecindex.sock";
@@ -977,6 +1020,7 @@ int main(int argc, char **argv)
     vs_aggr = aggr;
     if (nth <= 0) { nth = (i32)(aggr * (f32)store_cpus_avail_() + 0.5f); if (nth < 1) nth = 1; }
 
+    vs_m_t0 = vs_now_();
     t0 = vs_now_();
     if (!vs_dir) {                                               /* one store */
         vs_one.path = path;

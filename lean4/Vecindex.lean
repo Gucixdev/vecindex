@@ -18,3 +18,10 @@ import Vecindex.Codes
 import Vecindex.Hadamard
 import Vecindex.TopK
 import Vecindex.CodeGen
+import Vecindex.Tenant
+import Vecindex.Journal
+import Vecindex.Rate
+import Vecindex.NsSet
+import Vecindex.Emeans
+import Vecindex.Exact
+import Vecindex.Config

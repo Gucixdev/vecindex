@@ -27,9 +27,9 @@ proposes 256+ candidates; the f32 rows the store keeps re-score them exactly, wh
 
 ## Index choice
 
-`store_build` picks automatically: with no memory budget (default) the TurboQuant-style scan (`src/tq.c`);
-with `ENG_MIN_SIZE` or a `max_code_bytes` below the f32 size, the q1-q5 / IVF / HNSW tuner (`engine_build`),
-which is what small-footprint goals need.
+`store_build` builds the one index there is: the TurboQuant-style scan (`src/tq.c`). The q1-q5 / IVF / HNSW tuner
+that small code budgets once selected is retired (`trash/src/`); a small footprint is now `vi_set_layout` (2-bit
+codes, int8 rows). A file saved with the old engine's index still loads: its rows are read and the scan index built.
 
 ## Stemming: Polish and English together
 
@@ -159,6 +159,14 @@ the page cache (major faults), the store asks for all of a query's rows at once 
 blocking fault after another - ~190k IOPS batched against ~21k one by one on this disk. Ids that arrive in increasing
 order (the usual case) need no id map at all (binary search over the id column); only rows added out of order go
 into an 8-byte-a-slot hash.
+
+A loaded index whose scanned codes are more than half of RAM (the machine's, or a cgroup's cap) is cold: the load no
+longer reads all of them in, and a search pages in only the clusters it probes. Measured with `bench/cold.c` on this
+VM (2M rows, d=96, 97 MB of codes, 301 of 5647 clusters probed, page cache dropped first): 0.7 ms median a query and
+12 major faults, against 0.4 ms warm. Asking for each probed cluster with `MADV_WILLNEED` before the scan was tried
+and dropped: fewer faults, slower here. A file that large also opens with the lens instead of reading every
+block for its digest first (see [api.md](api.md): checked when needed, and walked one block at a time in the
+background); `bench/cold.c` runs with `VECINDEX_VERIFY=1` so the walk does not warm the cache it measures.
 
 For stores past what RAM and disk allow at f32, two knobs: `store_set_codes(s, 2)` (2-bit codes: half the RAM,
 twice the scan speed, re-score more candidates) and `store_set_vec_bytes(s, 1)` (int8 rows with an f32 scale: d + 4

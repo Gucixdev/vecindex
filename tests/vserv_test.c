@@ -68,6 +68,7 @@ static pid_t start(const char *extra1, const char *extra2, const char *extra3)
         int n = 0;
         argv[n++] = getenv("VSERV"); argv[n++] = "-s"; argv[n++] = sock_path; argv[n++] = "-p"; argv[n++] = ports;
         argv[n++] = "-t"; argv[n++] = "2"; argv[n++] = "-d"; argv[n++] = "8"; argv[n++] = "-l"; argv[n++] = log_path;
+        argv[n++] = "-P";                        /* plaintext on TCP beside the automatic TLS: these checks speak it */
         if (extra1) argv[n++] = extra1;
         if (extra2) argv[n++] = extra2;
         if (extra3) argv[n++] = extra3;
@@ -152,6 +153,55 @@ static int count_of(int fd)
     const char *c;
     if (ask(fd, "stats\n", r, sizeof(r)) < 0 || !(c = strstr(r, "count="))) return -1;
     return atoi(c + 6);
+}
+
+/* 1 when the files at a and b hold the same bytes (both missing counts as different) */
+static int same_file(const char *a, const char *b)
+{
+    FILE *f = fopen(a, "rb"), *g = fopen(b, "rb");
+    int ca = 0, cb = 0, same = f && g;
+    while (same) { ca = getc(f); cb = getc(g); if (ca != cb) same = 0; else if (ca == EOF) break; }
+    if (f) fclose(f);
+    if (g) fclose(g);
+    return same;
+}
+
+/* the replica's file and journal equal the primary's, within ms */
+static int wait_same(const char *pa, const char *ra, int ms)
+{
+    char pj[256], rj[256];
+    int t;
+    sprintf(pj, "%s.j", pa); sprintf(rj, "%s.j", ra);
+    for (t = 0; t < ms; t += 50) { if (same_file(pa, ra) && same_file(pj, rj)) return 1; msleep(50); }
+    return 0;
+}
+
+/* vserv -F ADDR -f 0.1 REPLICA, $VSERV_KEY = key when given */
+static pid_t follow(const char *addr, const char *rep, const char *key)
+{
+    pid_t p = fork();
+    if (p == 0) {
+        char flog[160];
+        if (key) setenv("VSERV_KEY", key, 1); else unsetenv("VSERV_KEY");
+        sprintf(flog, "%s/follow.log", dir);
+        if (!freopen(flog, "a", stderr)) {}
+        execl(getenv("VSERV"), getenv("VSERV"), "-F", addr, "-f", "0.1", rep, (char *)0);
+        _exit(127);
+    }
+    return p;
+}
+
+/* rows id0..id1-1 with the text "row ID", over a connection */
+static int add_rows(int fd, long id0, long id1)
+{
+    char l[2048], r[256];
+    long id;
+    for (id = id0; id < id1; ++id) {
+        vline(l, "addt", id, (int)id);
+        sprintf(l + strlen(l) - 1, " row %ld\n", id);
+        if (ask(fd, l, r, sizeof(r)) < 0 || strcmp(r, "ok")) return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -392,6 +442,234 @@ int main(int argc, char **argv)
         stop(p, SIGTERM);
     }
 
+    /* grouped search, numbers and number ranges, update keeping the rest of the row: line protocol, binary, HTTP,
+     * a batch, and the journal across a kill -9 */
+    {   long d0 = 1L << 20, d1 = 2L << 20, d2 = 3L << 20, id;
+        int c2, ok, m;
+        float v[DIM];
+        unsigned char pay[256];
+        p = start(NULL, NULL, NULL);
+        fd = connect_unix();
+        for (i = 0; i < 30; ++i) { vline(line, "add", (i < 10 ? d0 : (i < 20 ? d1 : d2)) | (i % 10), 9000 + i); ask(fd, line, r, sizeof(r)); }
+        for (i = 0, ok = 1; i < 30; ++i) {
+            sprintf(line, "num %ld %d\n", (i < 10 ? d0 : (i < 20 ? d1 : d2)) | (i % 10), i % 10);
+            ok &= ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok");
+        }
+        check(ok, "num ID N on 30 rows -> ok");
+        sprintf(line, "num %ld\n", d1 | 7);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok 7"), "num ID -> ok N");
+        check(ask(fd, "num 5\n", r, sizeof(r)) > 0 && !strcmp(r, "err no such id") && ask(fd, "num 5 1\n", r, sizeof(r)) > 0
+              && !strcmp(r, "err no such id"), "num of an unknown id, read or set -> err no such id");
+        vline(line, "group 3", 20, 9000 + 13);                   /* the vector of document 2, chunk 3 */
+        sprintf(what, "ok 3 %ld ", d1 | 3);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strncmp(r, what, strlen(what)), "group 3 20 -> 3 hits, the query's own row first");
+        {   long g[3]; char *q = r + 5;
+            for (m = 0; m < 3; ++m) { g[m] = strtol(q, &q, 10) >> 20; strtod(q, &q); }
+            check(g[0] != g[1] && g[0] != g[2] && g[1] != g[2], "group 3 20 -> three different documents"); }
+        vline(line, "group 3", 64, 1);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strncmp(r, "err usage: group", 16), "group with SHIFT 64 -> err usage");
+        vline(line, "between 5 3", 3, 9000 + 13);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strncmp(r, "ok 3 ", 5) && strstr(r, " 1048579 ") && strstr(r, " 2097155 ") && strstr(r, " 3145731 "),
+              "between 5 3 3 -> the 3 rows whose number is 3");
+        vline(line, "between 5 4", 3, 1);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strncmp(r, "err usage: between", 18), "between with LO > HI -> err usage");
+        vline(line, "update", d0 | 4, 77777);                    /* a new vector for document 1 chunk 4: number 4 kept */
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok"), "update ID X1 .. X8 -> ok");
+        vline(line, "update", 4242, 1);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strncmp(r, "err no such id", 14), "update of an unknown id -> err");
+        sprintf(line, "num %ld\n", d0 | 4);
+        vline(what, "between 1 4", 4, 77777); what[strlen(what)] = 0;
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok 4") && ask(fd, what, r, sizeof(r)) > 0 && !strncmp(r, "ok 1 1048580 ", 13),
+              "after update: the number kept, and the new vector found");
+        check(ask(fd, "begin\n", r, sizeof(r)) > 0 && !strcmp(r, "ok"), "begin");
+        sprintf(line, "num %ld 99\n", d2 | 9);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok queued"), "num in a batch -> ok queued");
+        vline(line, "update", d2 | 9, 88888);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok queued"), "update in a batch -> ok queued");
+        check(ask(fd, "commit sync\n", r, sizeof(r)) > 0 && !strcmp(r, "ok 2"), "commit sync -> ok 2");
+        stop(p, SIGKILL);                                         /* the journal carries the numbers and the updates */
+        p = start(NULL, NULL, NULL);
+        close(fd);
+        fd = connect_unix();
+        sprintf(line, "num %ld\n", d2 | 9);
+        vline(what, "between 1 99", 99, 88888);
+        check(ask(fd, line, r, sizeof(r)) > 0 && !strcmp(r, "ok 99") && ask(fd, what, r, sizeof(r)) > 0 && !strncmp(r, "ok 1 3145737 ", 13),
+              "kill -9, restart: the batch's number and update are there");
+        id = d1 | 3;                                             /* binary: get its vector, then search with it */
+        check(bin_call(fd, 8, &id, 8, &st, &rnb, rb) == 0 && st == 0 && rnb == DIM * 4, "binary get of a row for the queries");
+        memcpy(v, rb, sizeof(v));
+        {   unsigned sh = 20; memcpy(pay, &sh, 4); memcpy(pay + 4, v, sizeof(v)); }
+        c2 = bin_call(fd, 15, pay, 4 + sizeof(v), &st, &rnb, rb);
+        {   long long h0, g1, g2;
+            memcpy(&h0, rb, 8);                                    /* k 0: 10, and the store holds earlier tests' rows */
+            memcpy(&g1, rb + 12, 8); memcpy(&g2, rb + 24, 8);
+            check(c2 == 0 && st == 0 && rnb >= 3 * 12 && rnb % 12 == 0 && h0 == (long long)(d1 | 3) && (g1 >> 20) != (h0 >> 20)
+                  && (g2 >> 20) != (h0 >> 20) && (g1 >> 20) != (g2 >> 20), "binary grouped search (op 15): its own row first, one hit a document"); }
+        {   long long lh[2]; lh[0] = 3; lh[1] = 3; memcpy(pay, lh, 16); memcpy(pay + 16, v, sizeof(v)); }
+        check(bin_call(fd, 16, pay, 16 + sizeof(v), &st, &rnb, rb) == 0 && st == 0 && rnb == 3 * 12, "binary number range (op 16): the 3 rows numbered 3");
+        {   long long q2[2]; q2[0] = d0 | 1; q2[1] = -5; memcpy(pay, q2, 16); }
+        check(bin_call(fd, 18, pay, 16, &st, &rnb, rb) == 0 && st == 0, "binary set a number (op 18)");
+        id = d0 | 1;
+        {   long long nv = 0;
+            c2 = bin_call(fd, 19, &id, 8, &st, &rnb, rb); memcpy(&nv, rb, 8);
+            check(c2 == 0 && st == 0 && rnb == 8 && nv == -5, "binary get a number (op 19): -5"); }
+        memcpy(pay, &id, 8); memcpy(pay + 8, v, sizeof(v));
+        check(bin_call(fd, 17, pay, 8 + sizeof(v), &st, &rnb, rb) == 0 && st == 0, "binary update (op 17)");
+        id = 4242; memcpy(pay, &id, 8);
+        check(bin_call(fd, 17, pay, 8 + sizeof(v), &st, &rnb, rb) == 0 && st == 1, "binary update of no row -> status 1");
+        {   char body[256], req[512]; int n = sprintf(body, "[");
+            for (m = 0; m < DIM; ++m) n += sprintf(body + n, "%s%.6f", m ? "," : "", (double)v[m]);
+            strcat(body, "]");
+            sprintf(req, "POST /search?k=3&group=20 HTTP/1.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", (int)strlen(body), body);
+            {   char a1[32], a2[32];                             /* d0|1 has this vector now too: both documents lead */
+                sprintf(a1, "%ld", d0 | 1); sprintf(a2, "%ld", d1 | 3);
+                check(http(req, r, sizeof(r)) > 0 && strstr(r, "{\"ids\":[") && strstr(r, a1) && strstr(r, a2), "HTTP /search?k=3&group=20"); }
+            sprintf(req, "POST /search?k=9&lo=-5&hi=-5 HTTP/1.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", (int)strlen(body), body);
+            sprintf(what, "{\"ids\":[%ld],", d0 | 1);
+            check(http(req, r, sizeof(r)) > 0 && strstr(r, what), "HTTP /search?lo=-5&hi=-5: the one row numbered -5");
+            sprintf(req, "POST /search?k=3&group=20&lo=1 HTTP/1.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", (int)strlen(body), body);
+            check(http(req, r, sizeof(r)) > 0 && strstr(r, "400 Bad Request"), "HTTP /search with group and lo -> 400");
+            sprintf(req, "POST /update?id=%ld HTTP/1.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", d2 | 0, (int)strlen(body), body);
+            check(http(req, r, sizeof(r)) > 0 && strstr(r, "{\"ok\":true}"), "HTTP POST /update?id=");
+        }
+        sprintf(line, "POST /num?id=%ld&num=123 HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", d2 | 0);
+        check(http(line, r, sizeof(r)) > 0 && strstr(r, "{\"ok\":true}"), "HTTP POST /num?id=&num=");
+        sprintf(line, "GET /num?id=%ld HTTP/1.1\r\nConnection: close\r\n\r\n", d2 | 0);
+        check(http(line, r, sizeof(r)) > 0 && strstr(r, "{\"num\":123}"), "HTTP GET /num?id= -> 123");
+        check(http("GET /num?id=4242 HTTP/1.1\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0 && strstr(r, "404"), "HTTP GET /num of no row -> 404");
+        close(fd);
+        stop(p, SIGTERM);
+        check(log_has("update id=") && log_has("num id="), "log: the updates and numbers");
+    }
+
+    /* API keys (-K): two tenants in one store, each its own ids - both have an id 1 - and none of the other's rows in
+     * any protocol; housekeeping refused to a key; the Unix socket sees everything; the journal keeps it all */
+    {   char kpath[160], kstore[160], hreq[1024], body[256];
+        const char *k7 = "k_seven_0123456789ab", *k9 = "k_nine_0123456789abcd";
+        const char *old = serve_path;
+        int f7, f9, fa, ok, q, m;
+        FILE *kf;
+        sprintf(kpath, "%s/keys.tsv", dir); sprintf(kstore, "%s/keys.vxi", dir);
+        {   /* a line past the reader's 511 bytes: once its tail was read as a line of its own, so a long comment could
+             * carry a key ("# xxx...x injected_key_0123456789 7") - now the file is refused */
+            char lp[300];
+            int st2 = 0, t;
+            pid_t q;
+            sprintf(lp, "%s/long.tsv", dir);
+            if ((kf = fopen(lp, "w")) != (FILE *)0) {
+                fputc('#', kf);
+                for (t = 0; t < 510; ++t) fputc('x', kf);
+                fprintf(kf, " injected_key_0123456789 7\nk_good_0123456789abcde 3\n");
+                fclose(kf);
+            }
+            q = fork();
+            if (q == 0) { if (!freopen("/dev/null", "w", stderr)) {} execl(getenv("VSERV"), getenv("VSERV"), "-s", sock_path, "-d", "8", "-K", lp, kstore, (char *)0); _exit(127); }
+            for (t = 0; t < 100 && waitpid(q, &st2, WNOHANG) == 0; ++t) msleep(50);
+            if (t == 100) stop(q, SIGTERM);
+            check(t < 100 && WIFEXITED(st2) && WEXITSTATUS(st2) != 0, "-K: a line longer than 510 bytes -> the key file is refused (no key from a comment's tail)");
+        }
+        kf = fopen(kpath, "w");
+        if (kf) {
+            fprintf(kf, "# key tenant [rows [qps]]\n%s\t7\n%s   9\nk_admin_0123456789abcd *\n", k7, k9);
+            fprintf(kf, "k_rows_0123456789abcde 11 5\nk_rate_0123456789abcde 12 0 3\n");
+            fclose(kf);
+        }
+        serve_path = kstore;
+        p = start("-K", kpath, NULL);
+        f7 = connect_tcp(); f9 = connect_tcp(); fa = connect_unix();
+        vline(line, "search 3", 0, 1); line[strlen(line) - 1] = 0; memmove(line + 9, line + 11, strlen(line + 11) + 1); strcat(line, "\n");
+        check(ask(f7, line, r, sizeof(r)) > 0 && !strcmp(r, "err auth KEY first"), "-K: a TCP search before auth -> err auth KEY first");
+        check(ask(f7, "ping\n", r, sizeof(r)) > 0 && !strcmp(r, "ok pong"), "-K: ping needs no key");
+        check(ask(f7, "auth k_wrong_aaaaaaaaaaaa\n", r, sizeof(r)) > 0 && !strcmp(r, "err unknown key"), "auth with an unknown key -> err");
+        sprintf(line, "auth %s\n", k7);
+        check(ask(f7, line, r, sizeof(r)) > 0 && !strcmp(r, "ok"), "auth with tenant 7's key -> ok");
+        sprintf(line, "auth %s\n", k9); ask(f9, line, r, sizeof(r));
+        for (i = 0, ok = 1; i < 20; ++i) {
+            vline(line, "add", 1 + i, 3000 + i); ok &= ask(f7, line, r, sizeof(r)) > 0 && !strcmp(r, "ok");
+            vline(line, "add", i ? 100 + i : 1, 4000 + i); ok &= ask(f9, line, r, sizeof(r)) > 0 && !strcmp(r, "ok");
+        }
+        check(ok && count_of(f7) == 20 && count_of(f9) == 20, "two tenants add 20 rows each, both an id 1: each counts its own 20");
+        check(count_of(fa) == 40, "the Unix socket, no key: all 40 rows");
+        {   char a7[512], a9[512];
+            ask(f7, "get 1\n", a7, sizeof(a7)); ask(f9, "get 1\n", a9, sizeof(a9));
+            check(!strncmp(a7, "ok ", 3) && !strncmp(a9, "ok ", 3) && strcmp(a7, a9) != 0, "get 1: each tenant its own row 1");
+        }
+        check(ask(f7, "get 105\n", r, sizeof(r)) > 0 && !strcmp(r, "err no such id"), "tenant 7 cannot get tenant 9's row 105");
+        for (q = 0, ok = 1; q < 20; ++q) {                       /* searches with tenant 9's own vectors: tenant 7 never sees them */
+            char *z;
+            vline(line, "search 10", 0, 4000 + q); line[strlen(line) - 1] = 0; memmove(line + 10, line + 12, strlen(line + 12) + 1); strcat(line, "\n");
+            ask(f7, line, r, sizeof(r));
+            if (strncmp(r, "ok 10 ", 6)) ok = 0;
+            for (z = r + 6, m = 0; m < 10; ++m) { long id = strtol(z, &z, 10); strtod(z, &z); if (id < 1 || id > 20) ok = 0; }
+        }
+        check(ok, "tenant 7 searches with tenant 9's vectors: only its own ids 1-20 come back");
+        check(ask(f7, "del 100 119\n", r, sizeof(r)) > 0 && !strcmp(r, "ok 0") && count_of(f9) == 20, "tenant 7 deleting 100-119: none of tenant 9's go");
+        check(ask(f7, "build\n", r, sizeof(r)) > 0 && !strncmp(r, "err the server's housekeeping", 29), "build with a key -> refused");
+        vline(line, "add", 17592186044416L, 1);
+        check(ask(f7, line, r, sizeof(r)) > 0 && !strncmp(r, "err", 3), "an id of 2^44 from a tenant -> err");
+        check(ask(f7, "stats\n", r, sizeof(r)) > 0 && !strcmp(r, "ok count=20 dim=8"), "stats with a key: its own count and the dimension, nothing else");
+        {   unsigned char pay[64];
+            int fb = connect_tcp();
+            float v[DIM];
+            memset(v, 0, sizeof(v)); v[0] = 1.0f;
+            memcpy(pay, v, sizeof(v));
+            check(bin_call(fb, 1, pay, sizeof(v), &st, &rnb, rb) == 0 && st == 6, "binary search before a key (op 1) -> status 6");
+            check(bin_call(fb, 20, k9, (unsigned)strlen(k9), &st, &rnb, rb) == 0 && st == 0, "binary auth (op 20) -> status 0");
+            {   int c2 = bin_call(fb, 1, pay, sizeof(v), &st, &rnb, rb), z; long long id;
+                ok = c2 == 0 && st == 0 && rnb == 10 * 12;
+                for (z = 0; ok && z < 10; ++z) { memcpy(&id, rb + 12 * z, 8); if (!(id == 1 || (id >= 101 && id <= 119))) ok = 0; }
+                check(ok, "binary search with tenant 9's key: only tenant 9's ids"); }
+            check(bin_call(fb, 4, NULL, 0, &st, &rnb, rb) == 0 && st == 1, "binary build with a key -> status 1");
+            close(fb);
+        }
+        sprintf(body, "[1,0,0,0,0,0,0,0]");
+        sprintf(hreq, "POST /search?k=5 HTTP/1.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", (int)strlen(body), body);
+        check(http(hreq, r, sizeof(r)) > 0 && strstr(r, "401 Unauthorized"), "HTTP without a key -> 401");
+        sprintf(hreq, "POST /search?k=5 HTTP/1.1\r\nAuthorization: Bearer %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", k7, (int)strlen(body), body);
+        {   char *ids;
+            ok = http(hreq, r, sizeof(r)) > 0 && (ids = strstr(r, "{\"ids\":[")) != NULL;
+            if (ok) { char *z = ids + 8; for (m = 0; m < 5; ++m) { long id = strtol(z, &z, 10); if (id < 1 || id > 20) ok = 0; if (*z == ',') ++z; } }
+            check(ok, "HTTP with tenant 7's key: only its ids");
+        }
+        sprintf(hreq, "GET /stats HTTP/1.1\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n", k9);
+        check(http(hreq, r, sizeof(r)) > 0 && strstr(r, "{\"count\":20,\"dim\":8}"), "HTTP /stats with a key: its own count");
+        sprintf(hreq, "POST /save HTTP/1.1\r\nAuthorization: Bearer %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", k9);
+        check(http(hreq, r, sizeof(r)) > 0 && strstr(r, "403 Forbidden"), "HTTP /save with a key -> 403");
+        check(http("GET /health HTTP/1.1\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0 && strstr(r, "200 OK"), "HTTP /health needs no key");
+        sprintf(hreq, "GET /metrics HTTP/1.1\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n", k7);
+        check(http(hreq, r, sizeof(r)) > 0 && strstr(r, "403 Forbidden"), "GET /metrics with a tenant's key -> 403");
+        check(http("GET /prometheus HTTP/1.1\r\nAuthorization: Bearer k_admin_0123456789abcd\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0
+              && strstr(r, "Content-Type: text/plain; version=0.0.4") && strstr(r, "vserv_rows{store=\"default\"} 40\n")
+              && strstr(r, "# TYPE vserv_search_seconds histogram") && strstr(r, "vserv_search_seconds_bucket{le=\"+Inf\"}"),
+              "GET /prometheus with the * key: the text format, rows 40, the search histogram");
+        check(http("GET /metrics HTTP/1.1\r\nAuthorization: Bearer k_admin_0123456789abcd\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0
+              && strstr(r, "application/json") && strstr(r, "\"stores\":[{\"store\":\"default\",\"rows\":40,") && strstr(r, "\"searches\":"),
+              "GET /metrics with the * key: the same numbers as JSON");
+        {   int fr = connect_tcp(), fq = connect_tcp(), okr = 1, nq = 0;
+            ask(fr, "auth k_rows_0123456789abcde\n", r, sizeof(r));
+            for (i = 0; i < 6; ++i) { vline(line, "add", 500 + i, 9100 + i); ask(fr, line, r, sizeof(r)); okr &= i < 5 ? !strcmp(r, "ok") : !strcmp(r, "err the key's row limit is reached"); }
+            vline(line, "add", 502, 9200);
+            check(okr && ask(fr, line, r, sizeof(r)) > 0 && !strcmp(r, "ok"), "a key of 5 rows: the 6th is refused, a replacement is not");
+            ask(fq, "auth k_rate_0123456789abcde\n", r, sizeof(r));
+            for (i = 0; i < 10; ++i) if (ask(fq, "stats\n", r, sizeof(r)) > 0 && !strncmp(r, "err rate limit", 14)) ++nq;
+            check(nq >= 6, "a key of 3 requests a second: most of 10 at once refused");
+            msleep(1100);
+            check(ask(fq, "stats\n", r, sizeof(r)) > 0 && !strncmp(r, "ok count=", 9), "a second later: it answers again");
+            close(fr); close(fq);
+        }
+        close(f7); close(f9); close(fa);
+        msleep(1500);                                             /* -f 1: on the disk within a second */
+        stop(p, SIGKILL);                                         /* the journal: rows, ids and namespaces */
+        p = start("-K", kpath, NULL);
+        f7 = connect_tcp();
+        sprintf(line, "auth %s\n", k7); ask(f7, line, r, sizeof(r));
+        check(count_of(f7) == 20 && ask(f7, "get 1\n", r, sizeof(r)) > 0 && !strncmp(r, "ok ", 3), "kill -9, restart: tenant 7's 20 rows and its row 1");
+        close(f7);
+        stop(p, SIGTERM);
+        check(log_has("auth tenant=") && log_has("auth refused: an unknown key"), "log: the keys shown, and the one refused");
+        serve_path = old;
+    }
+
     /* a tenant server: a directory, a store per tenant; the line protocol, HTTP and binary choose one; the log names it */
     {
         char tdir[160], tf[200];
@@ -439,7 +717,292 @@ int main(int argc, char **argv)
         stop(p, SIGTERM);
         check(log_has("tenant created name=acme"), "log: a tenant created");
         check(log_has("tenant=acme add id=1 ok"), "log: a connection's lines name its tenant");
+        {   /* keys on a tenant directory: a key names its tenant's file, and no other */
+            char kp2[200];
+            FILE *kf = (FILE *)0;
+            int fk;
+            sprintf(kp2, "%s/dkeys.tsv", dir);
+            if ((kf = fopen(kp2, "w")) != (FILE *)0) { fprintf(kf, "k_acme_0123456789abcdef acme\n"); fclose(kf); }
+            p = start("-K", kp2, NULL);
+            fk = connect_tcp();
+            check(ask(fk, "use acme\n", r, sizeof(r)) > 0 && !strcmp(r, "err auth KEY first"), "-K on a directory: use before auth -> err");
+            check(ask(fk, "auth k_acme_0123456789abcdef\n", r, sizeof(r)) > 0 && !strcmp(r, "ok") && count_of(fk) == 1, "auth with acme's key: acme's store");
+            check(ask(fk, "use beta\n", r, sizeof(r)) > 0 && !strcmp(r, "err your key is for another tenant"), "the acme key at use beta -> err");
+            check(http("GET /stats HTTP/1.1\r\nAuthorization: Bearer k_acme_0123456789abcdef\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0
+                  && strstr(r, "\"count\":1"), "HTTP with acme's key, no /t/NAME/: acme");
+            check(http("GET /t/beta/stats HTTP/1.1\r\nAuthorization: Bearer k_acme_0123456789abcdef\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0
+                  && strstr(r, "403"), "HTTP with acme's key at /t/beta/ -> 403");
+            close(fk);
+            stop(p, SIGTERM);
+        }
         serve_path = store_path;
+    }
+
+    /* replication (-F): a replica copies the file and the journal, a snapshot makes it fetch the new file, and vserv
+     * on the replica after a kill -9 of the primary has every row the primary flushed; over TCP with the operator's
+     * key (a tenant's key is refused); a tenant directory, every tenant; a torn tail on the replica fetched again */
+    {
+        char pa[300], rdir[300], ra[400], rpj[600], kp[300], addr[64];
+        pid_t f;
+        FILE *kf;
+        int fr;
+        sprintf(pa, "%s/prim.vxi", dir); sprintf(rdir, "%s/replica", dir); sprintf(ra, "%s/prim.vxi", rdir);
+        mkdir(rdir, 0700);
+        serve_path = pa;
+        p = start(NULL, NULL, NULL);
+        fd = connect_unix();
+        check(add_rows(fd, 1, 301) == 0, "replication: 300 rows with texts on the primary");
+        f = follow(sock_path, ra, NULL);
+        check(wait_same(pa, ra, 6000), "-F: the replica's file and journal are the primary's");
+        check(ask(fd, "del 1 10\n", r, sizeof(r)) > 0 && !strcmp(r, "ok 10"), "deletes on the primary");
+        check(ask(fd, "snapshot\n", r, sizeof(r)) > 0 && !strcmp(r, "ok started"), "a snapshot on the primary");
+        for (i = 0; i < 200; ++i) { if (ask(fd, "stats\n", r, sizeof(r)) > 0 && strstr(r, "snapshot=idle")) break; msleep(25); }
+        check(wait_same(pa, ra, 6000), "-F after the snapshot: the new file and its journal");
+        check(add_rows(fd, 301, 351) == 0, "50 more rows after it");
+        close(fd);
+        msleep(1500);                                            /* past the primary's journal flush (-f 1) */
+        stop(p, SIGKILL);
+        check(wait_same(pa, ra, 6000), "-F: the journal up to the primary's last flush");
+        stop(f, SIGTERM);
+        serve_path = ra;
+        p = start(NULL, NULL, NULL);
+        fd = connect_unix();
+        check(count_of(fd) == 340 && ask(fd, "text 350\n", r, sizeof(r)) > 0 && !strcmp(r, "ok 7 row 350")
+              && ask(fd, "text 5\n", r, sizeof(r)) > 0 && !strcmp(r, "err no such id"),
+              "failover: vserv on the replica has the 340 rows and their texts");
+        close(fd);
+        stop(p, SIGTERM);
+
+        /* the replica killed with kill -9 at random moments - in the middle of a 4 MB chunk of the file, of a journal
+         * append, of a re-download after a snapshot: every time, what is on its disk loads (vserv starts on a copy
+         * of it) with no more rows than the primary has, and a restarted replica catches up */
+        {
+            char cp[400], cpj[420], rj[420], big[2200], *txt = (char *)malloc(300001);
+            unsigned seed = (unsigned)getpid();
+            int round, loads = 0, bounded = 0, maxc = 0, cur;
+            sprintf(pa, "%s/kp.vxi", dir); sprintf(ra, "%s/kr.vxi", rdir); sprintf(cp, "%s/kc.vxi", dir);
+            sprintf(cpj, "%s.j", cp); sprintf(rj, "%s.j", ra);
+            serve_path = pa;
+            p = start(NULL, NULL, NULL);
+            fd = connect_unix();
+            memset(txt, 'a', 300000); txt[300000] = 0;
+            for (i = 1; i <= 40; ++i) {                          /* 40 rows of 300 kB: a 12 MB file, three chunks */
+                char *l = (char *)malloc(300200);
+                vline(l, "addt", i, i);
+                sprintf(l + strlen(l) - 1, " %s\n", txt);
+                ask(fd, l, r, sizeof(r));
+                free(l);
+            }
+            check(ask(fd, "save\n", r, sizeof(r)) > 0 && !strcmp(r, "ok"), "kill -9 of the replica: a 12 MB primary, saved");
+            for (round = 0; round < 8; ++round) {
+                pid_t f;
+                if (round % 2 == 0) {                            /* a new file to fetch: killed in the middle of it */
+                    ask(fd, "snapshot\n", r, sizeof(r));
+                    for (i = 0; i < 400; ++i) { if (ask(fd, "stats\n", r, sizeof(r)) > 0 && strstr(r, "snapshot=idle")) break; msleep(10); }
+                }
+                f = follow(sock_path, ra, NULL);
+                seed = seed * 1103515245u + 12345u;
+                msleep(round % 2 == 0 ? 1 + (int)(seed % 30u) : 20 + (int)(seed % 300u));   /* a 12 MB copy takes ~20 ms */
+                kill(f, SIGKILL); waitpid(f, NULL, 0);
+                add_rows(fd, 1000 + round * 10, 1010 + round * 10);   /* journal for the next round to copy */
+                sprintf(big, "cp %s %s 2>/dev/null; rm -f %s; cp %s %s 2>/dev/null", ra, cp, cpj, rj, cpj);
+                if (system(big) != 0) {}
+                if (access(cp, F_OK) == 0) {
+                    pid_t q;
+                    serve_path = cp;
+                    {   char s2[160]; strcpy(s2, sock_path); sprintf(sock_path, "%s/kc.sock", dir);
+                        port += 100;                     /* the primary holds the port */
+                        q = start(NULL, NULL, NULL);
+                        port -= 100;
+                        cur = -1;
+                        {   int fc = connect_unix();
+                            if (fc >= 0) { cur = count_of(fc); close(fc); } }
+                        stop(q, SIGTERM);
+                        strcpy(sock_path, s2); }
+                    serve_path = pa;
+                    if (cur >= 0) ++loads;
+                    if (cur >= 0 && cur <= count_of(fd)) ++bounded;
+                    if (cur > maxc) maxc = cur;
+                } else { ++loads; ++bounded; }                   /* killed before the first file was in: nothing yet */
+            }
+            if (loads != 8 || bounded != 8) printf("  (loaded %d of 8, not ahead %d of 8)\n", loads, bounded);
+            check(loads == 8 && bounded == 8, "kill -9 of the replica 8 times: its files load every time, never ahead of the primary");
+            msleep(1200);
+            {   pid_t f = follow(sock_path, ra, NULL);
+                check(wait_same(pa, ra, 20000), "... and a restarted replica catches up");
+                stop(f, SIGTERM); }
+            free(txt);
+            close(fd);
+            stop(p, SIGTERM);
+            (void)maxc;
+        }
+
+        /* over TCP with -K: a tenant's key may not follow, the operator's may */
+        sprintf(kp, "%s/rkeys.tsv", dir);
+        if ((kf = fopen(kp, "w")) != (FILE *)0) { fprintf(kf, "op_key_0123456789abcdef *\nt_key_0123456789abcdef 3\n"); fclose(kf); }
+        serve_path = pa;
+        p = start("-K", kp, NULL);
+        fd = connect_tcp();
+        {   unsigned char pl[16];
+            memset(pl, 0, sizeof(pl));
+            check(bin_call(fd, 20, "t_key_0123456789abcdef", 22, &st, &rnb, rb) == 0 && st == 0
+                  && bin_call(fd, 21, pl, 16, &st, &rnb, rb) == 0 && st == 1, "op 21 with a tenant's key -> refused");
+            check(bin_call(fd, 23, NULL, 0, &st, &rnb, rb) == 0 && st == 1, "op 23 with a tenant's key -> refused");
+        }
+        close(fd);
+        sprintf(ra, "%s/tcp.vxi", rdir);
+        sprintf(addr, "127.0.0.1:%d", port);
+        f = follow(addr, ra, "op_key_0123456789abcdef");
+        check(wait_same(pa, ra, 6000), "-F over TCP with the operator's key in VSERV_KEY");
+        stop(f, SIGTERM);
+        stop(p, SIGTERM);
+
+        /* a tenant directory: every tenant, op 23 lists them */
+        sprintf(pa, "%s/ptens", dir); sprintf(ra, "%s/rtens", dir);
+        mkdir(pa, 0700); mkdir(ra, 0700);
+        serve_path = pa;
+        p = start(NULL, NULL, NULL);
+        fd = connect_unix();
+        check(ask(fd, "use acme\n", r, sizeof(r)) > 0 && add_rows(fd, 1, 41) == 0 && ask(fd, "use beta\n", r, sizeof(r)) > 0
+              && add_rows(fd, 1, 21) == 0, "a tenant server: acme 40 rows, beta 20");
+        check(bin_call(fd, 23, NULL, 0, &st, &rnb, rb) == 0 && st == 0 && rnb < sizeof(rb) && (rb[rnb] = 0, 1)
+              && strstr((char *)rb, "acme\n") && strstr((char *)rb, "beta\n"), "op 23: acme and beta");
+        f = follow(sock_path, ra, NULL);
+        {   char p1[500], r1[500], p2[500], r2[500];
+            sprintf(p1, "%s/acme.vxi", pa); sprintf(r1, "%s/acme.vxi", ra); sprintf(p2, "%s/beta.vxi", pa); sprintf(r2, "%s/beta.vxi", ra);
+            msleep(1200);
+            check(wait_same(p1, r1, 6000) && wait_same(p2, r2, 6000), "-F on a directory: both tenants");
+            stop(f, SIGTERM);
+            sprintf(rpj, "%s.j", r1);
+            if ((kf = fopen(rpj, "ab")) != (FILE *)0) { fwrite("G\377\377\0\0torn", 1, 9, kf); fclose(kf); }
+            check(ask(fd, "use acme\n", r, sizeof(r)) > 0 && add_rows(fd, 41, 61) == 0, "20 more acme rows meanwhile");
+            msleep(1200);
+            f = follow(sock_path, ra, NULL);
+            check(wait_same(p1, r1, 6000), "a torn tail on the replica's journal: cut, and the rest fetched");
+            stop(f, SIGTERM);
+        }
+        close(fd);
+        stop(p, SIGTERM);
+        fr = 0;
+        {   char flog[200], line2[512];
+            FILE *g;
+            sprintf(flog, "%s/follow.log", dir);
+            if ((g = fopen(flog, "r")) != (FILE *)0) { while (fgets(line2, sizeof(line2), g)) if (strstr(line2, "copied")) ++fr; fclose(g); }
+        }
+        check(fr >= 4, "the replica's log: every file it copied");
+        serve_path = store_path;
+    }
+
+    /* TLS with nothing to configure: a key and a self-signed certificate made at the first start, kept after it, its
+     * fingerprint printed; plaintext refused on TCP without -P; curl with the pin gets in, with another pin not; a
+     * replica pins the key on its first connection and refuses the primary once its key changed; a key others can
+     * read stops the start (TLS builds; skipped when the server makes no key) */
+    {
+        char adir[300], apath[400], kpath[400], cpath[400], elog[400], cmd[3000], pin[128] = "", pin2[128] = "", ports[16];
+        char rdir2[400], rpath[500], flog2[400];
+        struct stat sb;
+        FILE *g;
+        int stat_k;
+        sprintf(adir, "%s/auto", dir); mkdir(adir, 0700);
+        sprintf(apath, "%s/a.vxi", adir); sprintf(kpath, "%s/vserv.key", adir); sprintf(cpath, "%s/vserv.crt", adir);
+        sprintf(elog, "%s/auto.err", dir);
+        port += 1;
+        sprintf(ports, "%d", port);
+#define AUTO_START() do { p = fork(); if (p == 0) { if (!freopen(elog, "a", stderr)) {} \
+            execl(getenv("VSERV"), getenv("VSERV"), "-p", ports, "-s", sock_path, "-t", "2", "-d", "8", apath, (char *)0); _exit(127); } \
+            for (i = 0; i < 300 && (fd = connect_unix()) < 0; ++i) { msleep(20); } \
+            if (fd >= 0) close(fd); } while (0)
+        AUTO_START();
+        stat_k = stat(kpath, &sb);
+        if (stat_k != 0) {
+            printf("  (no automatic TLS key: a build without TLS - automatic TLS checks skipped)\n");
+            stop(p, SIGTERM);
+        } else {
+            check((sb.st_mode & 0777) == 0600 && stat(cpath, &sb) == 0, "automatic TLS: vserv.key (0600) and vserv.crt made at the first start");
+            if ((g = fopen(elog, "r")) != (FILE *)0) {
+                char l2[1024], *q;
+                while (fgets(l2, sizeof(l2), g)) if ((q = strstr(l2, "TLS key sha256//")) != (char *)0) { sscanf(q + 8, "%127[^ ]", pin); break; }
+                fclose(g);
+            }
+            check(strlen(pin) == 52 && !strncmp(pin, "sha256//", 8), "the key's fingerprint on stderr (sha256//, 44 base64 characters)");
+            check(http("GET /health HTTP/1.1\r\nConnection: close\r\n\r\n", r, sizeof(r)) > 0 && strstr(r, "this port speaks TLS"),
+                  "plaintext HTTP on the TCP port -> refused (no -P)");
+            if (system("command -v openssl >/dev/null") == 0) {
+                sprintf(cmd, "openssl verify -x509_strict -CAfile %s %s >/dev/null 2>&1 && "
+                             "test \"sha256//$(openssl x509 -in %s -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)\" = '%s'",
+                        cpath, cpath, cpath, pin);
+                check(system(cmd) == 0, "openssl -x509_strict: the certificate verifies, and its key hashes to the printed fingerprint");
+            }
+            if (system("command -v python3 >/dev/null") == 0) {
+                char pyf[420];
+                sprintf(pyf, "%s/strict.py", dir);
+                if ((g = fopen(pyf, "w")) != (FILE *)0) {
+                    fprintf(g, "import socket, ssl, sys\nc = ssl.create_default_context(cafile=sys.argv[1])\n"
+                               "s = c.wrap_socket(socket.create_connection(('localhost', int(sys.argv[2]))), server_hostname='localhost')\n"
+                               "s.sendall(b'GET /health HTTP/1.1\\r\\nConnection: close\\r\\n\\r\\n')\nb = b''\n"
+                               "while True:\n    d = s.recv(4096)\n    if not d: break\n    b += d\nsys.exit(0 if b'\"ok\":true' in b else 1)\n");
+                    fclose(g);
+                }
+                sprintf(cmd, "python3 %s %s %d >/dev/null 2>&1", pyf, cpath, port);
+                check(system(cmd) == 0, "Python's ssl, strict, with vserv.crt as its CA file and the name localhost");
+            }
+            if (system("command -v curl >/dev/null") == 0) {
+                sprintf(cmd, "curl -s -k --pinnedpubkey '%s' https://127.0.0.1:%d/health | grep -q '\"ok\":true'", pin, port);
+                check(system(cmd) == 0, "curl -k --pinnedpubkey with the fingerprint gets in");
+                sprintf(cmd, "curl -s -k --pinnedpubkey 'sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' https://127.0.0.1:%d/health >/dev/null 2>&1", port);
+                check(system(cmd) != 0, "curl with another fingerprint is refused");
+            }
+            fd = connect_unix();
+            check(add_rows(fd, 1, 21) == 0, "20 rows on the automatic-TLS primary");
+            close(fd);
+            msleep(1200);
+            sprintf(rdir2, "%s/rauto", dir); mkdir(rdir2, 0700); sprintf(rpath, "%s/a.vxi", rdir2);
+            {   char addr[64];
+                pid_t f;
+                sprintf(addr, "127.0.0.1:%d", port);
+                f = follow(addr, rpath, NULL);
+                check(wait_same(apath, rpath, 6000), "-F over automatic TLS: the replica pins the key and copies");
+                sprintf(cmd, "%s/vserv.pin", rdir2);
+                if ((g = fopen(cmd, "r")) != (FILE *)0) { if (!fgets(pin2, sizeof(pin2), g)) pin2[0] = 0; fclose(g); pin2[strcspn(pin2, "\n")] = 0; }
+                check(!strcmp(pin, pin2), "vserv.pin beside the replica holds the primary's fingerprint");
+                stop(f, SIGTERM);
+                stop(p, SIGTERM);
+                AUTO_START();
+                pin2[0] = 0;
+                if ((g = fopen(elog, "r")) != (FILE *)0) {
+                    char l2[1024], *q, last[128] = "";
+                    while (fgets(l2, sizeof(l2), g)) if ((q = strstr(l2, "TLS key sha256//")) != (char *)0) sscanf(q + 8, "%127[^ ]", last);
+                    fclose(g); strcpy(pin2, last);
+                }
+                check(!strcmp(pin, pin2), "a restart keeps the key: the same fingerprint");
+                stop(p, SIGTERM);
+                sprintf(cmd, "%s.old", kpath); rename(kpath, cmd);       /* a new key, as after a reinstall */
+                AUTO_START();
+                f = follow(addr, rpath, NULL);
+                {   int st2 = 0, t;
+                    for (t = 0; t < 100 && waitpid(f, &st2, WNOHANG) == 0; ++t) msleep(50);
+                    if (t == 100) stop(f, SIGTERM);
+                    check(t < 100 && WIFEXITED(st2) && WEXITSTATUS(st2) == 1, "the primary's key changed: the replica stops (exit 1)");
+                }
+                sprintf(flog2, "%s/follow.log", dir);
+                {   int hit = 0;
+                    char l2[2048];
+                    if ((g = fopen(flog2, "r")) != (FILE *)0) { while (fgets(l2, sizeof(l2), g)) if (strstr(l2, "shows another TLS key")) hit = 1; fclose(g); }
+                    check(hit, "... and says which key it pinned and which it was shown");
+                }
+                stop(p, SIGTERM);
+            }
+            chmod(kpath, 0644);
+            p = fork();
+            if (p == 0) { if (!freopen(elog, "a", stderr)) {}
+                execl(getenv("VSERV"), getenv("VSERV"), "-p", ports, "-s", sock_path, "-t", "2", "-d", "8", apath, (char *)0); _exit(127); }
+            {   int st2 = 0, t;
+                for (t = 0; t < 100 && waitpid(p, &st2, WNOHANG) == 0; ++t) msleep(50);
+                if (t == 100) stop(p, SIGTERM);
+                check(t < 100 && WIFEXITED(st2) && WEXITSTATUS(st2) != 0, "a key file others can read (0644): the server does not start");
+            }
+        }
+#undef AUTO_START
     }
 
     /* mutual TLS: the name in the client's certificate goes into the log (needs openssl and curl; skipped without) */

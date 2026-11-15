@@ -50,12 +50,57 @@ range 7340032 8388607                              ok 1 7340032
 words 3 oxidised                                   ok 1 7340032 0.049180
 ```
 
+Grouped search, numbers and updates (see [api.md](api.md)): `group K SHIFT X1 .. XD` gives one hit an `id >> SHIFT`
+group - with ids `doc << 20 | chunk`, `group 10 20 ...` is the best chunk of 10 documents; `num ID N` sets a row's
+number (a time, a price) and `num ID` reads it; `between K LO HI X1 .. XD` searches the rows whose number is in
+`[LO, HI]`; `update ID X1 .. XD` gives a row a new vector and keeps its tag, number and text. In a batch, `num` and
+`update` wait like `add` (`ok queued`).
+
+```
+num 7340032 1731250000                             ok
+between 5 1731000000 1732000000 1 0 0 0            ok 1 7340032 1.000000
+group 3 20 1 0 0 0                                 ok 1 7340032 1.000000
+update 7340032 0.9 0.1 0 0                         ok
+```
+
+**Many users, one server** (`-K keys.tsv`): a line of the file is `KEY TENANT`. A client on the TCP port shows its
+key first - `auth KEY` (lines), op 20 (binary), `Authorization: Bearer KEY` on every HTTP request - and from then on
+reaches only its tenant. With one store a tenant is a number (1 to 524287): its rows go into a namespace of the store
+with ids of its own (0 to 2^44 - 1), so two tenants may both have an id 1, and no search, get, delete or range of one
+ever touches the other's rows. With a tenant directory a tenant is a name, and its key opens only its file. A key
+cannot build, save, snapshot or scrub - that stays with whoever runs the server - and its `stats` show only its own
+row count. The Unix socket needs no key: who may connect to it is the socket file's mode.
+
+```
+# keys.tsv
+k_9f2c41d07e3a4b55a1f0   7
+k_1b7e0c9da2f84c3e8d61   8
+
+vserv -K keys.tsv -c cert.pem -k key.pem -p 8443 data.vxi
+curl -H 'Authorization: Bearer k_9f2c41d07e3a4b55a1f0' -d '[0.1, 0.2, ...]' https://host:8443/search?k=10
+```
+
+A line may add limits: `KEY TENANT ROWS QPS` - at most ROWS rows (counted once a second; replacing a row the tenant
+has is never refused) and QPS requests a second (past it: `err rate limit`, binary status 7, HTTP 429); 0 or nothing
+is no limit. A key with `*` for its tenant is the operator's: the whole store, any tenant, the housekeeping.
+
+**Numbers:** `GET /metrics` answers JSON, `GET /prometheus` the Prometheus text format - the same numbers in both:
+uptime, searches, writes, refused requests, search latency in buckets (0.5 ms to 1 s), and for every open store its
+rows, rows not indexed yet, memory (hot, cold), blocks checked, damaged and rebuilt, rows that failed their check
+and were healed, the journal, snapshots and the lens. Only for the operator: no `-K`, the `*` key, or the Unix
+socket; a tenant's key gets 403. A Prometheus scrape with keys sends the `*` key (`authorization: credentials:`).
+
 **Binary** (`0xB5` first): little-endian frames, nothing to parse - `u8 0xB5, u8 op, u16 k, u32 nbytes, payload`.
 Ops: 1 search, 2 add, 3 delete, 4 build, 5 save, 6 stats, 7 snapshot, 8 get, 9 delete a range of ids, 10 add with a
-text, 11 get a text, 12 the ids in a range, 13 hybrid search.
+text, 11 get a text, 12 the ids in a range, 13 hybrid search, 14 use a tenant, 15 grouped search (`u32 shift`, then
+the vector), 16 a number range (`i64 lo, i64 hi`, then the vector), 17 update (`i64 id`, then the vector), 18 set a
+number (`i64 id, i64 number`), 19 get a number (`i64 id`, reply `i64`), 24 search with a proof (the vector; the
+reply's hits, then `i64` rows scored exactly - see `vi_search_exact` in api.md).
 
 **HTTP/1.1** (anything else): `GET /health`, `GET /stats`, `GET /get?id=N`, `GET /text?id=N`,
-`GET /range?lo=&hi=&max=`, `POST /search?k=`, `/hybrid?k=`, `/add?id=`, `/delete?id=` or `/delete?lo=&hi=`, `/build`,
+`GET /range?lo=&hi=&max=`, `GET /num?id=`, `POST /search?k=` (with `&group=SHIFT` one hit a group, with `&lo=&hi=`
+the rows whose number is in the range, with `&exact=1` the k best by exact score with a proof and `"checked"`, the
+rows scored exactly, in the reply; not with `group`), `/hybrid?k=`, `/update?id=`, `/num?id=&num=`, `/add?id=`, `/delete?id=` or `/delete?lo=&hi=`, `/build`,
 `/save`, `/snapshot`; vectors as a JSON array or raw little-endian f32 (an add's text after the floats), or
 `{"vector": [...], "text": "..."}` for an add with a text and for `/hybrid` (either key); keep-alive, pipelining. The header scan looks for the blank line 16 bytes at a time with SSE2 (the picohttpparser
 idea, cut down to what this server needs).
@@ -64,7 +109,7 @@ In all three an add replaces the row with the same id: one row per id. A request
 buffer of a connection starts small, grows for a big request and goes back once it is answered. The full reference is the comment at the top
 of `src/vserv_proto.c`.
 
-## Durability: a journal and background snapshots, no replication
+## Durability: a journal and background snapshots
 
 Every write goes into the journal next to the file (`docs.vxi.j`), which is flushed to the disk every second (`-f
 SECONDS`; 0 leaves it to the kernel), so a crash loses at most that second. A new store's file is created at start,
@@ -99,10 +144,67 @@ line protocol reads every block of the current store's file from the disk, rebui
 rows_bad= rows_healed= journal=ok|damaged`: what the load found, then the rows that failed their check when a search
 read them - rebuilt from the parity on the spot, or left out of the results. A cron line that runs `scrub` weekly is the ZFS habit.
 
-There is no replication inside the server. A copy of the store is the file plus its journal, both written atomically
-(`rename`), so `rsync` or `cp` of the two at any moment is a consistent backup; a standby machine that replays them
-starts in milliseconds (mmap). A snapshot to another path (`store_snapshot` / `vi_snapshot` with a path) writes a
-point-in-time copy without touching the live journal.
+A copy of the store is the file plus its journal, both written atomically (`rename`), so `rsync` or `cp` of the two
+at any moment is a consistent backup; a standby machine that replays them starts in milliseconds (mmap). A snapshot
+to another path (`store_snapshot` / `vi_snapshot` with a path) writes a point-in-time copy without touching the live
+journal. For a copy that keeps up by itself, see the replica below.
+
+## A replica on a second machine: `vserv -F`
+
+```sh
+# on the standby: copy everything the primary has flushed, every second, until stopped
+vserv -F 10.0.0.5:8077 /srv/vx/docs.vxi          # a one-store primary, over TLS
+vserv -F /run/vx/primary.sock /srv/vx/           # a tenant server: every tenant, NAME.vxi in the directory
+VSERV_KEY=op_key_... vserv -F 10.0.0.5:8077 ...  # the operator's key, when the primary has -K
+```
+
+The replica copies what `store_load` reads, the file and its journal, and serves nothing. The journal comes over byte
+for byte, but only up to what the primary's last fsync covered, which always ends on a whole record - so the replica
+never holds a write the primary could still lose in a crash, and a write reaches it within about a second (`-f` on
+the primary; with `-f 0` the replica sees writes only after a `commit sync` or a snapshot). When a save or a snapshot
+gives the primary's file a new stamp, the replica fetches the new file in 4 MB chunks into `NAME.vxi.part`, checks every
+block against its digest (rebuilding from the parity what it can), renames it into place and starts the journal over;
+in between the old file and its journal stay a matching pair. A torn tail on the replica's own journal (it was
+killed mid-write) is cut when it starts and fetched again. Every file copied is a line on stderr and in the log (`-l`).
+
+Failover is by hand or by the init system: stop the replica, start `vserv` on the same path. It replays the journal
+like any restart and has every row the primary had flushed - `tests/vserv_test.c` kills the primary with `kill -9`
+and checks exactly that. Never run a replica and a server on the same files at once. There is one primary per store:
+the replica is a standby, not a second place to write.
+
+The primary side is three binary ops (21 journal, 22 file, 23 the tenants), refused to tenant keys: the Unix socket
+or the operator's key (`*` in `-K`). Over TCP the replica speaks TLS and pins the primary's key on its first
+connection (see TLS below); `-F ... -P` speaks plaintext to a primary that allows it. A Unix socket carried over ssh
+works as well:
+
+```sh
+ssh -N -L /run/vx/primary.sock:/srv/vx/vecindex.sock vx@primary &   # a local socket that is the primary's
+vserv -F /run/vx/primary.sock /srv/vx/
+```
+
+A tenant server's replica opens every tenant on the primary (`use NAME`), which keeps them open there afterwards.
+
+## Encryption at rest: the operating system's
+
+The server writes plain files and leaves encryption to the layer below, which does it at disk speed with AES-NI and
+already solves the hard part, the keys (a passphrase at boot, a TPM, a network key server). Its own encryption would
+gain nothing: the store is memory-mapped, so its pages sit in the page cache in the clear while it runs whatever the
+file holds. Pick one:
+
+- **The whole volume, LUKS.** `cryptsetup luksFormat /dev/nvme0n1p3`, `cryptsetup open /dev/nvme0n1p3 vx`,
+  `mkfs.ext4 /dev/mapper/vx`, mount it where the stores live. Unattended boot: `systemd-cryptenroll --tpm2-device=auto`
+  (the key in the TPM) or clevis with a tang server (the key only on your network). Covers a stolen disk, a disk sent
+  back under warranty, a disk thrown away.
+- **A dataset, ZFS native encryption.** `zfs create -o encryption=aes-256-gcm -o keyformat=passphrase tank/vx`.
+  `zfs send --raw` replicates or backs it up still encrypted: the backup machine never sees the key.
+- **A directory, fscrypt** (ext4 with `-O encrypt`, or f2fs): the key of one directory, locked again by removing the
+  key. With a server per directory, deleting that directory's key makes its data unreadable everywhere, backups
+  included (crypto-shredding). Tenants in one directory share its key.
+
+What else holds the data and must be on the same encrypted layer: the snapshot's temporary file (`NAME.vxi.snap`, in
+the same directory), the replica's files and every backup copy (encrypted only if where they land is), swap (encrypt
+it, or keep the store in RAM with `-m`), and core dumps (`LimitCORE=0` in the unit). In transit there is TLS (`-c`/`-k`
+below) for clients and the replica.
 
 ## Memory: hot codes in RAM, cold rows on the disk
 
@@ -172,11 +274,34 @@ decide who connects.
 
 ## TLS
 
-`-c`/`-k`: TLS 1.2 through the vendored [BearSSL](https://bearssl.org) 0.6 (MIT, unmodified, no crypto code of our
-own): ECDHE only (forward secrecy), AEAD suites only (AES-GCM with AES-NI, ChaCha20-Poly1305), EC or RSA keys,
-sessions resumed from one cache shared by every worker, keys wiped when a connection closes. `-a CA` requires client
-certificates (mutual TLS). TLS is sniffed per connection (`0x16`): the TCP port takes only TLS (`-P` lets plaintext in
-too); the Unix socket takes TLS or, for local tools, plaintext (`-T`: TLS only).
+On by default for TCP, with nothing to configure. The first start of a server with a port makes an EC P-256 key and
+a self-signed certificate around it, `vserv.key` (mode 0600; a key others can read stops the start) and `vserv.crt`
+next to the store or in the tenant directory, and every start prints the key's fingerprint:
+
+```
+vserv: TLS key sha256//rb6eC07nZ3DVmE91EIqYTgvfjWTzCz/NZc4k18aztC0= (curl -k --pinnedpubkey sha256//...; a replica remembers it)
+curl -k --pinnedpubkey 'sha256//rb6eC07nZ3DVmE91EIqYTgvfjWTzCz/NZc4k18aztC0=' https://10.0.0.5:8077/health
+```
+
+There is no outside CA: clients pin the key, the way ssh pins a host key. `-k` skips curl's CA check and the pin
+replaces it (curl refuses the connection when the key differs). The certificate is also its own CA and names
+`localhost`, `127.0.0.1`, `::1` and the machine's host name, so a copy of `vserv.crt` works as the CA file wherever
+that is easier: `curl --cacert vserv.crt https://HOSTNAME:8077/...`, `ssl.create_default_context(cafile="vserv.crt")`
+in Python (strict checks on). For any other name or address, pin. A replica
+(`-F`) pins the key it sees on its first connection in `vserv.pin` beside its files, and stops with an error when the
+primary later shows another one: after a reinstall that is expected (move `vserv.pin` away), otherwise someone is in
+between. What this does not cover: the very first connection is trusted as it comes - compare the fingerprint the
+replica prints with the primary's, or copy it there first as `$VSERV_PIN`. Back up `vserv.key` with the store and keep
+it as private as the data: whoever has it can pose as the server.
+
+`-c`/`-k` use a certificate of your own instead (from your CA, or Let's Encrypt for a public name). Either way: TLS 1.2
+through the vendored [BearSSL](https://bearssl.org) 0.6 (MIT, unmodified; the certificate above is assembled here,
+signed with BearSSL's ECDSA): ECDHE only (forward secrecy), AEAD suites only (AES-GCM with AES-NI,
+ChaCha20-Poly1305), EC or RSA keys, sessions resumed from one cache shared by every worker, keys wiped when a
+connection closes. `-a CA` requires client certificates (mutual TLS). TLS is sniffed per connection (`0x16`): the TCP
+port takes only TLS (`-P` lets plaintext in too, for old clients on a private network); the Unix socket takes TLS or,
+for local tools, plaintext (`-T`: TLS only). API keys (`-K`) travel inside the TLS session, so nobody on the network
+reads them.
 
 ## Measured
 
@@ -194,5 +319,9 @@ byte, oversized and malformed input, 8 concurrent clients, SIGTERM saves, restar
 socket and no build call) and `py/vserv_tls_test.py` (22 checks: resumption on every reconnect, multi-record replies,
 plaintext refused, untrusted CA, mTLS accept/reject, RSA key, curl, TLS on the Unix socket), and `tests/vserv_test.c`
 (the line protocol and its errors, the binary and HTTP snapshot, get and range-delete calls, replace-on-add, the log
-and its peers, kill -9 against the journal, timed snapshots, and the certificate name of a curl client under mutual
-TLS in the log) run in `./run`.
+and its peers, kill -9 against the journal, timed snapshots, API keys and their limits, /metrics and /prometheus, a
+replica (`-F`) through a snapshot, a kill -9 of the primary and a failover, the replica itself killed with kill -9 at
+random moments of its copy (its files load every time, never ahead of the primary), over TCP with the operator's key, on a
+tenant directory and past a torn tail, automatic TLS (openssl strict, Python's ssl, curl with the pin, the replica
+refusing a changed key), and the certificate name of a curl client under mutual TLS in the log) run in
+`./run`.

@@ -77,10 +77,13 @@
 #define _FILE_OFFSET_BITS 64    /* 64-bit file offsets on 32-bit CPUs too: the journal and the spill file can grow past 2 GB */
 #endif
 #define ARENA_FLAT_RESERVE_BYTES ((size_t)1 << (sizeof(size_t) > 4 ? 34 : 28))  /* 16 GB of address space; 256 MB on 32-bit */
+#if defined(__wasi__) && !defined(ARENA_BACKEND)
+#define ARENA_BACKEND 0                 /* WebAssembly has no address space to reserve: regions from malloc */
+#endif
 #define ENGINE_THREADS
-#define ENGINE_SERIALIZE
 #define PRINT_IMPLEMENTATION
-#include "engine.c"
+#include "config.h"
+#include "core.c"
 #include "print.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,11 +94,25 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#ifdef __wasi__
+#include "wasi_shim.h"                                           /* WebAssembly: no processes, no signals (bindings/js) */
+#else
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
+#endif
 #include <errno.h>
 #include <sched.h>
+
+/* A descriptor to fsync outside the lock: a copy (dup), closed after. WASI has no dup, and one thread: the
+ * descriptor itself, left open. */
+#ifdef __wasi__
+static int store_fd_dup_(int fd) { return fd; }
+static void store_fd_drop_(int fd) { (void)fd; }
+#else
+static int store_fd_dup_(int fd) { return dup(fd); }
+static void store_fd_drop_(int fd) { close(fd); }
+#endif
 #include "hdict.c"
 #include "lex.c"
 #include "tq.c"
@@ -114,6 +131,32 @@
 #define STORE_IVF_ROWS 256
 #endif
 static i32 store_ivf_min_ = STORE_IVF_MIN;   /* the self-test lowers it to reach the IVF paths on a small store */
+static i64 store_cold_min_ = -1;   /* scanned code bytes past which a loaded index is cold (Tq.cold); -1: half of RAM */
+
+/* half the memory this process can count on: the machine's RAM, or less when a cgroup (a container, a systemd unit)
+ * caps it; read once */
+static i64 store_ram_half_(void)
+{
+    static i64 half;
+    if (!half) {
+        long np = sysconf(_SC_PHYS_PAGES), pz = sysconf(_SC_PAGESIZE);
+        i64 ram = np > 0 && pz > 0 ? (i64)np * pz : ((i64)1 << 40);
+        const char *cg[2];
+        i32 i;
+        cg[0] = "/sys/fs/cgroup/memory.max";                     /* cgroup v2 ("max": no cap) */
+        cg[1] = "/sys/fs/cgroup/memory/memory.limit_in_bytes";   /* cgroup v1 (a huge number: no cap) */
+        for (i = 0; i < 2; ++i) {
+            FILE *f = fopen(cg[i], "r");
+            char b[32];
+            if (!f) continue;
+            if (fgets(b, sizeof(b), f) && b[0] >= '0' && b[0] <= '9') { i64 cap = (i64)strtoll(b, (char **)0, 10); if (cap > 0 && cap < ram) ram = cap; }
+            fclose(f);
+        }
+        if (VI_RAM_LIMIT_MB > 0 && ((i64)VI_RAM_LIMIT_MB << 20) < ram) ram = (i64)VI_RAM_LIMIT_MB << 20;   /* config.h */
+        half = ram / 2;
+    }
+    return half;
+}
 static i32 store_nclusters_(i32 n)
 {
     i32 a = (i32)(4.0 * eng_sqrt_((f64)n)), b = n / STORE_IVF_ROWS;
@@ -138,16 +181,7 @@ static void store_prefetch_row_(const f32 *row, i32 dim)
 #endif
 }
 
-#define STORE_MAGIC   0x34584956u   /* 'VIX4' - v4 = goal gains max_candidates */
-#define STORE_VERSION 5             /* v5: 64-byte aligned sections, the scan index saved too, loaded by mmap */
-#define STORE_VERSION_I8 6          /* v6: v5 + a 16-byte extension after the header (int8 rows) and their scales */
-#define STORE_VERSION7 7            /* v7: the extension on every file - flags (bit 0: int8 rows), 0, and the 64-bit
-                                     * stamp its journal carries too */
-#define STORE_VERSION8 8            /* v8: v7 + texts (flags bit 1): after the meta column, the heap's length (u64),
-                                     * each row's text offset | length << 40 (u64), then the heap; written only by a
-                                     * store that holds texts */
-#define STORE_VERSION9 9            /* v9: the v7/v8 layout (texts: flags bit 1), then block digests, Reed-Solomon
-                                     * parity and two copies of the table of digests and its trailer (store_sum.c) */
+#include "format.h"
 #define STORE_LABELS 64             /* labels: names for the 64 bits of a row's tag (store_label.c) */
 #define STORE_LABEL_NAME 64         /* bytes of a label's name, its 0 included */
 #define STORE_SUM_K 32              /* data blocks a parity group, by default */
@@ -180,6 +214,14 @@ typedef struct {
     i64      used;          /* the next free byte */
 } STx;
 
+/* the error bytes of search with a proof (store_exact.c): one a row, for one index and one row order */
+/* The build goal of the old adaptive engine, as a file's header stores it (8 words): kept so the header's layout
+ * does not move; seed is the only field read (the index's rotation). */
+typedef struct { i32 mode, k; f32 target_recall; i32 max_code_bytes, eval_queries, n_iters; u32 seed; i32 max_candidates; } StoreGoal;
+
+typedef struct StoreCertOld { u8 *err; struct StoreCertOld *next; } StoreCertOld;
+typedef struct { const void *tq; u32 gen, sgen; i32 n, cap; u8 *err; u8 emax; u8 *serr; StoreCertOld *old; } StoreCert;
+
 typedef struct {
     FILE    *jf;            /* write-ahead journal of adds/deletes since the last full save (store_sync) */
     char    *jpath;
@@ -187,6 +229,8 @@ typedef struct {
     u64      jsynced;       /* the jseq an fsync last covered (under jsync_mu) */
     pthread_mutex_t jsync_mu;   /* one fsync at a time: commits that arrive meanwhile find theirs covered */
     u64      stamp;         /* the stamp of the file the journal belongs to (v7); 0: an older file, or none */
+    i64      jdur, jdur2;   /* bytes of jf / jf2 an fsync has covered: whole records, what a replica may copy (vserv -F) */
+    u64      jgen;          /* bumped whenever jf or jf2 is replaced: an fsync that started before does not move jdur */
     /* background snapshot (store_snapshot): one child process at a time writes the store's image to snap_path */
     pthread_mutex_t snap_mu;/* guards the fields below; store_save / store_build hold it through their compaction */
     i32      snap_pid;      /* the child writing a snapshot; 0: none */
@@ -230,12 +274,13 @@ typedef struct {
     f64      win_sum;       /* the added rows' squared distances to their centroids, this window */
     i32      win_n, drifted;            /* rows in the window; windows that sat too far since the build */
     i64      n_indexed, n_rebuilds, rebuild_us;   /* what maintenance did (store_live_stats) */
+    i32      split_on;      /* live mode splits clusters past twice their size in place instead of rebuilding (default 1) */
+    i64      n_splits;      /* clusters split in place (store_live_stats2) */
     i64      rebuilding;    /* 1 while a live rebuild runs */
     Tq      *tq;            /* fast mode: the TurboQuant-style index */
     i32      fast;          /* 1: store_build skips the auto-tuner (engine_build_fast) */
     f32      fast_target;   /* recall@k the fast build grows nprobe to (default 0.9) */
     Arena   *arena;         /* the RagStore struct lives here */
-    Arena    idx_arena;     /* committed engine index; arena_reset each build/load */
     i32      dim;
 
     SCol     vec, idc, metac;   /* the rows: unit vectors, caller doc ids, caller i64 tags (0 = none) */
@@ -255,8 +300,7 @@ typedef struct {
     i32      live;          /* rows that are not tombstoned */
     i32      count;
     i32      built_upto;    /* [0, built_upto) is in the index; the rest pends */
-    EngIndex *idx;
-    EngGoal  goal;
+    StoreGoal goal;         /* what a file's header carries of the old engine's build goal; only seed is used */
     pthread_rwlock_t lock;
     void    *map;           /* store_load's private copy-on-write mapping of the file (columns and tq point in) */
     size_t   map_len;
@@ -265,9 +309,21 @@ typedef struct {
     void    *msum;          /* the loaded file's layout and digests (an SSum), to rebuild blocks a row comes from */
     int      mfd;           /* that file, open for the rebuilds (-1: none) */
     pthread_mutex_t heal_mu; /* one rebuild at a time */
+    /* the lens (a file larger than RAM, or VECINDEX_VERIFY=lens): the load checked the header, the small index arrays
+     * and the label table; the rest is checked when it is needed - a text before it is read, everything before a save
+     * - and by a thread that walks the file one block at a time, in order. Rows are checked on every read anyway. */
+    u64     *vbits;         /* a bit a block of the file (data, then parity): checked since the load. NULL: no lens */
+    i64      vblocks;       /* blocks vbits covers */
+    u8      *vmem;          /* scratch for a check and a rebuild, under heal_mu */
+    i64      lens_at;       /* the lens thread's next block (under lens_mu) */
+    i32      lens_run, lens_stop;
+    pthread_t lens_th;
+    pthread_mutex_t lens_mu;
+    pthread_cond_t lens_cv;
     i32      vreads;        /* test every row a search uses against its check (store_set_check_reads; default on) */
     i64      rot_rows, rot_healed;   /* rows that failed their check and stayed out, and those rebuilt from parity */
     i32      jdamaged;      /* the journal had a damaged record or header: its copy is PATH.j.damaged */
+    i32      jnewer;        /* the op of a whole journal record this build does not know: a newer build's, the load refused */
 
     i32      idmap_ok;      /* 0: nsorted / ids_h / dup are rebuilt on the next lookup (after a load or a compaction) */
     i32      nsorted;       /* rows [0, nsorted) carry strictly increasing ids: found by binary search, nothing stored */
@@ -287,11 +343,24 @@ typedef struct {
      * heap until store_save rewrites it. */
     SCol     txo;
     i32      has_text;      /* the txo column exists (the first text added or loaded) */
+    SCol     tck;           /* a CRC-32C a text (0: none, or from a file older than these checks), checked on every
+                             * read of it: a text that fails is rebuilt from the parity or not served */
+    SCol     numc;          /* a caller i64 number a row (a time, a price) for range filters (0 = none set) */
+    i32      has_num;       /* the numc column exists (the first number set or loaded) */
+    SCol     nsc;           /* the row's namespace, i64 (0 = none): searches in a namespace see only its rows */
+    i32      has_ns;        /* the nsc column exists */
+    void    *nsx;           /* namespace -> its rows, built on the first namespace search (StoreNs, store_ns.c) */
+    pthread_mutex_t ns_mu;  /* that first build */
     STx      tx;            /* the heap */
     i64      txlive;        /* bytes of the live rows' texts */
     Lex     *lex;           /* BM25 over the live rows' texts: built by the first hybrid search, kept up to date after */
     pthread_mutex_t lex_mu; /* that first build */
+    StoreCert *cert;        /* search with a proof: each row's error byte, built on the first such search */
+    pthread_mutex_t cert_mu; /* building or extending it */
+    u32      cert_gen;      /* moved on every new index or row order: a cert of an older one starts over */
 } RagStore;
+static void store_ex_reap_(RagStore *s);
+static void store_ex_free_(RagStore *s);
 
 /* row accessors (also for tests and tools) */
 #define STORE_VEC(s, r)  ((f32 *)(void *)SCOL_AT(&(s)->vec, r))      /* f32 stores only (vbytes == 4) */
@@ -304,6 +373,10 @@ typedef struct {
 #define STORE_DEAD(s, r) ((i32)(((s)->dead[(size_t)(r) >> 6] >> ((u32)(r) & 63u)) & 1u))
 #define STORE_KILL(s, r) ((s)->dead[(size_t)(r) >> 6] |= (u64)1 << ((u32)(r) & 63u))
 #define STORE_TXO(s, r)  (*(u64 *)(void *)SCOL_AT(&(s)->txo, r))     /* text rows only (has_text) */
+#define STORE_TCK(s, r)  (*(u32 *)(void *)SCOL_AT(&(s)->tck, r))     /* text rows only (has_text) */
+#define STORE_NUM(s, r)  (*(i64 *)(void *)SCOL_AT(&(s)->numc, r))    /* numbered stores only (has_num) */
+#define STORE_NS(s, r)   (*(i64 *)(void *)SCOL_AT(&(s)->nsc, r))     /* stores with namespaces only (has_ns) */
+#define STORE_NSOF(s, r) ((s)->has_ns ? STORE_NS(s, r) : 0)
 #define STORE_TXSHIFT    20                                          /* 1 MB heap blocks */
 #define STORE_TXB        ((i64)1 << STORE_TXSHIFT)
 #define STORE_TXMAX      ((1 << 24) - 1)                             /* bytes a text, at most */
@@ -508,6 +581,9 @@ static i32 store_reserve_(RagStore *s, i64 need)
     while (s->metric && s->nrm.nchunk < nch) if (scol_push_(s, &s->nrm)) return -1;
     while (s->vbytes == 1 && s->vsc.nchunk < nch) if (scol_push_(s, &s->vsc)) return -1;
     while (s->has_text && s->txo.nchunk < nch) if (scol_push_(s, &s->txo)) return -1;
+    while (s->has_text && s->tck.nchunk < nch) if (scol_push_(s, &s->tck)) return -1;
+    while (s->has_num && s->numc.nchunk < nch) if (scol_push_(s, &s->numc)) return -1;
+    while (s->has_ns && s->nsc.nchunk < nch) if (scol_push_(s, &s->nsc)) return -1;
     ci = (i32)((i64)s->count >> STORE_CSHIFT);                   /* the chunk the next row lands in */
     if (scol_unshare_(s, &s->vec, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT))
         || scol_unshare_(s, &s->idc, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT))
@@ -515,7 +591,10 @@ static i32 store_reserve_(RagStore *s, i64 need)
         || scol_unshare_(s, &s->rck, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT))
         || (s->metric && scol_unshare_(s, &s->nrm, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))
         || (s->vbytes == 1 && scol_unshare_(s, &s->vsc, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))
-        || (s->has_text && scol_unshare_(s, &s->txo, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))) return -1;
+        || (s->has_text && scol_unshare_(s, &s->txo, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))
+        || (s->has_text && scol_unshare_(s, &s->tck, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))
+        || (s->has_num && scol_unshare_(s, &s->numc, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))
+        || (s->has_ns && scol_unshare_(s, &s->nsc, ci, (i64)s->count - ((i64)ci << STORE_CSHIFT)))) return -1;
     if (words > s->dead_words) {
         i64 nw = s->dead_words ? s->dead_words * 2 : 1024;
         u64 *d;
@@ -602,10 +681,10 @@ static i32 store_tq_pin_(const RagStore *s, const Tq *t, i32 hot, i32 warm)
 /* (un)pin the rows, their int8 scales, ids and tags that live in a file (the loaded .vxi, the spill file) */
 static i32 store_rows_pin_(const RagStore *s, i32 on)
 {
-    const SCol *cols[6];
+    const SCol *cols[8];
     i32 c, i, rc = 0;
-    cols[0] = &s->vec; cols[1] = &s->vsc; cols[2] = &s->idc; cols[3] = &s->metac; cols[4] = &s->rck; cols[5] = &s->nrm;
-    for (c = 0; c < 6; ++c)
+    cols[0] = &s->vec; cols[1] = &s->vsc; cols[2] = &s->idc; cols[3] = &s->metac; cols[4] = &s->rck; cols[5] = &s->nrm; cols[6] = &s->numc; cols[7] = &s->nsc;
+    for (c = 0; c < 8; ++c)
         for (i = 0; i < cols[c]->nchunk; ++i) {
             i64 rows = (i64)s->count - ((i64)i << STORE_CSHIFT);
             if (rows > STORE_CROWS) rows = STORE_CROWS;
@@ -782,7 +861,7 @@ RagStore *store_new(Arena *a, i32 dim)
     s->arena = a;
     s->dim = dim;
     s->idmap_ok = 1;
-    s->goal.mode = ENG_MAX_ACC;
+    s->goal.mode = 1;                   /* (the old engine's ENG_MAX_ACC: files keep the field) */
     s->goal.k = 10;
     s->goal.max_code_bytes = 1 << 20;   /* unbounded -> most accurate config */
     s->goal.eval_queries = 0;           /* engine default (128) */
@@ -800,12 +879,16 @@ RagStore *store_new(Arena *a, i32 dim)
     s->rck.esz = sizeof(u32); s->rck.elem = sizeof(u32);
     s->nrm.esz = sizeof(f32); s->nrm.elem = sizeof(f32);
     s->txo.esz = sizeof(u64); s->txo.elem = sizeof(u64);
+    s->tck.esz = sizeof(u32); s->tck.elem = sizeof(u32);
+    s->numc.esz = sizeof(i64); s->numc.elem = sizeof(i64);
+    s->nsc.esz = sizeof(i64); s->nsc.elem = sizeof(i64);
     pthread_mutex_init(&s->lex_mu, (const pthread_mutexattr_t *)0);
     h64_init(&s->dup, 8);
     s->tune_recall = -1.0f;
     s->qlog_rng = 0x9e3779b9u;
     pthread_mutex_init(&s->qlog_mu, (const pthread_mutexattr_t *)0);
     s->live_grow = 1.0f;
+    s->split_on = 1;
     pthread_mutex_init(&s->mt_mu, (const pthread_mutexattr_t *)0);
     pthread_mutex_init(&s->rb_mu, (const pthread_mutexattr_t *)0);
     pthread_mutex_init(&s->mt_cmu, (const pthread_mutexattr_t *)0);
@@ -815,6 +898,10 @@ RagStore *store_new(Arena *a, i32 dim)
     s->sum_k = STORE_SUM_K; s->sum_m = STORE_SUM_M;
     s->mfd = -1; s->vreads = 1;
     pthread_mutex_init(&s->heal_mu, (const pthread_mutexattr_t *)0);
+    pthread_mutex_init(&s->lens_mu, (const pthread_mutexattr_t *)0);
+    pthread_mutex_init(&s->ns_mu, (const pthread_mutexattr_t *)0);
+    pthread_mutex_init(&s->cert_mu, (const pthread_mutexattr_t *)0);
+    pthread_cond_init(&s->lens_cv, (const pthread_condattr_t *)0);
     s->snap_last = 2;
     s->spill_fd = -1;
     s->spill_min = STORE_SPILL_MIN;
@@ -854,9 +941,20 @@ static void store_live_stop_(RagStore *s);
 static i32 store_snap_reap_(RagStore *s, i32 block);
 
 static void store_msum_free_(void *p);                          /* store_sum.c */
+static void store_lens_stop_(RagStore *s);                       /* store_sum.c */
+static void store_ns_free_(RagStore *s);                         /* store_ns.c */
+static void store_ns_row_(RagStore *s, i32 r);                   /* store_ns.c */
+static void store_ns_unlist_(RagStore *s, i64 k, i32 r);        /* store_ns.c */
+static i64 store_ns_keep_(const RagStore *s, i64 doc_id);
+static void store_ns_put_(RagStore *s, i64 ns);
+static i32 store_tx_vouch_(RagStore *s, u64 v);                 /* store_sum.c */
+static i32 store_tx_ok_(RagStore *s, i32 r);                     /* store_sum.c */
+static u32 store_crc32c_(const u8 *p, size_t n);                 /* store_batch.c */
+static u32 store_tck_(const char *t, i32 n) { u32 c = store_crc32c_((const u8 *)t, (size_t)n); return c ? c : 1u; }
 
 void store_destroy(RagStore *s)
 {
+    store_lens_stop_(s);
     store_live_stop_(s);
     pthread_mutex_lock(&s->snap_mu);
     store_snap_reap_(s, 1);                                      /* a snapshot still being written finishes first */
@@ -870,9 +968,12 @@ void store_destroy(RagStore *s)
     sidx_free_(&s->ids_h); h64_free(&s->dup);
     if (s->jf) fclose(s->jf);
     free(s->jpath); s->jpath = (char *)0;
-    arena_free(&s->idx_arena);
-    scol_free_(&s->vec); scol_free_(&s->idc); scol_free_(&s->metac); scol_free_(&s->vsc); scol_free_(&s->txo); scol_free_(&s->rck); scol_free_(&s->nrm);
+    scol_free_(&s->vec); scol_free_(&s->idc); scol_free_(&s->metac); scol_free_(&s->vsc); scol_free_(&s->txo); scol_free_(&s->tck); scol_free_(&s->rck); scol_free_(&s->nrm); scol_free_(&s->numc); scol_free_(&s->nsc);
+    store_ns_free_(s); pthread_mutex_destroy(&s->ns_mu);
+    store_ex_free_(s); pthread_mutex_destroy(&s->cert_mu);
     if (s->msum) { store_msum_free_(s->msum); s->msum = (void *)0; }
+    free(s->vbits); s->vbits = (u64 *)0; free(s->vmem); s->vmem = (u8 *)0;
+    pthread_mutex_destroy(&s->lens_mu); pthread_cond_destroy(&s->lens_cv);
     if (s->mfd >= 0) { close(s->mfd); s->mfd = -1; }
     store_tx_free_(s);
     if (s->lex) { lex_free(s->lex); free(s->lex); s->lex = (Lex *)0; }
@@ -890,10 +991,10 @@ void store_mem(RagStore *s, i64 *ram, i64 *file)
 {
     i64 r = 0, f = 0;
     i32 c;
-    SCol *cols[7];
+    SCol *cols[10];
     pthread_rwlock_rdlock(&s->lock);
-    cols[0] = &s->vec; cols[1] = &s->idc; cols[2] = &s->metac; cols[3] = &s->vsc; cols[4] = &s->txo; cols[5] = &s->rck; cols[6] = &s->nrm;
-    for (c = 0; c < 7; ++c) {
+    cols[0] = &s->vec; cols[1] = &s->idc; cols[2] = &s->metac; cols[3] = &s->vsc; cols[4] = &s->txo; cols[5] = &s->rck; cols[6] = &s->nrm; cols[7] = &s->numc; cols[8] = &s->nsc; cols[9] = &s->tck;
+    for (c = 0; c < 10; ++c) {
         i32 i;
         for (i = 0; i < cols[c]->nchunk; ++i) {
             i64 rows = (i64)s->count - ((i64)i << STORE_CSHIFT), b;
@@ -926,7 +1027,7 @@ void store_mem(RagStore *s, i64 *ram, i64 *file)
 void store_tiers(RagStore *s, i64 *hot, i64 *cold)
 {
     i64 h = 0, c = 0;
-    const SCol *cols[7];
+    const SCol *cols[10];
     const Tq *t;
     i32 i;
     pthread_rwlock_rdlock(&s->lock);
@@ -938,8 +1039,8 @@ void store_tiers(RagStore *s, i64 *hot, i64 *cold)
         if (t->nc > 1) h += (i64)t->nc * t->dim * 8 + ((i64)t->nc + 1) * 4;  /* the centroids, and transposed */
     }
     h += (((i64)s->count + 63) >> 6) * 8;                         /* the dead-row bits of the rows there are */
-    cols[0] = &s->vec; cols[1] = &s->vsc; cols[2] = &s->idc; cols[3] = &s->metac; cols[4] = &s->txo; cols[5] = &s->rck; cols[6] = &s->nrm;
-    for (i = 0; i < 7; ++i) if (cols[i]->nchunk) c += (i64)s->count * (i64)cols[i]->esz;
+    cols[0] = &s->vec; cols[1] = &s->vsc; cols[2] = &s->idc; cols[3] = &s->metac; cols[4] = &s->txo; cols[5] = &s->rck; cols[6] = &s->nrm; cols[7] = &s->numc; cols[8] = &s->nsc; cols[9] = &s->tck;
+    for (i = 0; i < 10; ++i) if (cols[i]->nchunk) c += (i64)s->count * (i64)cols[i]->esz;
     c += s->tx.used;
     pthread_rwlock_unlock(&s->lock);
     if (hot) *hot = h;
@@ -1162,6 +1263,9 @@ static u32 store_rck_row_(const RagStore *s, i32 r)
     h0 = (h0 ^ (u64)STORE_ID(s, r)) * K;
     h3 = (h3 ^ (u64)STORE_META(s, r)) * K;
     if (s->metric) { u32 nb; memcpy(&nb, &STORE_NRM(s, r), 4); h1 = (h1 ^ (u64)nb) * K; }
+    if (s->has_num && STORE_NUM(s, r)) h2 = (h2 ^ (u64)STORE_NUM(s, r)) * K;   /* 0 mixes nothing in: the column can
+                                                                  * appear under rows that already have their checks */
+    if (s->has_ns && STORE_NS(s, r)) h0 = (h0 ^ (u64)STORE_NS(s, r)) * K;      /* the same for the namespace */
     w = h0 ^ (h1 << 17 | h1 >> 47) ^ (h2 << 31 | h2 >> 33) ^ (h3 << 47 | h3 >> 17) ^ (u64)(u32)d;
     w ^= w >> 33; w *= K; w ^= w >> 29;
     return (u32)(w ^ (w >> 32));
@@ -1234,19 +1338,13 @@ void store_set_fast(RagStore *s, f32 target_recall)
     pthread_rwlock_wrlock(&s->lock);
     s->fast = 1; s->fast_target = target_recall > 0.0f ? target_recall : 0.9f;
     if (!s->tq && s->count > 0 && s->built_upto == s->count) {   /* a loaded, already-built store */
-        s->idx = (EngIndex *)0;
+        store_ex_reap_(s);
         s->tq = store_tq_build_(s, s->count);
     }
     pthread_rwlock_unlock(&s->lock);
     pthread_mutex_unlock(&s->mt_mu);
 }
 
-void store_set_goal(RagStore *s, EngGoal g)
-{
-    pthread_rwlock_wrlock(&s->lock);
-    s->goal = g;
-    pthread_rwlock_unlock(&s->lock);
-}
 
 static void store_jframe_(RagStore *s, const void *const *part, const size_t *plen, i32 np);   /* store_batch.c */
 
@@ -1260,7 +1358,7 @@ static void store_jrec_(RagStore *s, u8 op, i64 id, i64 meta, const f32 *vec)
     i32 np = 0;
     pt[np] = &op; pl[np++] = 1; pt[np] = &id; pl[np++] = 8;
     if (op != 'D') { pt[np] = &meta; pl[np++] = 8; }
-    if (op == 'A' || op == 'P') { pt[np] = vec; pl[np++] = sizeof(f32) * (size_t)s->dim; }
+    if (op == 'A' || op == 'P' || op == 'U') { pt[np] = vec; pl[np++] = sizeof(f32) * (size_t)s->dim; }
     store_jframe_(s, pt, pl, np);
 }
 
@@ -1279,9 +1377,11 @@ static void store_append_locked_(RagStore *s, const f32 *vec, i64 doc_id, i64 me
     STORE_ID(s, r) = doc_id;
     STORE_META(s, r) = meta;
     if (s->metric) STORE_NRM(s, r) = len;
+    if (s->has_text) { STORE_TXO(s, r) = 0; STORE_TCK(s, r) = 0; }
+    if (s->has_num) STORE_NUM(s, r) = 0;                         /* before the check, which mixes them in: the slot may */
+    if (s->has_ns) STORE_NS(s, r) = 0;                           /* still hold a row's from before a compaction */
     STORE_RCK(s, r) = store_rck_row_(s, r);
     if (s->metric) for (d = 0; d < s->dim; ++d) v[d] *= len;     /* the journal gets the row as it came */
-    if (s->has_text) STORE_TXO(s, r) = 0;
     s->dead[r >> 6] &= ~((u64)1 << (r & 63));
     store_note_row_(s, r);
     s->live += 1;
@@ -1331,15 +1431,77 @@ i32 store_add_batch(RagStore *s, const f32 *vecs, const i64 *doc_ids, i32 m)
  * crash never leaves the id with neither. Returns as store_add_meta; on -1 nothing changed. */
 i32 store_put(RagStore *s, const f32 *vec, i64 doc_id, i64 meta)
 {
+    i64 ns;
     if (!store_finite_(vec, s->dim)) return -1;
     pthread_rwlock_wrlock(&s->lock);
     store_idmap_locked_(s);
     if (store_reserve_(s, (i64)s->count + 1) != 0) { pthread_rwlock_unlock(&s->lock); return -1; }   /* before the kill */
+    ns = store_ns_keep_(s, doc_id);
     store_kill_id_locked_(s, doc_id);
     store_append_locked_(s, vec, doc_id, meta);
+    if (ns) store_ns_put_(s, ns);
     store_jrec_(s, 'P', doc_id, meta, s->addbuf);
     pthread_rwlock_unlock(&s->lock);
     return 0;
+}
+
+/* A new vector for doc_id, the rest of the row kept: the newest live row's tag (labels with it), number and text go
+ * to the new row, every row with doc_id goes. The text is not copied - the new row points at the same bytes, and the
+ * word index, keyed by the id, stays as it is. Under the write lock, vec finite; 0, or -1: no live row with doc_id,
+ * a damaged one, or no memory (nothing changed). The caller journals it. */
+static i32 store_live_row_(const RagStore *s, i64 doc_id);
+
+/* the namespace of doc_id's live row (0: none) - a replacement stays in it: a namespace is who owns the row, not one
+ * of its details, so an add over a row never moves it into another tenant's searches */
+static i64 store_ns_keep_(const RagStore *s, i64 doc_id)
+{
+    i32 r;
+    if (!s->has_ns) return 0;
+    r = store_live_row_(s, doc_id);
+    return r >= 0 ? STORE_NS(s, r) : 0;
+}
+/* the row just appended into namespace ns (has_ns, ns != 0): its check again, and its namespace's list */
+static void store_ns_put_(RagStore *s, i64 ns)
+{
+    i32 n = s->count - 1;
+    STORE_NS(s, n) = ns;
+    STORE_RCK(s, n) = store_rck_row_(s, n);
+    store_ns_row_(s, n);
+}
+
+static i32 store_update_locked_(RagStore *s, const f32 *vec, i64 doc_id)
+{
+    i32 r = store_live_row_(s, doc_id), q, n;
+    i64 meta, num, ns;
+    u64 txo;
+    u32 tck;
+    if (r < 0 || store_row_bad_(s, r)) return -1;
+    meta = STORE_META(s, r);
+    num = s->has_num ? STORE_NUM(s, r) : 0;
+    ns = STORE_NSOF(s, r);
+    txo = s->has_text ? STORE_TXO(s, r) : 0;
+    tck = s->has_text ? STORE_TCK(s, r) : 0;
+    if (store_reserve_(s, (i64)s->count + 1) != 0) return -1;   /* before the kill */
+    for (q = store_find_(s, doc_id); q >= 0; q = store_prev_(s, q))
+        if (!STORE_DEAD(s, q)) { STORE_KILL(s, q); --s->live; ++s->mods; if (q != r) store_tx_drop_(s, q); }
+    store_append_locked_(s, vec, doc_id, meta);
+    n = s->count - 1;
+    if (txo) { STORE_TXO(s, n) = txo; STORE_TCK(s, n) = tck; }   /* txlive and the word index: unchanged */
+    if (num) STORE_NUM(s, n) = num;
+    if (ns) { STORE_NS(s, n) = ns; store_ns_row_(s, n); }
+    if (num || ns) STORE_RCK(s, n) = store_rck_row_(s, n);
+    return 0;
+}
+i32 store_update(RagStore *s, const f32 *vec, i64 doc_id)
+{
+    i32 rc;
+    if (!store_finite_(vec, s->dim)) return -1;
+    pthread_rwlock_wrlock(&s->lock);
+    store_idmap_locked_(s);
+    rc = store_update_locked_(s, vec, doc_id);
+    if (rc == 0) store_jrec_(s, 'U', doc_id, 0, s->addbuf);
+    pthread_rwlock_unlock(&s->lock);
+    return rc;
 }
 
 i32 store_delete(RagStore *s, i64 doc_id)
@@ -1386,7 +1548,7 @@ i32 store_built(const RagStore *s)
 {
     i32 r;
     pthread_rwlock_rdlock((pthread_rwlock_t *)&s->lock);
-    r = (s->idx || s->tq) && s->built_upto == s->count;
+    r = s->tq && s->built_upto == s->count;
     pthread_rwlock_unlock((pthread_rwlock_t *)&s->lock);
     return r;
 }
@@ -1454,6 +1616,92 @@ i32 store_get_meta(RagStore *s, i64 doc_id, i64 *meta)
     return r >= 0 ? 0 : -1;
 }
 
+/* A row's number, for range filters: the first one set gives every row a slot (0 until set). Under the write lock;
+ * the row (or -1: no live row with this id, or a damaged one). The caller journals it. */
+static i32 store_set_num_locked_(RagStore *s, i64 doc_id, i64 num)
+{
+    i32 r;
+    if (!s->has_num) {
+        s->has_num = 1;
+        if (store_reserve_(s, (i64)s->count) != 0) { s->has_num = 0; return -1; }
+    }
+    r = store_live_row_(s, doc_id);
+    if (r < 0 || store_row_bad_(s, r)) return -1;
+    {   /* a chunk still in the loaded file's mapping is copied out before the write */
+        i32 ci = (i32)((i64)r >> STORE_CSHIFT);
+        i64 used = (i64)s->count - ((i64)ci << STORE_CSHIFT);
+        if (scol_unshare_(s, &s->numc, ci, used > STORE_CROWS ? STORE_CROWS : used) != 0) return -1;
+    }
+    STORE_NUM(s, r) = num;
+    STORE_RCK(s, r) = store_rck_row_(s, r);
+    ++s->mods;
+    return r;
+}
+i32 store_set_num(RagStore *s, i64 doc_id, i64 num)
+{
+    i32 r;
+    pthread_rwlock_wrlock(&s->lock);
+    store_idmap_locked_(s);
+    r = store_set_num_locked_(s, doc_id, num);
+    if (r >= 0) store_jrec_(s, 'N', doc_id, num, (const f32 *)0);
+    pthread_rwlock_unlock(&s->lock);
+    return r >= 0 ? 0 : -1;
+}
+/* A row's namespace (0: none), as store_set_num_locked_ - and into its namespace's list when the lists exist */
+static i32 store_set_ns_locked_(RagStore *s, i64 doc_id, i64 ns)
+{
+    i32 r;
+    if (!s->has_ns) {
+        s->has_ns = 1;
+        if (store_reserve_(s, (i64)s->count) != 0) { s->has_ns = 0; return -1; }
+    }
+    r = store_live_row_(s, doc_id);
+    if (r < 0 || store_row_bad_(s, r)) return -1;
+    {   i32 ci = (i32)((i64)r >> STORE_CSHIFT);
+        i64 used = (i64)s->count - ((i64)ci << STORE_CSHIFT);
+        if (scol_unshare_(s, &s->nsc, ci, used > STORE_CROWS ? STORE_CROWS : used) != 0) return -1;
+    }
+    if (STORE_NS(s, r) == ns) return r;                          /* already there */
+    store_ns_unlist_(s, STORE_NS(s, r), r);
+    STORE_NS(s, r) = ns;
+    STORE_RCK(s, r) = store_rck_row_(s, r);
+    if (ns) store_ns_row_(s, r);
+    ++s->mods;
+    return r;
+}
+i32 store_set_ns(RagStore *s, i64 doc_id, i64 ns)
+{
+    i32 r;
+    pthread_rwlock_wrlock(&s->lock);
+    store_idmap_locked_(s);
+    r = store_set_ns_locked_(s, doc_id, ns);
+    if (r >= 0) store_jrec_(s, 'S', doc_id, ns, (const f32 *)0);
+    pthread_rwlock_unlock(&s->lock);
+    return r >= 0 ? 0 : -1;
+}
+i32 store_get_ns(RagStore *s, i64 doc_id, i64 *ns)
+{
+    i32 r;
+    store_need_idmap_(s);
+    pthread_rwlock_rdlock(&s->lock);
+    r = store_live_row_(s, doc_id);
+    if (r >= 0 && store_row_bad_(s, r)) r = -1;
+    if (r >= 0) *ns = STORE_NSOF(s, r);
+    pthread_rwlock_unlock(&s->lock);
+    return r >= 0 ? 0 : -1;
+}
+i32 store_get_num(RagStore *s, i64 doc_id, i64 *num)
+{
+    i32 r;
+    store_need_idmap_(s);
+    pthread_rwlock_rdlock(&s->lock);
+    r = store_live_row_(s, doc_id);
+    if (r >= 0 && store_row_bad_(s, r)) r = -1;
+    if (r >= 0) *num = s->has_num ? STORE_NUM(s, r) : 0;
+    pthread_rwlock_unlock(&s->lock);
+    return r >= 0 ? 0 : -1;
+}
+
 /* tombstones among rows [0, r), with pre[w] = tombstones in words [0, w) */
 static i32 store_dead_before_(const RagStore *s, const i32 *pre, i32 r)
 {
@@ -1472,7 +1720,7 @@ static i32 store_compact_(RagStore *s)
         for (x = 0; x <= words; ++x) { pre[x] = acc; if (x < words) acc += tq_pop64_(s->dead[x]); }
         bu = s->built_upto - store_dead_before_(s, pre, s->built_upto);
         if (s->tq) tq_remap(s->tq, s->dead, pre, bu);
-        if (s->idx) { s->idx = (EngIndex *)0; arena_reset(&s->idx_arena); bu = 0; }
+        store_ex_reap_(s);                                       /* rows renumbered: their error bytes too */
         s->built_upto = bu;
         s->dead_built = 0;
         free(pre);
@@ -1486,12 +1734,15 @@ static i32 store_compact_(RagStore *s)
             STORE_META(s, w) = STORE_META(s, i);
             STORE_RCK(s, w) = STORE_RCK(s, i);
             if (s->metric) STORE_NRM(s, w) = STORE_NRM(s, i);
-            if (s->has_text) STORE_TXO(s, w) = STORE_TXO(s, i);
+            if (s->has_text) { STORE_TXO(s, w) = STORE_TXO(s, i); STORE_TCK(s, w) = STORE_TCK(s, i); }
+            if (s->has_num) STORE_NUM(s, w) = STORE_NUM(s, i);
+            if (s->has_ns) STORE_NS(s, w) = STORE_NS(s, i);
         }
         ++w;
     }
     memset(s->dead, 0, (size_t)s->dead_words * sizeof(u64));
     s->count = w;
+    store_ns_free_(s);                                           /* rows renumbered: the namespace lists again later */
     s->live = w;
 #if defined(__GNUC__)
     __atomic_store_n(&s->idmap_ok, 0, __ATOMIC_RELEASE);        /* rows moved: the lookups are rebuilt on next use */
@@ -1503,18 +1754,6 @@ static i32 store_compact_(RagStore *s)
 
 static f32 store_tune_run_(RagStore *s, i32 nth);
 
-static i32 store_uses_tq_(const RagStore *s) { return s->fast || (s->goal.mode == ENG_MAX_ACC && s->goal.max_code_bytes >= s->dim * 4); }
-
-/* the engine index (the q1-q5 / IVF / HNSW tuner) over rows [0, w), under the write lock */
-static void store_engine_build_(RagStore *s, i32 w)
-{
-    f32 *flat = (f32 *)malloc((size_t)w * (size_t)s->dim * sizeof(f32));   /* the tuner wants one contiguous array */
-    i32 i;
-    for (i = 0; i < w; ++i) { f32 *dst = flat + (size_t)i * s->dim; const f32 *v = store_row_(s, i, dst); if (v != dst) memcpy(dst, v, (size_t)s->dim * sizeof(f32)); }
-    s->idx = engine_build(&s->idx_arena, flat, w, s->dim, s->goal);
-    free(flat);
-}
-
 void store_build(RagStore *s)
 {
     i32 w;
@@ -1525,15 +1764,10 @@ void store_build(RagStore *s)
     pthread_rwlock_wrlock(&s->lock);
     if (s->mem_tier >= 1) store_tq_pin_(s, s->tq, 0, 0);         /* its pages in the file go back to the kernel */
     tq_free(s->tq); s->tq = (Tq *)0;                             /* rebuilt below: no use remapping it */
+    store_ex_reap_(s);
     w = store_compact_(s);
-    arena_reset(&s->idx_arena);
     s->tuned_n = 0; s->dead_built = 0; s->win_sum = 0.0; s->win_n = 0; s->drifted = 0;
-    /* Auto choice: with no memory budget (the default) the data-oblivious 4-bit scan + exact re-score wins
-     * on accuracy and speed and needs no training. The q1-q5 / IVF / HNSW tuner (engine_build) only earns
-     * its 10-70 s when the goal is a SMALL index (ENG_MIN_SIZE, or a code budget below f32 size). */
-    s->idx = (EngIndex *)0;
-    if (w > 0 && store_uses_tq_(s)) s->tq = store_tq_build_(s, w);
-    else if (w > 0) store_engine_build_(s, w);
+    if (w > 0) s->tq = store_tq_build_(s, w);                    /* the 4-bit scan + exact re-score: the one index there is */
     s->built_upto = w;
     pthread_rwlock_unlock(&s->lock);
     store_tune_run_(s, store_ncpu_(s));                           /* keep the recall asked for, if one is (searches go on) */
@@ -1542,14 +1776,18 @@ void store_build(RagStore *s)
     pthread_mutex_unlock(&s->snap_mu);
 }
 
-/* label conditions of a search: every mask of any[0..n) shared by the row's tag, none of none */
-typedef struct { i32 n; u64 any[16]; u64 none; } StoreCnf;
-static i32 store_cnf_ok_(const StoreCnf *c, i64 meta)
+/* conditions of a search: every mask of any[0..n) shared by the row's tag, none of none; with num, the row's number
+ * in [lo, hi] (a store without numbers: every row's is 0) */
+typedef struct { i32 n; u64 any[16]; u64 none; i32 num; i64 lo, hi; i32 ns_on; i64 ns; const i64 *nss; i32 nns; } StoreCnf;   /* ns_on: the row's
+                                                                  * namespace is ns */
+static i32 store_cnf_ok_(const RagStore *s, const StoreCnf *c, i32 row)
 {
-    u64 m = (u64)meta;
+    u64 m = (u64)STORE_META(s, row);
     i32 i;
     if (m & c->none) return 0;
     for (i = 0; i < c->n; ++i) if (!(m & c->any[i])) return 0;
+    if (c->num) { i64 v = s->has_num ? STORE_NUM(s, row) : 0; if (v < c->lo || v > c->hi) return 0; }
+    if (c->ns_on) { i64 v = STORE_NSOF(s, row); if (c->nns ? !tq_in_set_(c->nss, c->nns, v) : v != c->ns) return 0; }
     return 1;
 }
 
@@ -1557,7 +1795,9 @@ static i32 store_cnf_ok_(const StoreCnf *c, i64 meta)
 
 #include "store_live.c"
 
+#include "store_ns.c"
 #include "store_search.c"
+#include "store_exact.c"
 
 #include "store_text.c"
 

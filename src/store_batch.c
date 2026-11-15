@@ -17,10 +17,10 @@
 
 typedef struct {
     RagStore *s;
-    u8 *buf;                /* the records, as in the journal: 'P' id meta row, 'Q' id meta row len text, 'D' id, 'R' lo hi */
+    u8 *buf;                /* the records, as in the journal: 'P' id meta row, 'Q' id meta row len text, 'D' id, 'R' lo hi, 'N' id number, 'S' id namespace */
     size_t len, cap;
     f32 *tmp;               /* [dim] scratch: a row normalised, or copied out of buf aligned */
-    i32 n, nput, ntext;     /* changes, rows they add, texts among them */
+    i32 n, nput, ntext, nnum, nns;   /* changes, rows they add, texts among them, numbers and namespaces set */
     i32 bad;                /* a refused change (non-finite vector, bad text, no memory): commit refuses the batch */
 } StoreWb;
 
@@ -108,6 +108,13 @@ i32 store_batch_put(StoreWb *b, const f32 *vec, i64 id, i64 meta)
     return store_batch_row_(b, 'P', vec, id, meta, 0);
 }
 
+/* A new vector for id, its tag, number and text kept (store_update) - on the row the batch added before it, or the
+ * row the store has; an id with neither by then is left alone */
+i32 store_batch_update(StoreWb *b, const f32 *vec, i64 id)
+{
+    return store_batch_row_(b, 'U', vec, id, 0, 0);
+}
+
 /* The same with a text (len 0: none; at most STORE_TXMAX bytes) */
 i32 store_batch_put_text(StoreWb *b, const f32 *vec, i64 id, i64 meta, const char *text, i32 len)
 {
@@ -139,14 +146,35 @@ i32 store_batch_delete_range(StoreWb *b, i64 lo, i64 hi)
     return 0;
 }
 
+/* a row's number (store_set_num), set when the batch reaches it: on the row the batch added before it, or on the row
+ * the store has; an id with neither by then is left alone */
+i32 store_batch_set_num(StoreWb *b, i64 id, i64 num)
+{
+    u8 op = 'N';
+    if (store_batch_room_(b, 17) != 0) return -1;
+    store_batch_w_(b, &op, 1); store_batch_w_(b, &id, 8); store_batch_w_(b, &num, 8);
+    ++b->n; ++b->nnum;
+    return 0;
+}
+
+/* a row's namespace (store_set_ns), set when the batch reaches it, as store_batch_set_num */
+i32 store_batch_set_ns(StoreWb *b, i64 id, i64 ns)
+{
+    u8 op = 'S';
+    if (store_batch_room_(b, 17) != 0) return -1;
+    store_batch_w_(b, &op, 1); store_batch_w_(b, &id, 8); store_batch_w_(b, &ns, 8);
+    ++b->n; ++b->nns;
+    return 0;
+}
+
 /* bytes of the record at r */
 static size_t store_batch_reclen_(const RagStore *s, const u8 *r)
 {
     size_t vb = (size_t)s->dim * sizeof(f32);
     u32 n;
     if (r[0] == 'D') return 9;
-    if (r[0] == 'R') return 17;
-    if (r[0] == 'P') return 17 + vb;
+    if (r[0] == 'R' || r[0] == 'N' || r[0] == 'S') return 17;
+    if (r[0] == 'P' || r[0] == 'U') return 17 + vb;
     memcpy(&n, r + 17 + vb, 4);                                  /* 'Q' */
     return 21 + vb + n;
 }
@@ -186,6 +214,26 @@ static void store_jframe_(RagStore *s, const void *const *part, const size_t *pl
     }
 }
 
+/* With the write lock held and the stdio buffers just flushed: the journals' sizes, whole records only (writers hold
+ * the same lock), into at[2]; returns jgen. After their fsync, store_jdur_ makes them what a replica may copy. */
+static u64 store_jmark_(RagStore *s, i64 *at)
+{
+    struct stat st;
+    at[0] = s->jf && fstat(fileno(s->jf), &st) == 0 ? (i64)st.st_size : -1;
+    at[1] = s->jf2 && fstat(fileno(s->jf2), &st) == 0 ? (i64)st.st_size : -1;
+    return s->jgen;
+}
+
+static void store_jdur_(RagStore *s, u64 gen, const i64 *at)
+{
+    pthread_rwlock_wrlock(&s->lock);
+    if (s->jgen == gen) {
+        if (at[0] > s->jdur) s->jdur = at[0];
+        if (at[1] > s->jdur2) s->jdur2 = at[1];
+    }
+    pthread_rwlock_unlock(&s->lock);
+}
+
 /* Durable up to journal write seq: one fsync at a time under jsync_mu, the write lock held only while the stdio
  * buffers go to the kernel; a commit whose write an fsync started after it already covered returns at once. */
 static i32 store_jsync_(RagStore *s, u64 seq)
@@ -194,16 +242,18 @@ static i32 store_jsync_(RagStore *s, u64 seq)
     pthread_mutex_lock(&s->jsync_mu);
     if (s->jsynced < seq) {
         int fd[2];
-        u64 at;
+        u64 at, gen;
+        i64 sz[2];
         fd[0] = fd[1] = -1;
         pthread_rwlock_wrlock(&s->lock);
         at = s->jseq;
-        if (s->jf) { if (fflush(s->jf) != 0) r = -1; else fd[0] = dup(fileno(s->jf)); }
-        if (s->jf2) { if (fflush(s->jf2) != 0) r = -1; else fd[1] = dup(fileno(s->jf2)); }
+        if (s->jf) { if (fflush(s->jf) != 0) r = -1; else fd[0] = store_fd_dup_(fileno(s->jf)); }
+        if (s->jf2) { if (fflush(s->jf2) != 0) r = -1; else fd[1] = store_fd_dup_(fileno(s->jf2)); }
+        gen = store_jmark_(s, sz);
         pthread_rwlock_unlock(&s->lock);
         for (i = 0; i < 2; ++i)
-            if (fd[i] >= 0) { if (fsync(fd[i]) != 0) r = -1; close(fd[i]); }
-        if (r == 0) s->jsynced = at;
+            if (fd[i] >= 0) { if (fsync(fd[i]) != 0) r = -1; store_fd_drop_(fd[i]); }
+        if (r == 0) { s->jsynced = at; store_jdur_(s, gen, sz); }
     }
     pthread_mutex_unlock(&s->jsync_mu);
     return r;
@@ -220,7 +270,7 @@ i32 store_batch_commit(StoreWb *b, i32 sync)
     size_t vb = (size_t)s->dim * sizeof(f32), at, rl;
     u64 *tv = (u64 *)0, seq;
     u32 crc;
-    i32 k, i;
+    i32 k, i, had_num, had_ns;
     if (b->bad || s->ro) return -1;
     if (b->n == 0) return 0;
     if (b->ntext && !(tv = (u64 *)malloc((size_t)b->ntext * sizeof(u64)))) return -1;
@@ -228,7 +278,10 @@ i32 store_batch_commit(StoreWb *b, i32 sync)
     pthread_rwlock_wrlock(&s->lock);
     store_idmap_locked_(s);
     if (b->ntext) s->has_text = 1;                               /* from now on the column has a slot for every row */
-    if (store_reserve_(s, (i64)s->count + b->nput) != 0) { pthread_rwlock_unlock(&s->lock); free(tv); return -1; }
+    had_num = s->has_num; had_ns = s->has_ns;
+    if (b->nnum) s->has_num = 1;                                 /* the same for numbers */
+    if (b->nns) s->has_ns = 1;                                   /* and namespaces */
+    if (store_reserve_(s, (i64)s->count + b->nput) != 0) { s->has_num = had_num; s->has_ns = had_ns; pthread_rwlock_unlock(&s->lock); free(tv); return -1; }
     /* the texts first, the other thing that can run out; what a refused batch left in the heap is garbage that the
      * next save drops */
     for (at = 0, k = 0; at < b->len; at += store_batch_reclen_(s, b->buf + at))
@@ -249,6 +302,8 @@ i32 store_batch_commit(StoreWb *b, i32 sync)
         memcpy(&id, r + 1, 8);
         if (r[0] == 'D') { store_kill_id_locked_(s, id); continue; }
         memcpy(&meta, r + 9, 8);
+        if (r[0] == 'N') { store_set_num_locked_(s, id, meta); continue; }
+        if (r[0] == 'S') { store_set_ns_locked_(s, id, meta); continue; }
         if (r[0] == 'R') {
             for (i = 0; i < s->count; ++i)
                 if (!STORE_DEAD(s, i) && STORE_ID(s, i) >= id && STORE_ID(s, i) <= meta) {
@@ -257,12 +312,16 @@ i32 store_batch_commit(StoreWb *b, i32 sync)
             continue;
         }
         memcpy(b->tmp, r + 17, vb);                              /* aligned for the row code */
-        store_kill_id_locked_(s, id);
-        store_append_locked_(s, b->tmp, id, meta);
+        if (r[0] == 'U') { store_update_locked_(s, b->tmp, id); continue; }
+        {   i64 ns = store_ns_keep_(s, id);
+            store_kill_id_locked_(s, id);
+            store_append_locked_(s, b->tmp, id, meta);
+            if (ns) store_ns_put_(s, ns); }
         if (r[0] == 'Q') {
             u32 n;
             memcpy(&n, r + 17 + vb, 4);
             STORE_TXO(s, s->count - 1) = tv[k++];
+            STORE_TCK(s, s->count - 1) = store_tck_((const char *)r + 21 + vb, (i32)n);
             s->txlive += (i64)n;
             if (s->lex) lex_add(s->lex, id, (const char *)r + 21 + vb, (i32)n);
         }

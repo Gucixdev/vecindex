@@ -1,0 +1,5 @@
+csrc/
+build/
+*.egg-info/
+vecindex/_libvecindex*.so
+__pycache__/

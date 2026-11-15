@@ -20,6 +20,7 @@ static void store_jrec_text_(RagStore *s, i64 id, i64 meta, const f32 *vec, cons
 i32 store_put_text(RagStore *s, const f32 *vec, i64 doc_id, i64 meta, const char *text, i32 len)
 {
     u64 v;
+    i64 ns;
     if (len == 0) return store_put(s, vec, doc_id, meta);
     if (!store_finite_(vec, s->dim) || len < 0 || len > STORE_TXMAX || !text) return -1;
     pthread_rwlock_wrlock(&s->lock);
@@ -29,9 +30,12 @@ i32 store_put_text(RagStore *s, const f32 *vec, i64 doc_id, i64 meta, const char
         pthread_rwlock_unlock(&s->lock);
         return -1;
     }
+    ns = store_ns_keep_(s, doc_id);
     store_kill_id_locked_(s, doc_id);
     store_append_locked_(s, vec, doc_id, meta);
+    if (ns) store_ns_put_(s, ns);
     STORE_TXO(s, s->count - 1) = v;
+    STORE_TCK(s, s->count - 1) = store_tck_(text, len);
     s->txlive += len;
     if (s->lex) lex_add(s->lex, doc_id, text, len);
     store_jrec_text_(s, doc_id, meta, s->addbuf, text, len);
@@ -50,7 +54,8 @@ i32 store_get_text(RagStore *s, i64 doc_id, char *buf, i32 cap)
     if (r >= 0) {
         u64 v = s->has_text ? STORE_TXO(s, r) : 0;
         n = STORE_TXLEN(v);
-        if (n > 0 && buf && cap > 0) store_tx_copy_(&s->tx, v, buf, n < cap ? n : cap);
+        if (n > 0 && !store_tx_ok_(s, r)) n = -1;              /* its check fails and it cannot be rebuilt: not served */
+        else if (n > 0 && buf && cap > 0) store_tx_copy_(&s->tx, v, buf, n < cap ? n : cap);
     }
     pthread_rwlock_unlock(&s->lock);
     return n;
@@ -130,7 +135,7 @@ static void store_lex_ready_(RagStore *s)
     lex_init(x);
     for (r = 0; r < s->count; ++r) {
         u64 v = STORE_TXO(s, r);
-        if (!v || STORE_DEAD(s, r)) continue;
+        if (!v || STORE_DEAD(s, r) || !store_tx_ok_(s, r)) continue;   /* a damaged text is left out */
         store_tx_copy_(&s->tx, v, buf, STORE_TXLEN(v));
         lex_add(x, STORE_ID(s, r), buf, STORE_TXLEN(v));
     }

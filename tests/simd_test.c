@@ -98,17 +98,19 @@ static void sd_score_(void)
     for (nc = 1; nc <= 70; nc += 23)
         for (dim = 1; dim <= 130; dim += 43) {
             f32 *ct;
+            Gen g;
             i32 ng = (nc + 15) / 16;
             for (c = 0; c < nc * dim; ++c) cent[c] = sd_f_();
             for (d = 0; d < dim; ++d) v[d] = sd_f_();
-            ct = tq_transpose_(cent, nc, dim);
+            gen_init_(&g);
+            ct = tq_transpose_(&g, cent, nc, dim);
             tq_score_(v, ct, ng, dim, sc);
             for (l = 0; l < ng * 16; ++l) {
                 f64 want = 0, mag = 0;
                 if (l < nc) for (d = 0; d < dim; ++d) { want += (f64)v[d] * cent[l * dim + d]; mag += fabs((f64)v[d] * cent[l * dim + d]); }
                 sd_check_(sd_close_(sc[l], want, mag), "tq_score_", nc * 1000 + dim);
             }
-            free(ct);
+            gen_free_(&g);
         }
 }
 

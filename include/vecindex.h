@@ -47,7 +47,7 @@ typedef int64_t vi_i64;
 
 typedef struct vi_db vi_db;
 
-#define VI_VERSION "0.3.0"
+#define VI_VERSION "0.4.0"
 
 /* flags for vi_open. By default rows are indexed as they come and the index is rebuilt as it ages, by a thread of the
  * store's own: there is no vi_build to forget. VI_MANUAL turns that off (then vi_build indexes what was added; until
@@ -88,6 +88,13 @@ VI_API vi_dir *vi_dir_open(const char *path, int dim, int flags);
 VI_API vi_db *vi_dir_get(vi_dir *d, const char *name);
 VI_API void vi_dir_close(vi_dir *d);
 
+/* Shards: every store in the directory (each NAME.vxi, opened as vi_dir_get opens it) searched, and the k best hits of
+ * all of them, best first. A store holds at most 2^31 - 1 rows; past that, or past one disk, rows go into several
+ * stores - by id range, by time, by source: the caller picks the store a row goes to - and one search covers them all.
+ * Ids are the caller's, so they should not repeat across stores. Returns how many hits, or -1: a store that cannot be
+ * opened, or one of another dimension or metric than the others (vi_error() names it). */
+VI_API int vi_dir_search(vi_dir *d, const float *query, int k, vi_i64 *ids, float *scores);
+
 /* Dimensions; live rows (added and not deleted). */
 VI_API int vi_dim(const vi_db *db);
 VI_API vi_i64 vi_count(vi_db *db);
@@ -96,6 +103,11 @@ VI_API vi_i64 vi_count(vi_db *db);
  * neither). 0 on success, -1 when the vector has a NaN or an infinity or is all zeros (it is refused) or memory ran
  * out. */
 VI_API int vi_add(vi_db *db, vi_i64 id, const float *vec);
+
+/* A new vector for the row with this id - a document embedded again by a new model - that keeps the rest of it: the
+ * tag, labels, number and text stay (vi_add starts the row over). One change, journaled as one record. 0, or -1 when
+ * there is no such row (vi_error() says so), the vector is refused as vi_add refuses it, or memory ran out. */
+VI_API int vi_update(vi_db *db, vi_i64 id, const float *vec);
 
 /* vi_add for n rows (vecs: n x dim, row after row); returns how many went in. When some were refused, vi_error()
  * names the first: "row 17 (id 9042): the vector has a NaN ...". */
@@ -134,9 +146,12 @@ VI_API int vi_range(vi_db *db, vi_i64 lo, vi_i64 hi, vi_i64 *ids, int max);
 typedef struct vi_batch vi_batch;
 VI_API vi_batch *vi_batch_begin(vi_db *db);
 VI_API int vi_batch_add(vi_batch *b, vi_i64 id, const float *vec);
+VI_API int vi_batch_update(vi_batch *b, vi_i64 id, const float *vec);   /* vi_update; an id with no row by then: nothing */
 VI_API int vi_batch_add_text(vi_batch *b, vi_i64 id, const float *vec, const char *text, int len);
 VI_API int vi_batch_delete(vi_batch *b, vi_i64 id);
 VI_API int vi_batch_delete_range(vi_batch *b, vi_i64 lo, vi_i64 hi);
+VI_API int vi_batch_set_num(vi_batch *b, vi_i64 id, vi_i64 num);
+VI_API int vi_batch_set_ns(vi_batch *b, vi_i64 id, vi_i64 ns);     /* as vi_set_ns, when the batch reaches it */   /* on the row the batch added or the store has */
 
 /* Applies the batch as one change and frees it. sync 1: also on the disk when this returns (a store opened from a
  * file; commits arriving during an fsync share the next one). Returns how many changes it held; -1 refused, nothing
@@ -164,6 +179,40 @@ VI_API int vi_label_remove(vi_db *db, vi_i64 id, const char *labels);
 VI_API int vi_search_labeled(vi_db *db, const float *query, int k, const char *all, const char *any, const char *none,
                              vi_i64 *ids, float *scores);
 
+/* Labels and a number range in one search: vi_search_labeled's all, any and none (NULL or "": no condition), and the
+ * row's number in [lo, hi] (vi_set_num) - "the legal team's documents from this year" in one query. Both are tested
+ * inside the scan, so a narrow combination still finds its rows. Returns as vi_search_labeled. */
+VI_API int vi_search_where(vi_db *db, const float *query, int k, const char *all, const char *any, const char *none,
+                           vi_i64 lo, vi_i64 hi, vi_i64 *ids, float *scores);
+
+/* A number on a row - a time, a price in cents, a version - for range filters; every row's is 0 until set, and a
+ * row that vi_add replaces starts again at 0. vi_set_num / vi_get_num: 0, or -1 when there is no such row.
+ * vi_search_range is vi_search over the rows whose number is in [lo, hi]; the range is tested inside the scan, so a
+ * narrow one costs no more than a wide one. The numbers are saved in the file, journaled and under the row checks. */
+VI_API int vi_set_num(vi_db *db, vi_i64 id, vi_i64 num);
+VI_API int vi_get_num(vi_db *db, vi_i64 id, vi_i64 *num);
+VI_API int vi_search_range(vi_db *db, const float *query, int k, vi_i64 lo, vi_i64 hi, vi_i64 *ids, float *scores);
+
+/* Namespaces: many tenants in one store. A row is in one namespace (an i64 the caller picks - a user id, or
+ * vi_key("acme", -1) for a name; 0: none), and vi_search_ns sees only the rows of its namespace. A small namespace
+ * (up to 20000 rows) is searched exactly over its own rows, a big one through the index with the namespace tested
+ * inside the scan, so a tenant's search costs about its own size. Ids are still the store's: one id, one row, in
+ * one namespace. vi_add_ns adds (or replaces) a row with its namespace and an optional text (NULL: none; len -1: a
+ * C string) as one change, so a crash never leaves the row outside it; vi_add over a row keeps its namespace -
+ * replacing a row never moves it into another tenant's searches; vi_set_ns moves a row. vi_delete_ns removes every
+ * row of a namespace (one journal record) and returns how many; vi_count_ns counts them. Saved in the file,
+ * journaled, under the row checks. 0 (a count for the last two), or -1 (vi_error()). */
+VI_API int vi_add_ns(vi_db *db, vi_i64 ns, vi_i64 id, const float *vec, const char *text, int len);
+VI_API int vi_set_ns(vi_db *db, vi_i64 id, vi_i64 ns);
+VI_API int vi_get_ns(vi_db *db, vi_i64 id, vi_i64 *ns);
+VI_API int vi_search_ns(vi_db *db, vi_i64 ns, const float *query, int k, vi_i64 *ids, float *scores);
+/* vi_search_ns over several namespaces at once: the rows of any of ns[0, n) (any order, repeats allowed; a name is
+ * vi_key(name, -1)), the k best of all of them. The set is tested inside the scan (log2 n steps a candidate), and
+ * namespaces small enough together are searched exactly over their own rows. */
+VI_API int vi_search_in(vi_db *db, const vi_i64 *ns, int n, const float *query, int k, vi_i64 *ids, float *scores);
+VI_API vi_i64 vi_delete_ns(vi_db *db, vi_i64 ns);
+VI_API vi_i64 vi_count_ns(vi_db *db, vi_i64 ns);
+
 /* A 64-bit tag on a row, for filtered search: 0, or -1 when there is no such row. */
 VI_API int vi_set_tag(vi_db *db, vi_i64 id, vi_i64 tag);
 VI_API int vi_get_tag(vi_db *db, vi_i64 id, vi_i64 *tag);
@@ -182,15 +231,35 @@ VI_API int vi_search_tagged(vi_db *db, const float *query, int k, vi_i64 all, vi
  * such search builds the word index over every text; later writes keep it current. */
 VI_API int vi_search_hybrid(vi_db *db, const float *query, const char *text, int tlen, int k, vi_i64 *ids, float *scores);
 
+/* vi_search with at most one hit a group, the group of an id being id >> shift (unsigned): with ids made as
+ * doc << 20 | chunk, shift 20 gives the best chunk of each of the k nearest documents instead of k chunks of one.
+ * shift 0: every id its own group, as vi_search. Hits best first, scores as vi_search; returns how many groups were
+ * found (fewer than k when the store has fewer, or when the 65536 nearest rows hold fewer), or -1 (as vi_search, or
+ * a shift outside 0-63). */
+VI_API int vi_search_grouped(vi_db *db, const float *query, int k, int shift, vi_i64 *ids, float *scores);
+
 /* nq queries (queries: nq x dim) on up to threads threads (0: every core); ids and scores (cosines) get k slots a
  * query, a missing hit has id -1 and score -1. 0, or -1 when an argument or a query is wrong. */
 VI_API int vi_search_batch(vi_db *db, const float *queries, int nq, int k, vi_i64 *ids, float *scores, int threads);
+
+/* vi_search with a proof: the k rows with the highest exact score, the same set as scoring every row, at most a few
+ * times the time of vi_search. The fast scan gives each row an estimate and a bound on its error, proved in
+ * lean4/Vecindex/Exact.lean (Cauchy-Schwarz on the coding error, the table rounding); a row is scored exactly unless
+ * its estimate plus bound is below the k-th best exact score found so far. *checked (NULL: not wanted) gets how many
+ * rows were scored exactly - the rest were ruled out by the bound. Ties at the k-th score may come out either way.
+ * Returns how many hits, or -1 as vi_search. */
+VI_API int vi_search_exact(vi_db *db, const float *query, int k, vi_i64 *ids, float *scores, vi_i64 *checked);
+/* vi_search_exact for nq queries (queries: nq x dim), each block of codes read once for up to 16 of them: ids and
+ * scores get k slots a query (a missing hit: id -1, score -1), checked (NULL: not wanted) nq counts. 0, or -1 as
+ * vi_search_batch. */
+VI_API int vi_search_exact_batch(vi_db *db, const float *queries, int nq, int k, vi_i64 *ids, float *scores, vi_i64 *checked);
 
 /* Builds the index over every row now (with VI_MANUAL; by default the store's own thread does it as rows come). */
 VI_API void vi_build(vi_db *db);
 
 /* Keeps recall@10 at target (e.g. 0.95): every build measures recall against an exact search and picks the fewest
- * probes that reach it. 0 turns it off. 0, or -1 for a target outside [0, 1). */
+ * probes that reach it. A store opened without VI_MANUAL keeps 0.90 unless told otherwise (speed first, for RAG);
+ * vi_search_exact is there when every hit counts. 0 turns it off. 0, or -1 for a target outside [0, 1). */
 VI_API int vi_set_recall(vi_db *db, float target);
 
 /* Memory per row before the first row is added: code_bits 4 (default), 2 or 1 for what a search scans (dim / 2,
@@ -243,11 +312,17 @@ VI_API int vi_snapshot_wait(vi_db *db, int block);
  * on (data 1-128, parity 0-64; 0: digests only): 0, or -1 out of range. */
 VI_API int vi_set_parity(vi_db *db, int data, int parity);
 
-/* What opening checks, for every vi_open after the call (process-wide): 2 every block, the default; 1 only the
- * blocks that hold the header; 0 nothing (to rescue a file whose checksums are gone). $VECINDEX_VERIFY sets the
- * default. Damaged blocks are rebuilt from the parity and written back; when they cannot be, a damaged index is
- * built again from the rows and damaged rows make vi_open fail - vi_error says why. */
+/* What opening checks, for every vi_open after the call (process-wide): 2 every block; 3 the lens - the header,
+ * the index's small arrays and the label table at once, a text before it is read, every block before a save or a
+ * snapshot, and the rest by a thread that walks the file one 64 KiB block at a time (16 MB/s), so a store larger
+ * than RAM opens in a moment; 1 only the blocks that hold the header; 0 nothing (to rescue a file whose checksums
+ * are gone). The default: 2 for a file up to half of RAM, 3 above; $VECINDEX_VERIFY (0, 1, 2 or lens) sets it.
+ * Rows are checked on every read whatever the level. Damaged blocks are rebuilt from the parity and written back;
+ * when they cannot be, a damaged index is built again from the rows and damaged rows make vi_open fail (2) or stay
+ * out of every result (3) - vi_error says why. */
 VI_API void vi_set_verify(int level);
+/* The lens's walk: blocks checked so far and of how many (both 0: the open checked every block). */
+VI_API int vi_lens(vi_db *db, vi_i64 *done, vi_i64 *total);
 VI_API const char *vi_open_error(void);   /* vi_error, under its older name */
 
 /* Every row also carries a 32-bit check of its vector, id and tag, tested whenever a search re-scores it or vi_get

@@ -10,6 +10,7 @@
  * Or compile it into a program like any other part of vecindex: one translation unit, -Isrc -Iinclude. */
 #include "store.c"
 #include "vecindex.h"
+#include <dirent.h>
 
 struct vi_db {
     Arena arena;                /* the store lives in it */
@@ -110,6 +111,13 @@ VI_API const char *vi_error(void)
 
 VI_API const char *vi_open_error(void) { return vi_error(); }
 
+/* The recall@10 a store opened without VI_MANUAL keeps by default: for RAG over many documents speed matters more
+ * than the last few hits (GloVe-100: about 1.6 times the queries a second of recall 0.95, docs/benchmarks.md);
+ * vi_set_recall changes it, 0 turns the tuning off (the build's default probes: about 0.96 there). */
+#ifndef VI_RECALL_DEFAULT
+#define VI_RECALL_DEFAULT 0.90f
+#endif
+
 VI_API vi_db *vi_open(const char *path, int dim, int flags)
 {
     vi_db *db;
@@ -159,7 +167,10 @@ VI_API vi_db *vi_open(const char *path, int dim, int flags)
             return (vi_db *)0;
         }
     }
-    if (!(flags & VI_MANUAL)) store_set_live(db->s, 1, 1.0f);   /* rows are indexed as they come: no vi_build to forget */
+    if (!(flags & VI_MANUAL)) {
+        store_set_live(db->s, 1, 1.0f);                          /* rows are indexed as they come: no vi_build to forget */
+        store_set_target_recall(db->s, VI_RECALL_DEFAULT);       /* the fewest probes that keep recall@10 at 0.90 */
+    }
     {   char *e = vi_ebuf_(); if (e) *e = 0; }                   /* an open that worked leaves no reason from an earlier failure */
     return db;
 }
@@ -227,6 +238,49 @@ VI_API vi_db *vi_dir_get(vi_dir *d, const char *name)
     return t ? t->db : (vi_db *)0;
 }
 
+/* the k best of every store in the directory: each searched as vi_search, the hits merged by score (smaller first in
+ * an L2 store, bigger first otherwise); stores of another dimension or metric than the first are an error */
+VI_API int vi_dir_search(vi_dir *d, const float *query, int k, vi_i64 *ids, float *scores)
+{
+    DIR *dd;
+    struct dirent *e;
+    vi_i64 *ci;
+    float *cs;
+    int have = 0, n, i, j, metric = -1, dim = -1, r = 0;
+    if (!d) return vi_fail_(-1, "dir is NULL (did vi_dir_open fail? vi_error() said why)", (const char *)0, (const char *)0);
+    if (k < 1) return vi_fail_(-1, "k must be 1 or more", (const char *)0, (const char *)0);
+    if (!query || !ids || !scores) return vi_fail_(-1, "the query is NULL, or ids and scores do not hold k values each", (const char *)0, (const char *)0);
+    if (!(dd = opendir(d->path))) return vi_fail_(-1, d->path, ": cannot list it", (const char *)0);
+    ci = (vi_i64 *)malloc((size_t)k * sizeof(vi_i64));
+    cs = (float *)malloc((size_t)k * sizeof(float));
+    if (!ci || !cs) { free(ci); free(cs); closedir(dd); return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0); }
+    while (r == 0 && (e = readdir(dd)) != (struct dirent *)0) {
+        char name[72];
+        size_t L = strlen(e->d_name);
+        vi_db *db;
+        if (L < 5 || L > 68 || strcmp(e->d_name + L - 4, ".vxi") != 0) continue;   /* PATH.vxi.j and the rest are not stores */
+        memcpy(name, e->d_name, L - 4); name[L - 4] = 0;
+        if (!(db = vi_dir_get(d, name))) { r = -1; break; }      /* vi_error() says why */
+        if (metric < 0) { metric = db->s->metric; dim = db->s->dim; }
+        else if (db->s->metric != metric || db->s->dim != dim) {
+            r = vi_fail_(-1, e->d_name, " has another dimension or metric than the other stores", (const char *)0);
+            break;
+        }
+        if ((n = vi_search(db, query, k, ci, cs)) < 0) { r = -1; break; }
+        for (i = 0; i < n; ++i) {                                /* into the merged top k, best first */
+            float x = cs[i];
+            if (have == k && (metric == 2 ? x >= scores[k - 1] : x <= scores[k - 1])) break;   /* the rest are worse */
+            for (j = have < k ? have++ : k - 1; j > 0 && (metric == 2 ? scores[j - 1] > x : scores[j - 1] < x); --j) {
+                ids[j] = ids[j - 1]; scores[j] = scores[j - 1];
+            }
+            ids[j] = ci[i]; scores[j] = x;
+        }
+    }
+    closedir(dd);
+    free(ci); free(cs);
+    return r ? r : have;
+}
+
 VI_API void vi_dir_close(vi_dir *d)
 {
     vi_ten *t, *nx;
@@ -246,6 +300,13 @@ VI_API int vi_add(vi_db *db, vi_i64 id, const float *vec)
     if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
     if (vi_vec_ok_(db, vec, "the vector")) return -1;
     return store_put(db->s, vec, (i64)id, 0) == 0 ? 0 : vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+}
+
+VI_API int vi_update(vi_db *db, vi_i64 id, const float *vec)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (vi_vec_ok_(db, vec, "the vector")) return -1;
+    return store_update(db->s, vec, (i64)id) == 0 ? 0 : vi_norow_(db, id);
 }
 
 VI_API int vi_add_batch(vi_db *db, int n, const vi_i64 *ids, const float *vecs)
@@ -302,6 +363,15 @@ VI_API int vi_set_parity(vi_db *db, int data, int parity)
     return store_set_parity(db->s, (i32)data, (i32)parity) == 0 ? 0 : vi_fail_(-1, "data is 1 to 128 blocks and parity 0 to 64", (const char *)0, (const char *)0);
 }
 VI_API void vi_set_verify(int level) { store_set_verify((i32)level); }
+VI_API int vi_lens(vi_db *db, vi_i64 *done, vi_i64 *total)
+{
+    i64 d, t;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    store_lens_info(db->s, &d, &t);
+    if (done) *done = (vi_i64)d;
+    if (total) *total = (vi_i64)t;
+    return 0;
+}
 VI_API void vi_set_check_reads(vi_db *db, int on) { if (db) store_set_check_reads(db->s, (i32)on); }
 VI_API int vi_integrity(vi_db *db, vi_health *h)
 {
@@ -377,6 +447,15 @@ VI_API int vi_batch_add(vi_batch *b, vi_i64 id, const float *vec)
     return store_batch_put(&b->w, vec, (i64)id, 0) == 0 ? 0 : vi_fail_(-1, "out of memory, or the batch is over 1 GB", VI_BADB, (const char *)0);
 }
 
+VI_API int vi_batch_update(vi_batch *b, vi_i64 id, const float *vec)
+{
+    vi_db t;
+    if (!b) return vi_fail_(-1, VI_NOB, (const char *)0, (const char *)0);
+    t.s = b->w.s;
+    if (vi_vec_ok_(&t, vec, "the vector")) { b->w.bad = 1; { char *e = vi_ebuf_(); if (e && strlen(e) + strlen(VI_BADB) < VI_EMAX) strcat(e, VI_BADB); } return -1; }
+    return store_batch_update(&b->w, vec, (i64)id) == 0 ? 0 : vi_fail_(-1, "out of memory, or the batch is over 1 GB", VI_BADB, (const char *)0);
+}
+
 VI_API int vi_batch_add_text(vi_batch *b, vi_i64 id, const float *vec, const char *text, int len)
 {
     vi_db t;
@@ -396,6 +475,9 @@ VI_API int vi_batch_delete_range(vi_batch *b, vi_i64 lo, vi_i64 hi)
     if (lo > hi) { b->w.bad = 1; return vi_fail_(-1, "lo is above hi", VI_BADB, (const char *)0); }
     return store_batch_delete_range(&b->w, (i64)lo, (i64)hi);
 }
+
+VI_API int vi_batch_set_ns(vi_batch *b, vi_i64 id, vi_i64 ns) { return b ? store_batch_set_ns(&b->w, (i64)id, (i64)ns) : vi_fail_(-1, VI_NOB, (const char *)0, (const char *)0); }
+VI_API int vi_batch_set_num(vi_batch *b, vi_i64 id, vi_i64 num) { return b ? store_batch_set_num(&b->w, (i64)id, (i64)num) : vi_fail_(-1, VI_NOB, (const char *)0, (const char *)0); }
 
 VI_API int vi_batch_commit(vi_batch *b, int sync)
 {
@@ -457,12 +539,156 @@ VI_API int vi_get_tag(vi_db *db, vi_i64 id, vi_i64 *tag)
     return 0;
 }
 
+VI_API int vi_set_num(vi_db *db, vi_i64 id, vi_i64 num)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    return store_set_num(db->s, (i64)id, (i64)num) == 0 ? 0 : vi_norow_(db, id);
+}
+
+VI_API int vi_get_num(vi_db *db, vi_i64 id, vi_i64 *num)
+{
+    i64 v = 0;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (store_get_num(db->s, (i64)id, &v) != 0) return vi_norow_(db, id);
+    if (num) *num = (vi_i64)v;
+    return 0;
+}
+
+VI_API int vi_search_range(vi_db *db, const float *query, int k, vi_i64 lo, vi_i64 hi, vi_i64 *ids, float *scores)
+{
+    int n;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    n = store_search_num(db->s, query, (i32)k, (i64)lo, (i64)hi, (i64 *)ids, scores);
+    vi_cos_(db, scores, n);
+    return n;
+}
+
+VI_API int vi_add_ns(vi_db *db, vi_i64 ns, vi_i64 id, const float *vec, const char *text, int len)
+{
+    StoreWb b;
+    i32 r, n;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (vi_vec_ok_(db, vec, "the vector")) return -1;
+    n = text ? vi_len_(text, len) : 0;
+    if (n < 0 || n > STORE_TXMAX) return vi_fail_(-1, "the text is longer than 16 MB - 1 bytes", (const char *)0, (const char *)0);
+    store_batch_init(&b, db->s);                                 /* the row and its namespace: one journal record */
+    if (n > 0) store_batch_put_text(&b, vec, (i64)id, 0, text, n); else store_batch_put(&b, vec, (i64)id, 0);
+    store_batch_set_ns(&b, (i64)id, (i64)ns);
+    r = store_batch_commit(&b, 0);
+    store_batch_free(&b);
+    return r >= 0 ? 0 : vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+}
+
+VI_API int vi_set_ns(vi_db *db, vi_i64 id, vi_i64 ns)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    return store_set_ns(db->s, (i64)id, (i64)ns) == 0 ? 0 : vi_norow_(db, id);
+}
+
+VI_API int vi_get_ns(vi_db *db, vi_i64 id, vi_i64 *ns)
+{
+    i64 v = 0;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (store_get_ns(db->s, (i64)id, &v) != 0) return vi_norow_(db, id);
+    if (ns) *ns = (vi_i64)v;
+    return 0;
+}
+
+VI_API int vi_search_ns(vi_db *db, vi_i64 ns, const float *query, int k, vi_i64 *ids, float *scores)
+{
+    int n;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    n = store_search_ns(db->s, (i64)ns, query, (i32)k, (i64 *)ids, scores);
+    vi_cos_(db, scores, n);
+    return n;
+}
+
+VI_API int vi_search_in(vi_db *db, const vi_i64 *ns, int n, const float *query, int k, vi_i64 *ids, float *scores)
+{
+    int r;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    if (n < 1 || !ns) return vi_fail_(-1, "no namespace to search in", (const char *)0, (const char *)0);
+    r = store_search_nss(db->s, (const i64 *)ns, (i32)n, query, (i32)k, (i64 *)ids, scores);
+    if (r < 0) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    vi_cos_(db, scores, r);
+    return r;
+}
+
+VI_API vi_i64 vi_delete_ns(vi_db *db, vi_i64 ns)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (!ns) return vi_fail_(-1, "namespace 0 is the rows in none: delete those by id", (const char *)0, (const char *)0);
+    return (vi_i64)store_delete_ns(db->s, (i64)ns);
+}
+
+VI_API vi_i64 vi_count_ns(vi_db *db, vi_i64 ns)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    return (vi_i64)store_count_ns(db->s, (i64)ns);
+}
+
+VI_API int vi_search_exact(vi_db *db, const float *query, int k, vi_i64 *ids, float *scores, vi_i64 *checked)
+{
+    int n;
+    i64 c = 0;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    n = store_search_exact(db->s, query, (i32)k, (i64 *)ids, scores, (const StoreCnf *)0, &c);
+    if (n < 0) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    vi_cos_(db, scores, n);
+    if (checked) *checked = (vi_i64)c;
+    return n;
+}
+
+VI_API int vi_search_exact_batch(vi_db *db, const float *queries, int nq, int k, vi_i64 *ids, float *scores, vi_i64 *checked)
+{
+    int q, j;
+    i32 *n;
+    if (vi_search_ok_(db, (const float *)0, k, ids, scores)) return -1;
+    if (nq < 0 || (nq > 0 && !queries)) return vi_fail_(-1, "queries is NULL or nq below 0", (const char *)0, (const char *)0);
+    for (q = 0; q < nq; ++q) if (vi_vec_ok_(db, queries + (size_t)q * (size_t)db->s->dim, "a query")) {
+        char nb[24], why[VI_EMAX];
+        strcpy(why, vi_error());
+        sprintf(nb, "%d: ", q);
+        return vi_fail_(-1, "query ", nb, why);
+    }
+    if (nq == 0) return 0;
+    n = (i32 *)malloc((size_t)nq * sizeof(i32));
+    if (!n || store_search_exact_batch(db->s, queries, (i32)nq, (i32)k, (i64 *)ids, scores, n, (const StoreCnf *)0, (i64 *)checked) != 0) {
+        free(n);
+        return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    }
+    for (q = 0; q < nq; ++q) {
+        vi_cos_(db, scores + (size_t)q * k, n[q]);
+        for (j = n[q]; j < k; ++j) { ids[(size_t)q * k + j] = -1; scores[(size_t)q * k + j] = -1.0f; }
+    }
+    free(n);
+    return 0;
+}
+
 VI_API int vi_search(vi_db *db, const float *query, int k, vi_i64 *ids, float *scores)
 {
     int n;
     if (vi_search_ok_(db, query, k, ids, scores)) return -1;
     if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
-    n = store_search(db->s, query, (i32)k, (i64 *)ids, scores);
+    {   i64 oom = store_oom_count();
+        n = store_search(db->s, query, (i32)k, (i64 *)ids, scores);
+        if (n == 0 && store_oom_count() != oom) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0); }
+    vi_cos_(db, scores, n);
+    return n;
+}
+
+VI_API int vi_search_grouped(vi_db *db, const float *query, int k, int shift, vi_i64 *ids, float *scores)
+{
+    i32 n;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    if (shift < 0 || shift > 63) return vi_fail_(-1, "shift must be 0 to 63", (const char *)0, (const char *)0);
+    if ((n = store_search_grouped(db->s, query, (i32)k, (i32)shift, (const StoreCnf *)0, (i64 *)ids, scores)) < 0)
+        return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
     vi_cos_(db, scores, n);
     return n;
 }
@@ -631,6 +857,25 @@ VI_API int vi_search_labeled(vi_db *db, const float *query, int k, const char *a
     r = store_label_cnf(db->s, all, any, none, &c, &bad);
     if (r == -1) return vi_badlabel_(-1, bad, "\" does not exist (vi_label or vi_label_add makes it)");
     if (r == -2) return vi_fail_(-1, "at most 15 labels in all", (const char *)0, (const char *)0);
+    n = store_search_cnf(db->s, query, (i32)k, (i64 *)ids, scores, &c);
+    vi_cos_(db, scores, n);
+    return n;
+}
+
+VI_API int vi_search_where(vi_db *db, const float *query, int k, const char *all, const char *any, const char *none,
+                           vi_i64 lo, vi_i64 hi, vi_i64 *ids, float *scores)
+{
+    StoreCnf c;
+    const char *bad = (const char *)0;
+    i32 r;
+    int n;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    r = store_label_cnf(db->s, all, any, none, &c, &bad);
+    if (r == -1) return vi_badlabel_(-1, bad, "\" does not exist (vi_label or vi_label_add makes it)");
+    if (r == -2) return vi_fail_(-1, "at most 15 labels in all", (const char *)0, (const char *)0);
+    if (lo > hi) return 0;
+    c.num = 1; c.lo = (i64)lo; c.hi = (i64)hi;
     n = store_search_cnf(db->s, query, (i32)k, (i64 *)ids, scores, &c);
     vi_cos_(db, scores, n);
     return n;

@@ -1,19 +1,20 @@
 # Production readiness
 
-**Embedded first, one machine.** The library runs inside the application, like SQLite; `vserv` puts the same store
-on a socket for other processes and languages. Neither needs a cluster or a cloud: a tenant is a store file, a batch
-of writes goes in whole or not at all, the journal is flushed every second and folded into the file by background
-snapshots, the log records who did what (there are no users and roles), mutual TLS can tie a client to its tenant,
-one setting caps the CPU it takes and another what stays in RAM. A standby is a copy of the file and its journal;
-there is no replication. Every number below is measured: the older rows on a GTX 1050 Ti box (7.8 GB RAM, 12 cores),
-the scale, server and benchmark rows on the 2-core box of the Results section; `./run`, `./run stress`, `./run bench`
-and `./run real_val` reproduce them.
+**Embedded first, one machine.** The library runs inside the application, like SQLite; `vserv` puts the same store on
+a socket for other processes and languages. Neither needs a cluster or a cloud: a tenant is a store file, a batch of
+writes goes in whole or not at all, the journal is flushed every second and folded into the file by background
+snapshots, the log records who did what (there are no users and roles), mutual TLS can tie a client to its tenant, one
+setting caps the CPU it takes and another what stays in RAM. A standby on a second machine follows the primary with
+`vserv -F` (a copy of the file and its journal, never ahead of the primary's last fsync). Every number below is
+measured: the older rows on a GTX 1050 Ti box (7.8 GB RAM, 12 cores), the scale, server and benchmark rows on the
+2-core box of the Results section; `./run`, `./run stress`, `./run bench` and `./run real_val` reproduce them.
 
 | area | status | evidence |
 |---|---|---|
 | Crash safety | the store's journal and background snapshots | `tests/scrash.c` kills a store writer (and in every other round its snapshot child) at random moments: every synced row there exactly once |
 | CPUs | x86-64 (AVX-512, AVX2 or neither), ARM 64- and 32-bit (NEON), RISC-V 64, s390x (big-endian); 32-bit builds keep 64-bit file offsets | `tests/simd_test.c` checks every SIMD kernel against a plain reference: in `./run` for this CPU and, on x86-64, for an AVX2-only and a no-SIMD build. `tools/cross` builds the core tests for aarch64, armv7, riscv64 and s390x and runs them under qemu; it found a 32-bit bug that broke snapshots, fixed. Speed on real ARM hardware: not measured |
 | C API | `include/vecindex.h`, only `vi_*` exported | `tests/api_test.c` against the shared and the static library; Python, Go and Rust bindings run by hand ([docs/api.md](docs/api.md)) |
+| Search with a proof | `vi_search_exact`: the k best by exact score, the same set as scoring every row; the scan's per-row error bound rules the rest out | proved in [`lean4/Vecindex/Exact.lean`](lean4/Vecindex/Exact.lean) (Cauchy-Schwarz, table rounding, the cut, the answer exact); `tests/exact_test.c` checks every term of the bound on every row in 13 configurations; GloVe-100, 1.18M rows: recall@10 1.0000 in 3.7-4.0 ms median against 50-56 ms for every row, 0.16% of rows scored; a batch reads each block once for 16 queries ([docs/benchmarks.md](docs/benchmarks.md)) |
 | Concurrency | a readers-writer lock, TSan-clean, the store's live thread too | the store self-test under TSan in `./run` (it found two real races in live mode, fixed) |
 | Adversarial stress | invariant checks, not just "doesn't crash" | `tests/stress.c` (churn against an oracle, edge cases) in `./run stress` |
 | Integrity | every 64 KiB block of the file with a BLAKE3 digest, Reed-Solomon parity (any 2 damaged blocks of 32 rebuilt, groups interleaved), the table of digests twice; checked at load and by `scrub`, damage rebuilt and written back, damage beyond repair refused; a check on every row, tested whenever a search or lookup reads it - a page that went bad on the disk after the load is rebuilt from the parity on the spot (as ZFS heals a read), a row that cannot be is never returned; every journal record with a CRC-32C | in `./run`, passing (2-vCPU Xeon, 2026-11-06): `tests/store_test.c` (BLAKE3 against the reference implementation's digests, one damaged block rebuilt, two in one group refused, a row healed on a read after the load, a row damaged in memory left out, damaged copies and parity mended by a scrub, a damaged journal frame against a torn tail), `tests/api_test.c`, `tests/vserv_test.c`, `tests/battle_damage.c` (damage on the disk, below); proved in [`lean4`](lean4): GF(2^8) from the tables is a field, the Cauchy parity rebuilds any m damaged blocks of a group for every k <= 128 and m <= 64, CRC-32C catches every change inside one byte |
@@ -30,4 +31,4 @@ and `./run real_val` reproduce them.
 | Independent review | **not done** | every test here was written and run by the author of the code |
 | Tenants | a store file per tenant, opened on first use: in the library (`vi_dir_*`) or the server (`vserv DIR`, where `-U` binds a client certificate to its tenant) | in `./run`, passing (2-vCPU Xeon, 2026-11-06): `tests/api_test.c` (`vi_dir_*`), `tests/vserv_test.c` (isolation, the three protocols, the log, a restart, `-U` with a tenant's certificate) |
 | Transactions | write batches: searches see all or none of one, a crash leaves all or none (one CRC-checked journal record), commit with fsync on request (`vi_batch_*`, `begin`/`commit` in `vserv`) | in `./run`, passing (2-vCPU Xeon, 2026-11-06): `tests/store_test.c` (refused and aborted batches, a torn and a damaged batch in the journal, a reader that must never see half of one, durable commits from 4 threads), `tests/api_test.c`, `tests/vserv_test.c` (kill -9 right after `commit sync`) |
-| Users and roles / replication | **not present, on purpose** | access is the socket's file mode, the bound address and client certificates; accountability is the log; a backup or a standby is a copy of the file and its journal ([docs/server.md](docs/server.md)) |
+| Users and roles / multi-primary replication | **not present, on purpose** | access is the socket's file mode, the bound address, client certificates and API keys; accountability is the log; a standby follows with `vserv -F`, one primary per store ([docs/server.md](docs/server.md)) |
