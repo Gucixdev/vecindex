@@ -5,4 +5,4 @@ set -euo pipefail
 sed -e 's|/\*.*\*/||g' "$1" | awk '
     /\/\*/ { c = 1 } c { if (/\*\//) c = 0; next }
     /^VI_API/ { d = $0; while (d !~ /;/ && (getline l) > 0) d = d " " l; print d }' \
-  | sed -e 's|/\*.*||' | tr -s ' \t' ' ' | sed -e 's/ *; */;/' -e 's/ *$//' | sort -u
+  | sed -e 's|/\*.*||' | tr -s ' \t' ' ' | sed -e 's/ *; */;/' -e 's/ *$//' | LC_ALL=C sort -u

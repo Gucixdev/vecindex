@@ -181,7 +181,7 @@ echo
     || { echo "  ^ file compatibility FAILED"; fail=1; rec "file compatibility" FAIL; }
 apimiss=""
 for f in tests/compat/api-*.txt; do
-    m=$(comm -23 "$f" <(tests/compat/api_decls.sh include/vecindex.h)) || true
+    m=$(LC_ALL=C comm -23 "$f" <(tests/compat/api_decls.sh include/vecindex.h)) || true
     [[ -n $m ]] && apimiss+="$f: $m"$'\n'
 done
 if [[ -z $apimiss ]]; then rec "API compatibility" ok "every declaration of $(ls tests/compat/api-*.txt | sed 's|.*/api-||; s|\.txt||' | paste -sd, -) still in vecindex.h"
