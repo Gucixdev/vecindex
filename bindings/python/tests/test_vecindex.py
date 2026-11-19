@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 import vecindex
+import vecindex.convert
 
 DIM = 8
 
@@ -214,6 +215,114 @@ class Store(unittest.TestCase):
             self.assertEqual(len(db), 30)
             self.assertEqual(db.text(25), "r2")
 
+
+class Ingest(unittest.TestCase):
+    """Documents in: Markdown and JSON parsed in C, other formats converted in Python, the model a Python function."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="vecindex_py_ing_")
+        self.db = vecindex.open(None, DIM)
+
+    def tearDown(self):
+        self.db.close()
+        shutil.rmtree(self.dir)
+
+    def write(self, name, body):
+        p = os.path.join(self.dir, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        return p
+
+    def test_markdown_sections_and_python_model(self):
+        seen = []
+
+        def model(text):
+            seen.append(text)
+            return vecindex.embed_hash(text, DIM)
+        st = self.db.ingest_text("guide.md", "# Guide\n\nIntro.\n\n## Install\n\nRun the build.\n", embed=model)
+        self.assertEqual((st["docs"], st["sections"], st["chunks"]), (1, 2, 2))
+        self.assertEqual(len(seen), 2)
+        self.assertIn("# Guide > ## Install", seen[1])
+        lo = min(i for i, _ in self.db.search(text="build", k=5))
+        self.assertEqual((lo >> 10) & 1023, 1)  # the second section is page 1
+        self.assertTrue(self.db.text(lo).startswith("## Install"))
+
+    def test_model_error_comes_back(self):
+        def bad(text):
+            raise KeyError("model down")
+        with self.assertRaises(KeyError):
+            self.db.ingest_text("a.md", "# A\n\ntext\n", embed=bad)
+        self.assertEqual(len(self.db), 0)
+        with self.assertRaises(ValueError):
+            self.db.ingest_text("a.md", "# A\n\ntext\n", embed=lambda t: [1.0])
+
+    def test_json_and_replace_and_remove(self):
+        st = self.db.ingest_text("r.json", '[{"t":"red apple"},{"t":"green pear"}]', "json")
+        self.assertEqual(st["chunks"], 2)
+        self.db.ingest_text("r.json", '[{"t":"blue plum"}]', "json")
+        self.assertEqual(len(self.db), 1)
+        self.assertEqual(self.db.ingest_remove("r.json"), 1)
+        self.assertEqual(len(self.db), 0)
+        with self.assertRaises(vecindex.VecindexError):
+            self.db.ingest_text("x.json", '{"a":', "json")
+
+    def test_files_by_extension(self):
+        self.db.ingest_file(self.write("n.jsonl", '{"q":"one"}\n{"q":"two"}\n'))
+        self.db.ingest_file(self.write("p.html", "<html><head><title>x</title><script>no()</script></head><body>"
+                                       "<h1>Top</h1><p>Hello <b>world</b></p><h2>Sub</h2><ul><li>item</li></ul>"
+                                       "</body></html>"))
+        self.db.ingest_file(self.write("t.txt", "plain words here\n"))
+        self.assertEqual(len(self.db), 2 + 2 + 1)
+        hit = self.db.search(text="world", k=1)[0][0]
+        self.assertIn("Hello world", self.db.text(hit))
+        self.assertNotIn("no()", " ".join(self.db.text(i) for i, _ in self.db.search(text="no", k=5)))
+        with self.assertRaises(ValueError):
+            self.db.ingest_file(self.write("x.xyz", "?"))
+
+    def test_html_markdown(self):
+        md = vecindex.convert.html_to_markdown("<h2>A</h2><p>b  c</p><pre>x\n  y</pre>")
+        self.assertEqual(md, "## A\n\nb c\n\n```\nx\n  y\n```\n")
+
+    def test_register(self):
+        @vecindex.convert.register(".up")
+        def up(path):
+            with open(path) as f:
+                return "# Up\n\n" + f.read().upper()
+        self.db.ingest_file(self.write("a.up", "shout"))
+        self.assertIn("SHOUT", self.db.text(self.db.search(text="SHOUT", k=1)[0][0]))
+
+    @unittest.skipUnless(shutil.which("pdftotext"), "no pdftotext")
+    def test_pdf_pages(self):
+        pdf = os.path.join(self.dir, "d.pdf")
+        with open(pdf, "wb") as f:
+            f.write(tiny_pdf(["first page", "second page"]))
+        st = self.db.ingest_file(pdf)
+        self.assertEqual(st["sections"], 2)
+        hit = self.db.search(text="second", k=1)[0][0]
+        self.assertEqual((hit >> 10) & 1023, 1)
+
+
+def tiny_pdf(pages):
+    """A PDF by hand, one line of Helvetica per page: no tool needed to make it, only pdftotext to read it."""
+    n = len(pages)
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [%s] /Count %d >>" % (" ".join("%d 0 R" % (4 + 2 * i) for i in range(n)), n),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    for i, t in enumerate(pages):
+        body = "BT /F1 20 Tf 72 700 Td (%s) Tj ET" % t
+        objs.append("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> "
+                    "/Contents %d 0 R >>" % (5 + 2 * i))
+        objs.append("<< /Length %d >>\nstream\n%s\nendstream" % (len(body), body))
+    out = b"%PDF-1.4\n"
+    offs = []
+    for i, o in enumerate(objs):
+        offs.append(len(out))
+        out += ("%d 0 obj\n%s\nendobj\n" % (i + 1, o)).encode()
+    x = len(out)
+    out += ("xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)).encode()
+    out += "".join("%010d 00000 n \n" % o for o in offs).encode()
+    out += ("trailer << /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, x)).encode()
+    return out
 
 if __name__ == "__main__":
     unittest.main()

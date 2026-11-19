@@ -86,6 +86,30 @@ _sig("vi_build", None, _vp)
 _sig("vi_save", ctypes.c_int, _vp, _cp)
 _sig("vi_sync", ctypes.c_int, _vp)
 
+# documents in (include/ingest.h): Markdown and JSON are parsed in C; other formats become Markdown here (convert.py)
+_EMBED = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_char), ctypes.c_int, _f32p,
+                          ctypes.c_int)
+
+
+class _IngestOpts(ctypes.Structure):
+    _fields_ = [("embed", _EMBED), ("embed_ctx", ctypes.c_void_p), ("max_bytes", ctypes.c_int),
+                ("overlap", ctypes.c_int), ("fields", ctypes.c_char_p), ("headings", ctypes.c_int)]
+
+
+class _IngestStats(ctypes.Structure):
+    _fields_ = [("docs", ctypes.c_int), ("sections", ctypes.c_int), ("chunks", ctypes.c_int),
+                ("fields", ctypes.c_int), ("bytes", _i64)]
+
+
+MD, JSON, JSONL = 1, 2, 3
+_KINDS = {"md": MD, "markdown": MD, "json": JSON, "jsonl": JSONL, "ndjson": JSONL}
+_sig("vi_ingest_defaults", None, ctypes.POINTER(_IngestOpts))
+_sig("vi_ingest_text", ctypes.c_int, _vp, _cp, _cp, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_IngestOpts),
+     ctypes.POINTER(_IngestStats))
+_sig("vi_ingest_file", ctypes.c_int, _vp, _cp, ctypes.POINTER(_IngestOpts), ctypes.POINTER(_IngestStats))
+_sig("vi_ingest_remove", _i64, _vp, _cp)
+_sig("vi_embed_hash", ctypes.c_int, ctypes.c_void_p, _cp, ctypes.c_int, _f32p, ctypes.c_int)
+
 LIVE, MANUAL, DOT, L2 = 1, 2, 4, 8
 _METRICS = {"cos": 0, "cosine": 0, "dot": DOT, "l2": L2}
 
@@ -336,6 +360,84 @@ class DB:
             raise _err("search_exact")
         return [(ids[i], sc[i]) for i in range(n)], chk.value
 
+    # -- documents --
+    def _opts(self, embed, fields, max_bytes, overlap, headings):
+        o = _IngestOpts()
+        _L.vi_ingest_defaults(ctypes.byref(o))
+        keep = {}
+        if embed is not None:
+
+            def cb(ctx, text, n, out, d):
+                try:
+                    v = embed(ctypes.string_at(text, n).decode("utf-8", "replace"))
+                    if len(v) != d:
+                        raise ValueError("embed returned %d numbers, the store has %d dimensions" % (len(v), d))
+                    for i in range(d):
+                        out[i] = float(v[i])
+                    return 0
+                except BaseException as e:  # noqa: B902 - carried back to the caller, not lost in C
+                    keep["error"] = e
+                    return -1
+            o.embed = _EMBED(cb)
+            keep["cb"] = o.embed
+        if fields is not None:
+            keep["fields"] = _b(fields)
+            o.fields = keep["fields"]
+        if max_bytes is not None:
+            o.max_bytes = int(max_bytes)
+        if overlap is not None:
+            o.overlap = int(overlap)
+        if headings is not None:
+            o.headings = 1 if headings else 0
+        return o, keep
+
+    @staticmethod
+    def _stats(st):
+        return {"docs": st.docs, "sections": st.sections, "chunks": st.chunks, "fields": st.fields,
+                "bytes": st.bytes}
+
+    def ingest_text(self, name, text, kind="md", *, embed=None, fields=None, max_bytes=None, overlap=None,
+                    headings=None):
+        """Puts one document in: text in Markdown (kind "md"), JSON or JSONL, under name, replacing what name held.
+        embed(text) -> dim floats is the model (default: the C hash embedder, words only). The rows get a path
+        field with name; fields lists keys kept as fields ("year,author.name"). Returns the counts as a dict."""
+        k = _KINDS.get(kind, kind)
+        if k not in (MD, JSON, JSONL):
+            raise ValueError("kind is md, json or jsonl (other formats: vecindex.convert to Markdown first)")
+        data = text.encode() if isinstance(text, str) else bytes(text)
+        o, keep = self._opts(embed, fields, max_bytes, overlap, headings)
+        st = _IngestStats()
+        r = _L.vi_ingest_text(self._h(), _b(name), data, len(data), k, ctypes.byref(o), ctypes.byref(st))
+        if "error" in keep:
+            raise keep["error"]
+        if r != 0:
+            raise _err("ingest %s" % (name,))
+        return self._stats(st)
+
+    def ingest_file(self, path, *, embed=None, fields=None, max_bytes=None, overlap=None, headings=None):
+        """Puts a file in by its extension: .md .markdown .json .jsonl .ndjson in C; .txt .html .htm .pdf (and
+        anything vecindex.convert.register adds) converted to Markdown first. The file's path is its name."""
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        if ext in _KINDS:
+            o, keep = self._opts(embed, fields, max_bytes, overlap, headings)
+            st = _IngestStats()
+            r = _L.vi_ingest_file(self._h(), os.fsencode(path), ctypes.byref(o), ctypes.byref(st))
+            if "error" in keep:
+                raise keep["error"]
+            if r != 0:
+                raise _err("ingest %s" % (path,))
+            return self._stats(st)
+        from . import convert
+        return self.ingest_text(path, convert.to_markdown(path), "md", embed=embed, fields=fields,
+                                max_bytes=max_bytes, overlap=overlap, headings=headings)
+
+    def ingest_remove(self, name):
+        """Takes out every row a document put in (the name it was ingested under). Returns how many went."""
+        n = _L.vi_ingest_remove(self._h(), _b(name))
+        if n < 0:
+            raise _err("ingest_remove %s" % (name,))
+        return int(n)
+
     # -- the file --
     def build(self):
         """Indexes what was added (only needed with manual=True; by default rows are indexed as they come)."""
@@ -350,6 +452,14 @@ class DB:
         """Flushes the journal to the disk: everything before it survives a crash."""
         if _L.vi_sync(self._h()) != 0:
             raise _err("sync")
+
+
+def embed_hash(text, dim):
+    """The C hash embedder ingest uses by default: words and word pairs into dim signed buckets, unit length."""
+    b = text.encode() if isinstance(text, str) else bytes(text)
+    out = (ctypes.c_float * dim)()
+    _L.vi_embed_hash(None, b, len(b), out, dim)
+    return list(out)
 
 
 def open(path=None, dim=0, metric="cos", manual=False):

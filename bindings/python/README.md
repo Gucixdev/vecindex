@@ -24,13 +24,26 @@ with vecindex.open("docs.vxi", dim=384) as db:          # made when it is not th
     hits, checked = db.search_exact(query, k=5)          # the exact 5 best, with a proof; checked: rows scored exactly
 ```
 
+Files go in whole: Markdown and JSON are parsed by the C library, `.txt`, `.html` and `.pdf` (by pages, with
+`pdftotext`) are converted to Markdown first, and the model is any Python function from text to floats:
+
+```python
+db.ingest_file("guide.md", embed=model.encode, fields="year")   # sections as pages; front matter as fields
+db.ingest_file("paper.pdf", embed=model.encode)                  # each page a section
+db.ingest_text("rows.jsonl", jsonl_text, "jsonl")                # text from anywhere, under a name
+db.ingest_remove("guide.md")                                     # every row it put in
+
+@vecindex.convert.register(".rst")                               # one more format: path -> Markdown
+def rst(path): ...
+```
+
 Vectors are any sequence of floats; `array.array("f")` and float32 numpy arrays go in without a per-element copy.
 Every change is in the journal at once (`db.sync()` makes it durable), `db.save()` rewrites the file. A refused call
 raises `vecindex.VecindexError` with the library's reason.
 
-The whole API: `open`, `key`, `version`; on a store `add`, `add_many`, `update`, `get`, `text`, `delete`,
+The whole API: `open`, `key`, `version`, `embed_hash`, `convert`; on a store `add`, `add_many`, `update`, `get`, `text`, `delete`,
 `delete_range`, `set_tag`/`tag`, `set_num`/`num`, `set_ns`/`ns`, `count_ns`, `delete_ns`, `label`, `add_labels`,
-`remove_labels`, `search`, `build`, `save`, `sync`, `close`, `len(db)`, `id in db`. The C API underneath and what each
+`remove_labels`, `search`, `ingest_text`, `ingest_file`, `ingest_remove`, `build`, `save`, `sync`, `close`, `len(db)`, `id in db`. The C API underneath and what each
 call promises: `include/vecindex.h` and `docs/api.md` of vecindex.
 
 Tests: `python -m unittest discover -s tests` with the package installed or built in place
