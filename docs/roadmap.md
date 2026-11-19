@@ -133,9 +133,12 @@ Open, in the order they are planned:
 16. **Fields, next**: in vserv and the bindings; an index on a field (sorted
     row lists) so a very selective filter starts from its rows instead of widening the scan; the filter in
     `vi_search_exact` (the certified search) and `vi_search_hybrid`; strings kept whole on demand, beside the key
-17. **Compressed texts** (asked 2026-11-19, next): the documents stay apart from the vectors, as now, and their heap
-    is compressed in the file - an LZ4-style coder of our own (fast to decode on every vi_get_text and vi_context)
-    with a dictionary trained on the store's own texts, since chunks of a few hundred bytes compress poorly alone
+17. **Compressed texts** (asked 2026-11-19, next; the design: [compression.md](compression.md)): the documents stay
+    apart from the vectors, as now, and their heap is compressed in the file by an LZ4-style coder of our own with a
+    dictionary trained on the store's own texts - and nothing may fall apart: compressed bytes go through the block
+    digests and Reed-Solomon parity like every other byte, each text is its own frame (damage beyond the parity loses
+    one text, never its neighbours), the dictionary is stored twice with its own CRCs, the CRC stays on the raw text,
+    the decoder is bounds-checked, fuzzed and its bounds proved
 18. **RAG, next**: `vi_context` and `vi_search_mmr` in vserv (line, binary, HTTP) and the Python/Rust/JS bindings;
     MMR over the 1-bit or 4-bit codes instead of the f32 rows when the rows are cold (k x 4 x dim floats read a
     query today); a dedup of exact text copies by their check without the vectors
