@@ -183,7 +183,7 @@ int main(void)
         g = vg_open((const char *)0);
         for (d = 1; d <= 3; ++d)
             for (c = 0; c < 4; ++c) {
-                char t[16];
+                char t[32];
                 memset(v, 0, sizeof v); v[2 * (d - 1)] = 1.0f; v[2 * (d - 1) + 1] = 0.1f * (float)c;
                 sprintf(t, "d%dc%d;", d, c);
                 vi_add_text(db, ((vi_i64)d << 20) | c, v, t, -1);
