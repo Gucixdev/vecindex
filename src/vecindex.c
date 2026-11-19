@@ -524,6 +524,167 @@ VI_API int vi_search_hybrid(vi_db *db, const float *query, const char *text, int
     return store_search_hybrid(db->s, query, text, vi_len_(text, tlen), (i32)k, (i64 *)ids, scores);
 }
 
+/* ---- payload (store_meta.c) ---- */
+
+typedef char vi_filter_fits_[sizeof(vi_filter) >= sizeof(StoreFlt) ? 1 : -1];   /* the caller's value holds the compiled one */
+
+static int vi_fname_(vi_db *db, const char *name)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (!name) return vi_fail_(-1, "the field's name is NULL", (const char *)0, (const char *)0);
+    return 0;
+}
+
+static int vi_fset_(vi_db *db, vi_i64 id, const char *name, i32 type, u64 code)
+{
+    i32 r;
+    if (vi_fname_(db, name)) return -1;
+    if (db->s->ro) return vi_fail_(-1, "the store is open read-only", (const char *)0, (const char *)0);
+    r = store_field_set(db->s, (i64)id, name, (i32)strlen(name), type, code);
+    if (r == -1) return vi_norow_(db, id);
+    if (r == -2) return vi_fail_(-1, "the field \"", name, "\" exists with another type");
+    if (r == -3) return vi_fail_(-1, "the store has 16 fields already (STORE_FIELDS): no room for \"", name, "\"");
+    if (r == -4) return vi_fail_(-1, "not a field name (1 to 31 of A-Z a-z 0-9 _, no digit first, not and/or/not/in/has/true/false): \"", name, "\"");
+    if (r == -5) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    return 0;
+}
+
+VI_API int vi_field(vi_db *db, const char *name, int type)
+{
+    i32 f;
+    if (vi_fname_(db, name)) return -1;
+    if (type != VI_INT && type != VI_FLOAT && type != VI_STR) return vi_fail_(-1, "the type is VI_INT, VI_FLOAT or VI_STR", (const char *)0, (const char *)0);
+    if (db->s->ro) return vi_fail_(-1, "the store is open read-only", (const char *)0, (const char *)0);
+    f = store_field_decl(db->s, name, (i32)strlen(name), (i32)type);
+    if (f == -2) return vi_fail_(-1, "the field \"", name, "\" exists with another type");
+    if (f == -3) return vi_fail_(-1, "the store has 16 fields already (STORE_FIELDS): no room for \"", name, "\"");
+    if (f == -4) return vi_fail_(-1, "not a field name (1 to 31 of A-Z a-z 0-9 _, no digit first, not and/or/not/in/has/true/false): \"", name, "\"");
+    if (f < 0) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    return 0;
+}
+
+VI_API int vi_set_int(vi_db *db, vi_i64 id, const char *name, vi_i64 v)
+{
+    if ((u64)v == ((u64)1 << 63)) return vi_fail_(-1, "INT64_MIN cannot be stored in a field (its code means \"not set\")", (const char *)0, (const char *)0);
+    return vi_fset_(db, id, name, STORE_FT_INT, store_enc_int_((i64)v));
+}
+
+VI_API int vi_set_float(vi_db *db, vi_i64 id, const char *name, double v)
+{
+    if (v != v) return vi_fail_(-1, "NaN cannot be stored in a field", (const char *)0, (const char *)0);
+    return vi_fset_(db, id, name, STORE_FT_FLOAT, store_enc_f64_(v));
+}
+
+VI_API int vi_set_str(vi_db *db, vi_i64 id, const char *name, const char *v, int len)
+{
+    if (!v) return vi_fail_(-1, "the string is NULL", (const char *)0, (const char *)0);
+    return vi_fset_(db, id, name, STORE_FT_STR, store_enc_str_(v, vi_len_(v, len)));
+}
+
+VI_API int vi_unset(vi_db *db, vi_i64 id, const char *name)
+{
+    i32 t;
+    u64 c;
+    if (vi_fname_(db, name)) return -1;
+    if (store_field_get(db->s, (i64)id, name, (i32)strlen(name), &t, &c) == -2) t = STORE_FT_INT;   /* no such field: nothing to unset */
+    return vi_fset_(db, id, name, t, 0);
+}
+
+static int vi_fget_(vi_db *db, vi_i64 id, const char *name, i32 want, u64 *c)
+{
+    i32 t, r;
+    if (vi_fname_(db, name)) return -1;
+    r = store_field_get(db->s, (i64)id, name, (i32)strlen(name), &t, c);
+    if (r == -1) return vi_norow_(db, id);
+    if (r == -2) return vi_fail_(-1, "no field \"", name, "\"");
+    if (t != want) return vi_fail_(-1, "the field \"", name, "\" has another type");
+    return r;
+}
+
+VI_API int vi_get_int(vi_db *db, vi_i64 id, const char *name, vi_i64 *v)
+{
+    u64 c = 0;
+    int r = vi_fget_(db, id, name, STORE_FT_INT, &c);
+    if (r == 0 && v) *v = (vi_i64)store_dec_int_(c);
+    return r;
+}
+
+VI_API int vi_get_float(vi_db *db, vi_i64 id, const char *name, double *v)
+{
+    u64 c = 0;
+    int r = vi_fget_(db, id, name, STORE_FT_FLOAT, &c);
+    if (r == 0 && v) *v = store_dec_f64_(c);
+    return r;
+}
+
+VI_API int vi_get_str_key(vi_db *db, vi_i64 id, const char *name, vi_i64 *key)
+{
+    u64 c = 0;
+    int r = vi_fget_(db, id, name, STORE_FT_STR, &c);
+    if (r == 0 && key) *key = (vi_i64)c;
+    return r;
+}
+
+VI_API int vi_field_info(vi_db *db, int i, char *name, int *type)
+{
+    char nm[STORE_FIELD_NAME];
+    i32 t;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (store_field_info(db->s, (i32)i, nm, &t) != 0) return -1;
+    if (name) memcpy(name, nm, STORE_FIELD_NAME);
+    if (type) *type = (int)t;
+    return 0;
+}
+
+static const StoreFlt *vi_flt_(vi_db *db, const vi_filter *f)
+{
+    const StoreFlt *x = (const StoreFlt *)(const void *)f;
+    if (!f) return x;
+    if (x->sid != (u64)(size_t)db->s || x->nop < 1 || x->nop > STORE_FLT_OPS) {
+        vi_fail_(-1, "the filter was not compiled for this store (vi_filter_parse)", (const char *)0, (const char *)0);
+        return (const StoreFlt *)(const void *)-1;
+    }
+    return x;
+}
+#define VI_FLT_BAD(x) ((const void *)(x) == (const void *)-1)
+
+VI_API int vi_filter_parse(vi_db *db, const char *expr, vi_filter *f)
+{
+    const char *why;
+    i32 at;
+    char where[64];
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (!expr || !f) return vi_fail_(-1, "the filter or its expression is NULL", (const char *)0, (const char *)0);
+    if (store_flt_parse(db->s, expr, (StoreFlt *)(void *)f, &why, &at) == 0) return 0;
+    memset(f, 0, sizeof(*f));                                    /* never usable half-made */
+    sprintf(where, " (at byte %d)", (int)at);
+    return vi_fail_(-1, "filter: ", why ? why : "not a filter", where);
+}
+
+VI_API int vi_match(vi_db *db, vi_i64 id, const vi_filter *f)
+{
+    const StoreFlt *x;
+    i32 r;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (!f) return vi_fail_(-1, "the filter is NULL", (const char *)0, (const char *)0);
+    if (VI_FLT_BAD(x = vi_flt_(db, f))) return -1;
+    r = store_flt_match(db->s, (i64)id, x);
+    return r < 0 ? vi_norow_(db, id) : r;
+}
+
+VI_API int vi_search_filter(vi_db *db, const float *query, int k, const vi_filter *f, vi_i64 *ids, float *scores)
+{
+    const StoreFlt *x;
+    int n;
+    if (vi_search_ok_(db, query, k, ids, scores)) return -1;
+    if (!query) return vi_fail_(-1, "the query is NULL", (const char *)0, (const char *)0);
+    if (!f) return vi_fail_(-1, "the filter is NULL (vi_search searches every row)", (const char *)0, (const char *)0);
+    if (VI_FLT_BAD(x = vi_flt_(db, f))) return -1;
+    n = store_search_flt(db->s, query, (i32)k, x, (i64 *)ids, scores);
+    vi_cos_(db, scores, n);
+    return n;
+}
+
 /* ---- RAG (store_rag.c) ---- */
 
 static int vi_rag_args_(vi_db *db, const float *query, const char *text, int tlen, float lambda, float dup)
@@ -542,14 +703,16 @@ static void vi_rag_scores_(vi_db *db, const char *text, int tlen, float *sc, int
     if (!text || vi_len_(text, tlen) == 0) vi_cos_(db, sc, n);
 }
 
-VI_API int vi_search_mmr(vi_db *db, const float *query, const char *text, int tlen, int k, float lambda, float dup,
-                         vi_i64 *ids, float *scores)
+VI_API int vi_search_mmr(vi_db *db, const float *query, const char *text, int tlen, const vi_filter *filter, int k,
+                         float lambda, float dup, vi_i64 *ids, float *scores)
 {
+    const StoreFlt *x;
     i32 n;
     if (vi_rag_args_(db, query, text, tlen, lambda, dup)) return -1;
+    if (VI_FLT_BAD(x = vi_flt_(db, filter))) return -1;
     if (k < 1) return vi_fail_(-1, "k must be 1 or more", (const char *)0, (const char *)0);
     if (!ids || !scores) return vi_fail_(-1, "ids and scores must hold k values each", (const char *)0, (const char *)0);
-    if ((n = store_search_mmr(db->s, query, text, vi_len_(text, tlen), (i32)k, lambda, dup, (i64 *)ids, scores)) < 0)
+    if ((n = store_search_mmr(db->s, query, text, vi_len_(text, tlen), x, (i32)k, lambda, dup, (i64 *)ids, scores)) < 0)
         return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
     vi_rag_scores_(db, text, tlen, scores, n);
     return n;
@@ -569,26 +732,28 @@ VI_API int vi_neighbors(vi_db *db, vi_i64 id, int shift, int before, int after, 
 VI_API void vi_ctx_defaults(vi_ctx_opts *o)
 {
     if (!o) return;
-    o->k = 8; o->shift = 20; o->before = 1; o->after = 1; o->lambda = 0.7f; o->dup = 0.97f;
+    o->k = 8; o->shift = 20; o->before = 1; o->after = 1; o->lambda = 0.7f; o->dup = 0.97f; o->filter = (const vi_filter *)0;
 }
 
 VI_API int vi_context(vi_db *db, const float *query, const char *text, int tlen, const vi_ctx_opts *o,
                       vi_ctx_span *spans, int max_spans, char *buf, int cap, int *used)
 {
     vi_ctx_opts d;
+    const StoreFlt *x;
     StoreSpan sp[VI_CTX_HITS_MAX];
     i32 n, i, u = 0;
     if (used) *used = 0;
     vi_ctx_defaults(&d);
     if (o) d = *o;
     if (vi_rag_args_(db, query, text, tlen, d.lambda, d.dup)) return -1;
+    if (VI_FLT_BAD(x = vi_flt_(db, d.filter))) return -1;
     if (d.k < 1 || d.k > VI_CTX_HITS_MAX) return vi_fail_(-1, "k must be 1 to 256 (VI_CTX_HITS_MAX)", (const char *)0, (const char *)0);
     if (d.shift < 0 || d.shift > 63) return vi_fail_(-1, "shift must be 0 to 63", (const char *)0, (const char *)0);
     if (d.before < -1 || d.after < -1) return vi_fail_(-1, "before and after are 0 or more, or -1 (the whole document)", (const char *)0, (const char *)0);
     if (!spans || max_spans < 1) return vi_fail_(-1, "spans is NULL or max_spans below 1", (const char *)0, (const char *)0);
     if (cap < 0 || (cap > 0 && !buf)) return vi_fail_(-1, "buf is NULL or cap below 0", (const char *)0, (const char *)0);
     if (max_spans > VI_CTX_HITS_MAX) max_spans = VI_CTX_HITS_MAX;   /* a span holds a hit: never more than k */
-    n = store_context(db->s, query, text, vi_len_(text, tlen), (i32)d.k, (i32)d.shift, (i32)d.before, (i32)d.after,
+    n = store_context(db->s, query, text, vi_len_(text, tlen), x, (i32)d.k, (i32)d.shift, (i32)d.before, (i32)d.after,
                       d.lambda, d.dup, sp, (i32)max_spans, buf, (i32)cap, &u);
     if (n < 0) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
     for (i = 0; i < n; ++i) {

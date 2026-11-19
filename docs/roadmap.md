@@ -68,6 +68,11 @@ Done since 2026-11-19 (built and its own test run here, `tests/rag_test.c` under
   neighbours, one span a run of a document's chunks, cut to a byte budget with the hits' own chunks first). No
   malloc: the scratch pool. Not in vserv or the bindings yet
 - the three branches (main, merged, needmerge) one: main
+- payload fields and filters (`src/store_meta.c`): up to 16 typed fields a row (int, float, string by its key),
+  journaled (`K`, `V`), saved (file flag 128), mixed into the row's check and parity; a filter language (= != < <=
+  > >= in, not in, has, and, or, not, parentheses) compiled to a postfix program and tested inside the scan through
+  `TqFilt.ok`; `vi_search_filter`, `vi_match`, and the filter of `vi_search_mmr` and `vi_context`.
+  `tests/meta_test.c` (42 checks, run here, ASan and UBSan too)
 
 Open, in the order they are planned:
 1. **The rest of the code off malloc** (158 call sites): the store (`store.c`, `store_disk.c`, `store_exact.c`,
@@ -101,10 +106,16 @@ Open, in the order they are planned:
 14. **The live visualisation from the real engine** (WASM)
 15. **Ternary codes**, measured before any code: as a first sieve for row-to-centroid comparisons at build and
     split time (`trash/src/q3.c` has the packing). Not for the scan's codes or the rows: Config.lean shows why
-16. **RAG, next**: `vi_context` and `vi_search_mmr` in vserv (line, binary, HTTP) and the Python/Rust/JS bindings;
+16. **Fields, next**: in write batches (`vi_batch_set_*`), in vserv and the bindings; an index on a field (sorted
+    row lists) so a very selective filter starts from its rows instead of widening the scan; the filter in
+    `vi_search_exact` (the certified search) and `vi_search_hybrid`; strings kept whole on demand, beside the key
+17. **Compressed texts** (asked 2026-11-19, next): the documents stay apart from the vectors, as now, and their heap
+    is compressed in the file - an LZ4-style coder of our own (fast to decode on every vi_get_text and vi_context)
+    with a dictionary trained on the store's own texts, since chunks of a few hundred bytes compress poorly alone
+18. **RAG, next**: `vi_context` and `vi_search_mmr` in vserv (line, binary, HTTP) and the Python/Rust/JS bindings;
     MMR over the 1-bit or 4-bit codes instead of the f32 rows when the rows are cold (k x 4 x dim floats read a
     query today); a dedup of exact text copies by their check without the vectors
-17. Housekeeping: `Codes.lean` still proves the digit tables of the retired q1-q5; `src/fine_grained.h` (a thread
+19. Housekeeping: `Codes.lean` still proves the digit tables of the retired q1-q5; `src/fine_grained.h` (a thread
     pool) has no user left in `src/`; `src/arena_alloc.h` holds only the store's own struct (`store_new`) and
     should give way to `mem.h`
 

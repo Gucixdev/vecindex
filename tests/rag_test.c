@@ -67,20 +67,20 @@ int main(void)
 
     /* MMR */
     vec_(q, 1, 5 / 20.0, 0, 0.0);
-    n = vi_search_mmr(db, q, (const char *)0, 0, 4, 1.0f, 0.0f, ids, sc);
+    n = vi_search_mmr(db, q, (const char *)0, 0, (const vi_filter *)0, 4, 1.0f, 0.0f, ids, sc);
     n2 = vi_search(db, q, 4, ids2, sc2);
     for (i = 0, same = n == n2; same && i < n; ++i) same = fabs((double)sc[i] - (double)sc2[i]) < 1e-5;
     check(same, "vi_search_mmr lambda 1, dup 0: the scores of vi_search");
-    n = vi_search_mmr(db, q, (const char *)0, 0, 4, 1.0f, 0.97f, ids, sc);
+    n = vi_search_mmr(db, q, (const char *)0, 0, (const vi_filter *)0, 4, 1.0f, 0.97f, ids, sc);
     check(n >= 1 && !(has_(ids, n, ID(1, 5)) && has_(ids, n, ID(3, 0))), "vi_search_mmr dup 0.97: the copy of the best hit is out");
     vec_(q, 1, 5 / 20.0, 2, 0.35);
-    n = vi_search_mmr(db, q, (const char *)0, 0, 3, 1.0f, 0.0f, ids, sc);
+    n = vi_search_mmr(db, q, (const char *)0, 0, (const vi_filter *)0, 3, 1.0f, 0.0f, ids, sc);
     check(n == 3 && !has_(ids, n, ID(2, 0)), "vi_search_mmr lambda 1: three hits of document 1 (or its copy)");
-    n = vi_search_mmr(db, q, (const char *)0, 0, 3, 0.3f, 0.9999f, ids, sc);
+    n = vi_search_mmr(db, q, (const char *)0, 0, (const vi_filter *)0, 3, 0.3f, 0.9999f, ids, sc);
     check(n >= 2 && (has_(ids, n, ID(2, 0)) || has_(ids, n, ID(2, 1))), "vi_search_mmr lambda 0.3: document 2 comes in for variety");
-    n = vi_search_mmr(db, (const float *)0, "d2c7", -1, 2, 0.7f, 0.97f, ids, sc);
+    n = vi_search_mmr(db, (const float *)0, "d2c7", -1, (const vi_filter *)0, 2, 0.7f, 0.97f, ids, sc);
     check(n >= 1 && ids[0] == ID(2, 7), "vi_search_mmr with words alone: the chunk that has them");
-    check(vi_search_mmr(db, q, (const char *)0, 0, 3, 1.5f, 0.0f, ids, sc) == -1, "vi_search_mmr: lambda 1.5 is an error");
+    check(vi_search_mmr(db, q, (const char *)0, 0, (const vi_filter *)0, 3, 1.5f, 0.0f, ids, sc) == -1, "vi_search_mmr: lambda 1.5 is an error");
 
     /* the context */
     vec_(q, 1, 5 / 20.0, 0, 0.0);
@@ -109,6 +109,18 @@ int main(void)
     o.before = o.after = -1;
     n = vi_context(db, q, (const char *)0, 0, &o, sp, 8, buf, (int)sizeof buf, &used);
     check(n == 1 && sp[0].chunks == 10 && used == 50 && memcmp(buf, "d1c0;", 5) == 0, "vi_context -1 -1: the whole document, in order");
+    {   vi_filter fl;                                            /* a filter: hits only from document 2's chunks 4 to 6 */
+        for (c = 0; c < 10; ++c) vi_set_int(db, ID(2, c), "doc", 2);
+        vi_set_int(db, ID(1, 5), "doc", 1);
+        check(vi_filter_parse(db, "doc = 2", &fl) == 0, "a filter for the context");
+        vi_ctx_defaults(&o);
+        o.k = 1; o.filter = &fl;
+        n = vi_context(db, q, (const char *)0, 0, &o, sp, 8, buf, (int)sizeof buf, &used);
+        check(n == 1 && sp[0].doc == 2, "vi_context with a filter: the best hit that passes it, document 2");
+        n = vi_search_mmr(db, q, (const char *)0, 0, &fl, 3, 0.7f, 0.0f, ids, sc);   /* dup 0: its chunks lie close */
+        for (i = 0, same = n == 3; same && i < n; ++i) same = (ids[i] >> 20) == 2;
+        check(same, "vi_search_mmr with a filter: every hit passes");
+        vi_ctx_defaults(&o); }
     o.k = 0;
     check(vi_context(db, q, (const char *)0, 0, &o, sp, 8, buf, (int)sizeof buf, &used) == -1, "vi_context k 0 is an error");
 

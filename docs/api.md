@@ -74,6 +74,8 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_context(db, q, text, tlen, opts, spans, max_spans, buf, cap, &used)`, `vi_ctx_defaults(&opts)` | a context for a model to a byte budget: MMR hits, their neighbours, overlapping windows of one document merged into one span of unbroken text; the hits' own chunks first, then rings of neighbours while they fit |
 | `vi_set_tag`, `vi_get_tag` | a 64-bit tag per row |
 | `vi_set_num(db, id, num)`, `vi_get_num(db, id, &num)`, `vi_search_range(db, q, k, lo, hi, ids, scores)` | a 64-bit number per row (0 until set), and a search over the rows whose number is in `[lo, hi]` |
+| `vi_set_int`, `vi_set_float`, `vi_set_str(db, id, name, v)`, `vi_unset`, `vi_get_int`, `vi_get_float`, `vi_get_str_key`, `vi_field(db, name, type)`, `vi_field_info` | payload: named, typed fields on a row (an int, a float or a string; at most 16 a store), declared by the first set; journaled, saved and checked with the row |
+| `vi_filter_parse(db, expr, &f)`, `vi_search_filter(db, q, k, &f, ids, scores)`, `vi_match(db, id, &f)` | a filter over the fields - `lang = "c" and ext in (".h", ".c") and year >= 2020 and not draft` - compiled once, tested inside the scan; also `filter` of `vi_search_mmr` and `vi_ctx_opts` |
 | `vi_search_where(db, q, k, all, any, none, lo, hi, ids, scores)` | labels (as `vi_search_labeled`) and a number range in one search, both tested in the scan |
 | `vi_add_ns(db, ns, id, vec, text, len)`, `vi_search_ns(db, ns, q, k, ids, scores)`, `vi_set_ns`, `vi_get_ns`, `vi_delete_ns(db, ns)`, `vi_count_ns(db, ns)`, `vi_batch_set_ns` | namespaces: many tenants in one store; a search in a namespace sees only its rows (a small one searched exactly over its own rows, a big one through the scan with the namespace inside it); `vi_add` over a row keeps its namespace; `vi_delete_ns` drops a tenant in one journal record |
 | `vi_search_in(db, ns, n, q, k, ids, scores)` | the k best of several namespaces at once (`ns[0, n)`, any order, repeats allowed; names through `vi_key`): the set is tested inside the scan, log2 n steps a candidate (`lean4/Vecindex/NsSet.lean` proves that test is membership); namespaces small enough together are searched exactly over their own rows |
@@ -271,6 +273,29 @@ The query vector is closest to chunk 1; the word "oxidised" picks chunk 2. `vi_s
 fuses them by rank (reciprocal rank fusion with weights measured on Wikipedia: words 1.5, vector 0.6, plus up to 2 for a
 side whose best hit stands well clear of its runner-up), so an exact name, a number or a rare word is found where the
 embedding blurs it. Pass `NULL` for the words to search by the vector alone, or for the vector to search by words.
+
+### Fields and filters
+
+A row can carry up to 16 named fields of its own: ints (a year, a size, a flag), floats (a score, a price) and
+strings (a language, a file extension, a source). Setting one declares it with the setter's type; after that the
+field keeps that type. A string is kept as its 64-bit key (`vi_key`), so it filters by equality and sets, and it
+gives back the key, not the bytes: keep the bytes in the row's text if they are needed.
+
+```c
+vi_filter f;
+vi_set_str(db, id, "lang", "c", -1);
+vi_set_str(db, id, "ext", ".h", -1);
+vi_set_int(db, id, "year", 2024);
+vi_filter_parse(db, "lang = \"c\" and ext in (\".h\", \".c\") and year >= 2020 and not draft", &f);
+n = vi_search_filter(db, q, 10, &f, ids, scores);
+```
+
+A filter is compiled once into a value the caller holds (no memory to free, usable from many threads at once) and
+runs inside the scan, candidate by candidate, like labels and numbers: a 64-bit stack of truth values, no recursion.
+A comparison on a field the row has not set is false, `!=` and `not in` too, so `not lang = "c"` is the way to also
+take the rows that have no `lang`. Each field is a column of u64 a row (8 bytes a row once declared), coded so that
+0 means "not set" and the unsigned order of the codes is the order of the values. That is why `INT64_MIN` and NaN
+are the two values that cannot be stored.
 
 ### The context in one call
 

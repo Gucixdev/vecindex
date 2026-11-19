@@ -325,11 +325,13 @@ static void store_ex_ann_(void *p, i64 a, i64 b, i32 tid)
     i64 q;
     TqCol ncol, scol;
     TqFilt tf;
+    StoreFltX fx;
     (void)tid;
     rows = scr_get_(&ra, scr_need_((size_t)R * sizeof(i32))) == 0 ? (i32 *)scr_take_(&ra, (size_t)R * sizeof(i32)) : (i32 *)0;
     memset(&tf, 0, sizeof(tf));
     if (cnf && cnf->num && s->has_num) { ncol = store_tqcol_(&s->numc); tf.num = &ncol; tf.lo = cnf->lo; tf.hi = cnf->hi; }
     if (cnf && cnf->ns_on && s->has_ns) { scol = store_tqcol_(&s->nsc); tf.ns = &scol; tf.nsv = cnf->ns; tf.nss = cnf->nss; tf.nns = cnf->nns; }
+    if (cnf && cnf->flt) { fx.s = s; fx.f = cnf->flt; tf.ok = store_flt_cb_; tf.okc = &fx; }
     for (q = a; q < b; ++q) {
         StoreExQy *y = A->qy + q;
         y->ni = 0; y->nchk = 0;

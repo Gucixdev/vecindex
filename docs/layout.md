@@ -24,7 +24,7 @@ part of `LAYER.c`, which includes it; it is not compiled on its own.
 | `tq.c`, `tq_scan.c`, `tq_add.c` | the rotated 4-bit / 2-bit fast-scan index: build, scan, rows added after the build |
 | `hdict.c`, `lex.c` | hash dictionaries; the term dictionary, postings and BM25 |
 | `blake3.c`, `store_sum.c` | BLAKE3; the file's block digests, Reed-Solomon parity, the checks at load and the scrub |
-| `store.c`, `store_tune.c`, `store_live.c`, `store_search.c`, `store_text.c`, `store_rag.c`, `store_disk.c` | the vector store: rows, ids, build; self-tuning; live mode; search; texts, id ranges and hybrid search; RAG (MMR, near-duplicates, neighbour chunks, a context to a byte budget); the file and its journal |
+| `store.c`, `store_tune.c`, `store_live.c`, `store_search.c`, `store_meta.c`, `store_text.c`, `store_rag.c`, `store_disk.c` | the vector store: rows, ids, build; self-tuning; live mode; search; payload fields and their filters; texts, id ranges and hybrid search; RAG (MMR, near-duplicates, neighbour chunks, a context to a byte budget); the file and its journal |
 | `vecindex.c` | the C API of `include/vecindex.h` over the store |
 | `vfind.c` | search a store's texts as you type, like fzf; Enter opens the whole document |
 | `vserv.c`, `vserv_proto.c`, `vserv_text.c`, `vserv_log.c`, `vserv_pem.c` | the server: sockets, workers, TLS; the line, binary and HTTP protocols; texts and JSON; the log; certificates and keys |

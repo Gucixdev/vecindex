@@ -43,11 +43,13 @@ that change, report a damaged journal (`vi_integrity`: `journal_damaged`) and ke
 | 9 | 0.3.0, and 0.4.0 for stores without what v10 adds | block digests, Reed-Solomon parity, the rows' checks, the metric, labels | yes: 0.3.0 (cosine; int8 rows with L2), 0.4.0 |
 | 10 | 0.4.0 | numbers, namespaces, CRCs of the texts | yes: 0.4.0 (cosine; int8 rows with L2) |
 | 10, flag 64 | after 0.4.0, not released | the scan index carries its top cells (`src/tq_top.c`); only a store of 16384 clusters or more (about 16M rows) has them, so smaller files are unchanged; 0.4.0 refuses the flag | no: `tests/top_test.c` saves and loads one |
+| 10, flag 128 | after 0.4.0, not released | payload fields (`src/store_meta.c`): after the texts' CRCs, a table of 16 slots of a name (32 bytes, 0-padded, the declared ones first) and a type (u64: 1 int, 2 float, 3 string), then for each declared field a column of u64 a row, 64-byte aligned; only a store with fields has it; 0.4.0 refuses the flag | no: `tests/meta_test.c` saves, compacts and loads one |
 
 Journals: `VXJ1` (bound to the file by its size), `VXJ2` (by the stamp), `VXJ3` (a header with its CRC, then frames
 each with a CRC-32C). A build reads all three; 0.3.0 and 0.4.0 write `VXJ3`. The kinds of change in a frame: `A`, `P` and
 `Q` (rows), `D` and `R` (deletes), `M` (a tag), `L` (a label), and from 0.4.0 `U` (a row's vector updated), `N` (a
-number), `S` (a namespace) and `Y` (a namespace deleted).
+number), `S` (a namespace) and `Y` (a namespace deleted); after 0.4.0 `K` (a field declared: its index, type, name) and
+`V` (a field set on a row: id, the field's index, its u64 code, 0 unsetting it).
 
 ## Adding a version
 

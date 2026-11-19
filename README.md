@@ -3,8 +3,9 @@
 A vector database in C89 for RAG and LLMs: approximate nearest-neighbour search on a TurboQuant-style rotated
 fast-scan - 4-bit codes, or 2-bit, or 1-bit (alone, or as a first pass in front of the 4-bit ones: the cascade) -
 over IVF clusters, with the candidates re-scored exactly from f32 or int8 rows; BM25 hybrid search; cosine, inner
-product or Euclidean distance; string keys, labels in a hierarchy, a number a row for range filters, namespaces and
-grouped search (one hit a document); search with a proof (`vi_search_exact`: the exact k best, every other row
+product or Euclidean distance; string keys, labels in a hierarchy, typed fields a row (int, float, string) with a
+filter language tested inside the scan (`lang = "c" and year >= 2020 and not draft`), namespaces and grouped search
+(one hit a document); search with a proof (`vi_search_exact`: the exact k best, every other row
 ruled out by a bound proved in Lean); and what a RAG pipeline does with the hits before a model reads them: diverse
 hits without near-duplicates (MMR), the chunks around a hit, and a context built to a byte budget (`vi_context`).
 

@@ -238,6 +238,48 @@ VI_API int vi_search_hybrid(vi_db *db, const float *query, const char *text, int
  * a shift outside 0-63). */
 VI_API int vi_search_grouped(vi_db *db, const float *query, int k, int shift, vi_i64 *ids, float *scores);
 
+/* ---- payload: named, typed fields on a row, and filters over them ----
+ * A field is an int (64-bit), a float (double) or a string; a row has each at most once, or not at all. Setting one
+ * declares it, with the type of that setter (vi_field declares one ahead); a field once declared stays, with its
+ * type, at most 16 a store. Names: 1 to 31 of A-Z a-z 0-9 _, not starting with a digit, none of the filter's words
+ * (and or not in has true false). Each is journaled, saved and checked with its row. A string is kept as its key
+ * (vi_key): it filters with = != in, and vi_get_str_key gives the key back, not the bytes - keep those in the text.
+ * INT64_MIN is the one int that cannot be stored, NaN the one float. */
+#define VI_INT 1
+#define VI_FLOAT 2
+#define VI_STR 3
+
+VI_API int vi_field(vi_db *db, const char *name, int type);                         /* 0, -1 (exists as another type, 16 already, not a name) */
+VI_API int vi_set_int(vi_db *db, vi_i64 id, const char *name, vi_i64 v);
+VI_API int vi_set_float(vi_db *db, vi_i64 id, const char *name, double v);
+VI_API int vi_set_str(vi_db *db, vi_i64 id, const char *name, const char *v, int len);   /* len -1: a C string */
+VI_API int vi_unset(vi_db *db, vi_i64 id, const char *name);                        /* the row has it no more */
+/* the field of a row: 0 (*v set), 1 the row has not set it, -1 no row with id, no such field, or another type */
+VI_API int vi_get_int(vi_db *db, vi_i64 id, const char *name, vi_i64 *v);
+VI_API int vi_get_float(vi_db *db, vi_i64 id, const char *name, double *v);
+VI_API int vi_get_str_key(vi_db *db, vi_i64 id, const char *name, vi_i64 *key);
+/* the i-th field declared (0 up): its name into name[32] and its type; -1 past the last */
+VI_API int vi_field_info(vi_db *db, int i, char *name, int *type);
+
+/* A filter, compiled once by vi_filter_parse and used by as many searches as the caller likes (several threads at
+ * once too); a value the caller holds - no memory to free. It belongs to the store it was compiled for. */
+typedef struct { vi_i64 opaque[340]; } vi_filter;
+
+/* Compiles expr: conditions joined by and, or, not (also && || !) and ( ); a condition is
+ *     field = value    != <> < <= > >= too (a string field: = and != only)
+ *     field in (v, ...)   field not in (v, ...)
+ *     has field        the row has set it
+ *     field            an int field set and not 0
+ * values: whole numbers for an int field (true and false are 1 and 0), numbers for a float one, "strings" (\" and
+ * \\ inside) for a string one. A comparison of a field the row has not set is false, != and not in too: write
+ * "not lang = \"c\"" for the rows without lang as well. At most 96 steps and 256 values. 0, -1 (vi_error(): what
+ * and at which byte). Example: lang = "c" and ext in (".h", ".c") and year >= 2020 and not draft */
+VI_API int vi_filter_parse(vi_db *db, const char *expr, vi_filter *f);
+/* the filter on one row: 1 it passes, 0 not, -1 no row with id */
+VI_API int vi_match(vi_db *db, vi_i64 id, const vi_filter *f);
+/* vi_search over the rows that pass f, tested inside the scan (a selective filter widens it as labels do) */
+VI_API int vi_search_filter(vi_db *db, const float *query, int k, const vi_filter *f, vi_i64 *ids, float *scores);
+
 /* ---- RAG: what happens to the hits before a model reads them, done in the store ----
  * Ids as above: doc << shift | chunk (shift 20: a million chunks a document), so a document is an id range. */
 
@@ -247,10 +289,11 @@ VI_API int vi_search_grouped(vi_db *db, const float *query, int k, int shift, vi
  * 0.5 to 0.7 the usual trade, 0 variety alone. dup in (0, 1]: a candidate whose cosine to a chosen hit is dup or more
  * is dropped as a near-duplicate (a chunk stored twice, a page quoted in two documents; 0.97 is a good start); 0
  * keeps them. lambda 1 with dup 0.97 is vi_search without the duplicates. Scores: as vi_search for a vector alone,
- * the fused rank of vi_search_hybrid with words. Returns how many (fewer than k when duplicates went), or -1 (as
- * vi_search, or lambda or dup outside [0, 1]). */
-VI_API int vi_search_mmr(vi_db *db, const float *query, const char *text, int tlen, int k, float lambda, float dup,
-                         vi_i64 *ids, float *scores);
+ * the fused rank of vi_search_hybrid with words. filter (NULL: none): only rows that pass it (inside the scan for a
+ * vector alone; with words, the fused candidates kept to them, which can leave fewer). Returns how many (fewer than
+ * k when duplicates went), or -1 (as vi_search, or lambda or dup outside [0, 1]). */
+VI_API int vi_search_mmr(vi_db *db, const float *query, const char *text, int tlen, const vi_filter *filter, int k,
+                         float lambda, float dup, vi_i64 *ids, float *scores);
 
 /* The chunks around id in its document (the ids sharing id >> shift): those from id - before to id + after that have
  * a row, ascending, at most max, never past the document's edges (before or after -1: to that edge). id is among
@@ -271,6 +314,7 @@ typedef struct {
     int before, after;      /* neighbour chunks a side of each hit (default 1 and 1; -1: to the document's edge) */
     float lambda;           /* as vi_search_mmr (default 0.7) */
     float dup;              /* as vi_search_mmr (default 0.97) */
+    const vi_filter *filter;   /* hits only from rows that pass it (default NULL: all); their neighbours regardless */
 } vi_ctx_opts;
 
 typedef struct {

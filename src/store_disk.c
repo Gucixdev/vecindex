@@ -153,6 +153,24 @@ static i32 store_jrec_play_(RagStore *s, FILE *f, u8 op, f32 *vec, char **txt, i
         else if (op == 'S') store_set_ns(s, id, meta);
         else if (op == 'Y') store_delete_ns(s, id);
         else store_delete_range(s, id, meta);
+    } else if (op == 'K') {                                      /* a field declared: its index, type and name */
+        u8 b[2];
+        char nm[STORE_FIELD_NAME];
+        i32 fi;
+        if (fread(b, 1, 2, f) != 2 || fread(nm, 1, STORE_FIELD_NAME, f) != STORE_FIELD_NAME) return -1;
+        nm[STORE_FIELD_NAME - 1] = 0;
+        pthread_rwlock_wrlock(&s->lock);
+        fi = store_field_decl_locked_(s, nm, (i32)strlen(nm), (i32)b[1], 0);
+        pthread_rwlock_unlock(&s->lock);
+        if (fi != (i32)b[0]) return -1;                           /* not the index it had: the journal is not this store's */
+    } else if (op == 'V') {                                      /* a field set on a row (0: unset) */
+        u8 fb;
+        u64 code;
+        if (fread(&id, 8, 1, f) != 1 || fread(&fb, 1, 1, f) != 1 || fread(&code, 8, 1, f) != 1) return -1;
+        pthread_rwlock_wrlock(&s->lock);
+        store_idmap_locked_(s);
+        store_field_set_locked_(s, id, (i32)fb, code, 0);
+        pthread_rwlock_unlock(&s->lock);
     } else if (op == 'L') {                                      /* a label: its bit, name and parents */
         u8 b;
         char nm[STORE_LABEL_NAME];
@@ -468,6 +486,45 @@ static i32 store_labels_r_(RagStore *s, FILE *f, size_t off, size_t len)
     return 0;
 }
 
+/* the field table: for each of the STORE_FIELDS slots its name (32 bytes, 0-padded; empty: free) and its type (u64),
+ * then a column of u64 a row for each declared field, in order */
+static int store_fields_w_(FILE *f, const RagStore *s, i32 count, const u64 *dead)
+{
+    i32 i;
+    if (store_pad_(f)) return -1;
+    for (i = 0; i < STORE_FIELDS; ++i) {
+        u64 t = i < s->nfld ? (u64)s->fld_type[i] : 0;
+        static const char z[STORE_FIELD_NAME];
+        if (fwrite(i < s->nfld ? s->fld_name[i] : z, 1, STORE_FIELD_NAME, f) != STORE_FIELD_NAME || STORE_W64(f, &t, 1)) return -1;
+    }
+    for (i = 0; i < s->nfld; ++i) if (store_pad_(f) || store_col_w_live_(f, &s->fldc[i], count, dead)) return -1;
+    return 0;
+}
+
+static i32 store_col_r_(RagStore *s, SCol *c, u8 *map, size_t len, FILE *f, size_t off, i32 rows);
+static i32 store_fields_cols_r_(RagStore *s, u8 *map, size_t len, FILE *f, const size_t *o_fld, i32 live)
+{
+    i32 i;
+    for (i = 0; i < s->nfld; ++i) if (store_col_r_(s, &s->fldc[i], map, len, f, o_fld[i], live)) return -1;
+    return 0;
+}
+
+static i32 store_fields_r_(RagStore *s, FILE *f, size_t off, size_t len)
+{
+    i32 i;
+    if (off + (size_t)STORE_FIELDS * (STORE_FIELD_NAME + 8) > len || fseeko(f, (off_t)off, SEEK_SET) != 0) return -1;
+    for (i = 0; i < STORE_FIELDS; ++i) {
+        char nm[STORE_FIELD_NAME];
+        u64 t;
+        if (fread(nm, 1, STORE_FIELD_NAME, f) != STORE_FIELD_NAME || STORE_R64(f, &t, 1)) return -1;
+        nm[STORE_FIELD_NAME - 1] = 0;
+        if (!nm[0]) break;                                       /* the declared ones come first */
+        if (i != s->nfld || !store_fname_ok_(nm, (i32)strlen(nm)) || t < STORE_FT_INT || t > STORE_FT_STR) return -1;
+        memcpy(s->fld_name[i], nm, STORE_FIELD_NAME); s->fld_type[i] = (u8)t; s->nfld = i + 1;
+    }
+    return 0;
+}
+
 /* Writes the store to tmp - the data, then its block digests and parity (store_sum.c) - flushes it to the disk,
  * renames it over path and makes the rename durable: 0 or -1. Takes
  * no lock - the caller holds the write lock (store_save, after its compaction), or is the snapshot child, alone with
@@ -503,7 +560,7 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
     if (!f) return -1;
     hdr[0] = (i32)STORE_MAGIC; hdr[2] = s->dim; hdr[3] = live;
     ext[0] = (s->vbytes == 1 ? 1 : 0) | (s->has_text ? 2 : 0) | (s->nlab ? 4 : 0) | (s->has_num ? 8 : 0) | (s->has_ns ? 16 : 0) | (s->has_text ? 32 : 0)
-           | (kind == 2 && s->tq->nc > 1 && s->tq->top ? STORE_F_TOP : 0); ext[1] = s->metric;   /* v9: 0 cosine, 1 dot, 2 L2 */
+           | (s->nfld ? STORE_F_FIELDS : 0) | (kind == 2 && s->tq->nc > 1 && s->tq->top ? STORE_F_TOP : 0); ext[1] = s->metric;   /* v9: 0 cosine, 1 dot, 2 L2 */
     hdr[1] = (ext[0] & ~STORE_FLAGS_V9) ? STORE_VERSION10 : STORE_VERSION9;   /* the oldest version that holds it */
     ext[2] = (i32)(u32)(stamp & 0xffffffffu); ext[3] = (i32)(u32)(stamp >> 32);
     bad = STORE_W32(f, hdr, 4) || STORE_W32(f, ext, 4) || store_goal_w_(f, &s->goal)
@@ -518,6 +575,7 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
        || (s->has_num && (store_pad_(f) || store_col_w_live_(f, &s->numc, s->count, dead)))
        || (s->has_ns && (store_pad_(f) || store_col_w_live_(f, &s->nsc, s->count, dead)))
        || (s->has_text && (store_pad_(f) || store_col_w_live_(f, &s->tck, s->count, dead)))
+       || (s->nfld && store_fields_w_(f, s, s->count, dead))
        || fwrite(&kind, 1, 1, f) != 1
        || (kind == 2 && store_tq_w_(f, s->tq));
     if (!bad) {                                                  /* the digests and parity of all of it */
@@ -951,7 +1009,7 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     i32 live = hdr[3], dim = hdr[2], ext[4], v7 = hdr[1] == STORE_VERSION7 || hdr[1] == STORE_VERSION8 || STORE_V9UP(hdr[1]),
         i8rows = hdr[1] == STORE_VERSION_I8, texts = 0, drop_idx = 0;
     struct stat st;
-    size_t len, o_vecs, o_vsc = 0, o_ids, o_meta, o_kind, o_txo = 0, o_heap = 0, o_rck = 0, o_nrm = 0, o_num = 0, o_ns = 0, o_tck = 0;
+    size_t len, o_vecs, o_vsc = 0, o_ids, o_meta, o_kind, o_txo = 0, o_heap = 0, o_rck = 0, o_nrm = 0, o_num = 0, o_ns = 0, o_tck = 0, o_fld[STORE_FIELDS];
     u8 *map = (u8 *)0, kind = 0;
     u64 stamp = 0, hlen = 0;
 
@@ -1018,6 +1076,16 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     if (STORE_V9UP(hdr[1]) && (ext[0] & 32)) {            /* the texts' CRCs */
         o_tck = STORE_AL(o_kind); o_kind = o_tck + (size_t)live * 4;
     }
+    if (STORE_V9UP(hdr[1]) && (ext[0] & STORE_F_FIELDS)) {     /* the fields: their table, a column each */
+        i32 fi;
+        if ((vz && ssum_vouch_(vz, path, ro, (u64)STORE_AL(o_kind), (u64)STORE_FIELDS * (STORE_FIELD_NAME + 8)))
+            || store_fields_r_(s, f, STORE_AL(o_kind), len) != 0) {
+            sprintf(store_lerr_, "its table of fields is damaged");
+            fclose(f); store_destroy(s); return (RagStore *)0;
+        }
+        o_kind = STORE_AL(o_kind) + (size_t)STORE_FIELDS * (STORE_FIELD_NAME + 8);
+        for (fi = 0; fi < s->nfld; ++fi) { o_fld[fi] = STORE_AL(o_kind); o_kind = o_fld[fi] + (size_t)live * 8; }
+    }
     if (o_kind >= len) { fclose(f); store_destroy(s); return (RagStore *)0; }
     if (ubad != ~(u64)0) {                                       /* a block the checks could not rebuild */
         if (ubad <= (u64)o_kind) {
@@ -1040,7 +1108,8 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
             || (o_nrm && store_col_r_(s, &s->nrm, map, len, f, o_nrm, live))
             || (o_num && store_col_r_(s, &s->numc, map, len, f, o_num, live))
             || (o_ns && store_col_r_(s, &s->nsc, map, len, f, o_ns, live))
-            || (texts && (o_tck ? store_col_r_(s, &s->tck, map, len, f, o_tck, live) : store_col_zero_(s, &s->tck, live)))) { fclose(f); store_destroy(s); return (RagStore *)0; }
+            || (texts && (o_tck ? store_col_r_(s, &s->tck, map, len, f, o_tck, live) : store_col_zero_(s, &s->tck, live)))
+            || store_fields_cols_r_(s, map, len, f, o_fld, live)) { fclose(f); store_destroy(s); return (RagStore *)0; }
         s->dead_words = ((i64)live + 63) >> 6;
         s->dead = (u64 *)calloc((size_t)s->dead_words, sizeof(u64));
         if (map) {                                               /* re-scoring reads rows at random: no read-ahead */

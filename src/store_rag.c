@@ -75,17 +75,31 @@ i32 store_mmr_pick(RagStore *s, const i64 *cid, const f32 *csc, i32 n, i32 k, f3
     return have;
 }
 
-/* the n best candidates: the vector and the words fused when there are words (store_search_hybrid: at most 250 a
- * side), else the vector's */
-static i32 store_cands_(RagStore *s, const f32 *q, const char *text, i32 tlen, i32 n, i64 *ids, f32 *sc)
+/* store_search over the rows that pass the fields' filter flt (store_meta.c), tested inside the scan */
+i32 store_search_flt(RagStore *s, const f32 *query, i32 k, const StoreFlt *flt, i64 *ids, f32 *scores)
 {
-    if (text && tlen > 0) return store_search_hybrid(s, q, text, tlen, n, ids, sc);
-    return q ? store_search(s, q, n, ids, sc) : 0;
+    StoreCnf c;
+    memset(&c, 0, sizeof(c));
+    c.flt = flt;
+    return store_search_cnf(s, query, k, ids, scores, &c);
+}
+
+/* the n best candidates: the vector and the words fused when there are words (store_search_hybrid: at most 250 a
+ * side), else the vector's; flt (may be 0): only rows that pass it - inside the scan for a vector alone, the fused
+ * list kept to them for words (which can leave fewer) */
+static i32 store_cands_(RagStore *s, const f32 *q, const char *text, i32 tlen, const StoreFlt *flt, i32 n, i64 *ids, f32 *sc)
+{
+    i32 m, i, w;
+    if (!(text && tlen > 0)) return !q ? 0 : flt ? store_search_flt(s, q, n, flt, ids, sc) : store_search(s, q, n, ids, sc);
+    m = store_search_hybrid(s, q, text, tlen, n, ids, sc);
+    if (!flt) return m;
+    for (i = w = 0; i < m; ++i) if (store_flt_match(s, ids[i], flt) == 1) { ids[w] = ids[i]; sc[w] = sc[i]; ++w; }
+    return w;
 }
 
 /* Diverse hits: k x VI_MMR_POOL candidates (store_cands_), then store_mmr_pick. Scores are the search's own (the
  * internal score for a vector alone: store_score_out turns it into what callers see). -1 out of memory. */
-i32 store_search_mmr(RagStore *s, const f32 *q, const char *text, i32 tlen, i32 k, f32 lambda, f32 dup, i64 *ids, f32 *scores)
+i32 store_search_mmr(RagStore *s, const f32 *q, const char *text, i32 tlen, const StoreFlt *flt, i32 k, f32 lambda, f32 dup, i64 *ids, f32 *scores)
 {
     i32 n, c, r;
     i64 *ci;
@@ -97,7 +111,7 @@ i32 store_search_mmr(RagStore *s, const f32 *q, const char *text, i32 tlen, i32 
     if (scr_get_(&a, scr_need_((size_t)c * sizeof(i64)) + scr_need_((size_t)c * sizeof(f32))) != 0) return -1;
     ci = (i64 *)scr_take_(&a, (size_t)c * sizeof(i64));
     cs = (f32 *)scr_take_(&a, (size_t)c * sizeof(f32));
-    n = store_cands_(s, q, text, tlen, c, ci, cs);
+    n = store_cands_(s, q, text, tlen, flt, c, ci, cs);
     r = store_mmr_pick(s, ci, cs, n, k, lambda, dup, ids, scores);
     scr_put_(&a);
     return r;
@@ -124,14 +138,15 @@ static int store_run_cmp_(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
-/* A context for a model: the k hits of store_search_mmr; around each hit its window of before / after chunks
+/* A context for a model: the k hits of store_search_mmr (flt: of the rows that pass it; the neighbours are the hits'
+ * own document's chunks, filter or not); around each hit its window of before / after chunks
  * (store_win_; below 0: the whole document, at most VI_CTX_SIDE_MAX ids a side); windows of one document that
  * overlap or touch merged. Then the budget, cap bytes of buf: every hit's own chunk first, best hit first; then the
  * neighbours one ring at a time around every hit, best hit first, each while it fits and only next to what is
  * already in, so a span is always unbroken text. Spans (at most maxsp, best hit first) get their chunks' texts as
  * stored, one after another, nothing added between them. *used: bytes written. Returns how many spans, -1 out of
  * memory. */
-i32 store_context(RagStore *s, const f32 *q, const char *text, i32 tlen, i32 k, i32 shift, i32 before, i32 after,
+i32 store_context(RagStore *s, const f32 *q, const char *text, i32 tlen, const StoreFlt *flt, i32 k, i32 shift, i32 before, i32 after,
                   f32 lambda, f32 dup, StoreSpan *sp, i32 maxsp, char *buf, i32 cap, i32 *used)
 {
     i64 *hid, *cl;
@@ -157,7 +172,7 @@ i32 store_context(RagStore *s, const f32 *q, const char *text, i32 tlen, i32 k, 
     w = (StoreWin *)scr_take_(&a, (size_t)k * sizeof(StoreWin));
     ord = (i32 *)scr_take_(&a, (size_t)k * sizeof(i32));
     run = (StoreRun *)scr_take_(&a, (size_t)k * sizeof(StoreRun));
-    if ((m = store_search_mmr(s, q, text, tlen, k, lambda, dup, hid, hsc)) <= 0) { scr_put_(&a); return m; }
+    if ((m = store_search_mmr(s, q, text, tlen, flt, k, lambda, dup, hid, hsc)) <= 0) { scr_put_(&a); return m; }
     for (i = 0; i < m; ++i) {
         h[i].id = hid[i]; h[i].score = hsc[i]; h[i].rank = i; h[i].pos = -1;
         store_win_(hid[i], shift, before, after, &h[i].lo, &h[i].hi);

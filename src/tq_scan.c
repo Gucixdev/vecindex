@@ -295,6 +295,7 @@ static void *tq_job_(void *arg)
                     i64 v = *(const i64 *)(const void *)TQ_AT(j->f->ns, row);
                     if (j->f->nns ? !tq_in_set_(j->f->nss, j->f->nns, v) : v != j->f->nsv) continue;
                 }
+                if (j->f->ok && !j->f->ok(j->f->okc, row)) continue;
             }
             tq_res_push_(&j->res, ((u64)sc[k] << 32) | (u64)(u32)(j->slots ? blk * 32 + k : row));
         }
@@ -618,7 +619,7 @@ static i32 tq_search_(const Tq *t, const f32 *q, i32 R, i32 *rows, const u64 *de
     for (i = 0; i < nj; ++i) {
         jobs[i].t = t; jobs[i].lut = lut; jobs[i].blks = blks; jobs[i].b0 = i * per; jobs[i].b1 = (i + 1) * per < nblk_scan ? (i + 1) * per : nblk_scan;
         if (jobs[i].b0 > jobs[i].b1) jobs[i].b0 = jobs[i].b1;
-        jobs[i].R = R; jobs[i].dead = dead; jobs[i].f = filt && (filt->meta || filt->num || filt->ns) ? filt : (const TqFilt *)0;
+        jobs[i].R = R; jobs[i].dead = dead; jobs[i].f = filt && (filt->meta || filt->num || filt->ns || filt->ok) ? filt : (const TqFilt *)0;
         jobs[i].slots = slots;
         tq_res_init_(&jobs[i].res, buf + (size_t)i * 2 * (size_t)R, R);
     }

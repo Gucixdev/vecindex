@@ -36,7 +36,9 @@
                                      * still written as v9, which every reader since v9 opens (docs/format.md) */
 #define STORE_FLAGS_V9 7            /* the flags a v9 reader knows: int8 rows, texts, labels */
 #define STORE_F_TOP 64              /* flag 64: the scan index carries its top cells (tq_top.c); written only when it has them */
-#define STORE_FLAGS_KNOWN 127       /* every flag this build reads: a file with another is from a newer build, refused */
+#define STORE_F_FIELDS 128          /* flag 128: payload fields - after the text CRCs a table of 16 x (name[32], type u64), then
+                                     * a column of u64 a row for each declared field (store_meta.c) */
+#define STORE_FLAGS_KNOWN 255       /* every flag this build reads: a file with another is from a newer build, refused */
 #define STORE_V9UP(v) ((v) == STORE_VERSION9 || (v) == STORE_VERSION10)   /* the v9 layout, with its digests and parity */
 
 /* the journal's magics: bound to its file by size (1), by the stamp (2), and with a CRC'd header and frames (3) */
