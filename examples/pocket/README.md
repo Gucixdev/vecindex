@@ -46,6 +46,36 @@ bin/pocket-scan photos.vxi ~/Pictures  # every photo in, each at most 1024 px fo
 | `bin/pocket-scan` | a folder of JPEG/PNG/WebP/HEIC into the store through ffmpeg or ImageMagick |
 | `tests/pocket_test.c` | 100 synthetic scenes x 6 copies, the margins printed, groups, keep, reopen, edges |
 
+## Plan: the phone, and formats in C
+
+Asked 2026-11-19: "does pocket run on a phone yet" - not yet. What exists is the C library and the desktop CLI.
+The way there:
+
+1. **JNI**: Java passes a direct ByteBuffer of RGBA (`Bitmap.copyPixelsToBuffer`) and pocket reads it with
+   `GetDirectBufferAddress`. That is plain JNI, so it can be built and tested against a desktop JDK's `jni.h`
+   before any Android tooling.
+2. **The Android app**: Gradle with the NDK and a minimal UI. The manifest asks for no INTERNET permission. It
+   builds on his machine (the Android SDK cannot be downloaded in a cloud session).
+3. **The gallery**: MediaStore, decoded with `inSampleSize` so a photo is small before it reaches C.
+
+Codecs: our own C where it is small and a real gain; the platform for the big and patent-encumbered ones, where
+Android's decoders run in hardware and the device maker holds the licences.
+
+| format | where | why |
+|---|---|---|
+| JPEG decode | C, first | the DC-only path gives a 1/8-size thumbnail without the IDCT: a gallery scan several times faster, no ffmpeg on the desktop; then baseline and progressive in full |
+| PNG decode | C | inflate and filters, medium size; screenshots are PNG |
+| WAV / PCM, resample to 16 kHz | C | the input transcription takes |
+| FLAC decode | C | lossless, royalty-free, small; CRC-8 and CRC-16 of every frame checked, so a damaged frame is reported, not played |
+| MP3 decode | C | patents expired in 2017; a decoder is about 2000 lines |
+| MP4 / M4A container | C | ISO BMFF boxes, simple: the audio track out of a video or a voice note |
+| AAC (in M4A, MP4) | platform first, C later | the format of phone voice recorders; AAC-LC in C is a few thousand lines |
+| JPEG encode + PDF writer | C | the scanner's output with no libraries |
+| HEIC, H.264, H.265, AV1 | platform (BitmapFactory, MediaCodec) | huge, patented, and in hardware already; pocket needs only a few frames of a video |
+
+Each decoder takes the whole file in memory (mmap), allocates nothing, returns pixels or planar PCM, and is tested
+bit for bit against ffmpeg and fuzzed under ASan, as the rest of vecindex is.
+
 ## Status
 
 Measured on synthetic images only (`./run`, 2026-11-19); not yet on a real phone gallery.
