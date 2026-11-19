@@ -94,6 +94,22 @@ int main(void)
     check(vi_unset(db, 7, "draft") == 0 && vi_get_int(db, 7, "draft", &v) == 1, "vi_unset: the row has it no more");
     vi_set_int(db, 7, "draft", 1);
 
+    /* fields in a write batch: applied at commit, with the rows the batch adds */
+    {   vi_batch *b = vi_batch_begin(db);
+        vi_i64 got;
+        vi_batch_add(b, N + 1, vs);
+        vi_batch_set_int(b, N + 1, "year", 1999);
+        vi_batch_set_str(b, 2, "lang", "rust", -1);
+        vi_batch_set_float(b, 2, "score", 9.5);
+        vi_batch_set_int(b, 3, "draft", 7);                          /* set only here: the reopen below must find it */
+        check(vi_batch_set_int(b, 2, "lang", 1) == -1, "vi_batch_set_int on a string field: refused at once");
+        check(vi_get_int(db, N + 1, "year", &got) == -1 && vi_get_str_key(db, 2, "lang", &got) == 0 && got == vi_key("lean", -1),
+              "before the commit: nothing of the batch seen");
+        check(vi_batch_commit(b, 0) == 5, "vi_batch_commit: the row and four fields, one change");
+        check(vi_get_int(db, N + 1, "year", &got) == 0 && got == 1999 && vi_get_str_key(db, 2, "lang", &got) == 0 && got == vi_key("rust", -1)
+              && vi_get_float(db, 2, "score", &dv) == 0 && dv == 9.5, "after it: the batch's row has its year, row 2 its new lang and score");
+        vi_set_str(db, 2, "lang", "lean", -1); vi_set_float(db, 2, "score", (double)(2 % 21 - 10) / 4.0); vi_delete(db, N + 1); }
+
     /* the language */
     check(vi_filter_parse(db, "lang = \"c\" and year >= 2015 and not draft", &f) == 0, "parse: lang = \"c\" and year >= 2015 and not draft");
     for (i = 0, ok = 1; i < N; ++i) if (vi_match(db, i, &f) != want0_(i)) { ok = 0; break; }
@@ -142,6 +158,7 @@ int main(void)
     db = vi_open(path, DIM, 0);
     check(db && vi_get_int(db, 45, "year", &v) == 0 && v == 2015 && vi_get_str_key(db, 4, "lang", &v) == 0 && v == vi_key("rust", -1),
           "reopened: the fields from the journal");
+    check(db && vi_get_int(db, 3, "draft", &v) == 0 && v == 7, "and a field set only in the batch, replayed from its journal frame");
     check(db && vi_filter_parse(db, "lang = \"c\" and year >= 2015 and not draft", &f) == 0, "a filter compiled for the reopened store");
     for (i = 0, ok = 1; db && i < N; ++i) if (vi_match(db, i, &f) != want0_(i)) { ok = 0; break; }
     check(ok, "every row matches as before");

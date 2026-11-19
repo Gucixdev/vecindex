@@ -161,6 +161,11 @@ VI_API int vi_batch_delete(vi_batch *b, vi_i64 id);
 VI_API int vi_batch_delete_range(vi_batch *b, vi_i64 lo, vi_i64 hi);
 VI_API int vi_batch_set_num(vi_batch *b, vi_i64 id, vi_i64 num);
 VI_API int vi_batch_set_ns(vi_batch *b, vi_i64 id, vi_i64 ns);     /* as vi_set_ns, when the batch reaches it */   /* on the row the batch added or the store has */
+/* a field (vi_set_int / vi_set_float / vi_set_str), set when the batch reaches it, on the row the batch added before it
+ * or the one the store has; the field is declared at once (that much is not undone by vi_batch_abort) */
+VI_API int vi_batch_set_int(vi_batch *b, vi_i64 id, const char *name, vi_i64 v);
+VI_API int vi_batch_set_float(vi_batch *b, vi_i64 id, const char *name, double v);
+VI_API int vi_batch_set_str(vi_batch *b, vi_i64 id, const char *name, const char *v, int len);
 
 /* Applies the batch as one change and frees it. sync 1: also on the disk when this returns (a store opened from a
  * file; commits arriving during an fsync share the next one). Returns how many changes it held; -1 refused, nothing
@@ -288,6 +293,20 @@ VI_API int vi_filter_parse(vi_db *db, const char *expr, vi_filter *f);
 VI_API int vi_match(vi_db *db, vi_i64 id, const vi_filter *f);
 /* vi_search over the rows that pass f, tested inside the scan (a selective filter widens it as labels do) */
 VI_API int vi_search_filter(vi_db *db, const float *query, int k, const vi_filter *f, vi_i64 *ids, float *scores);
+
+/* ---- documents into pages and chunks, before they are embedded ----
+ * vi_chunk cuts a document's text for the embedding model, a page at a time: a form feed (\f, which pdftotext puts
+ * between a PDF's pages) always ends a page, chunks never cross it, and pages[i] tells the page (0 up) of chunk i.
+ * A chunk is at most max_bytes, cut at the best boundary in the last third of that window - a blank line, then a line
+ * end, then a sentence end (". " "? " "! "), then a space - or, with none, at max_bytes but never inside a UTF-8
+ * character; leading and trailing white space is left out. overlap bytes (0 to max_bytes / 2) of a chunk are repeated
+ * at the start of the next, on the same page. offs and lens (and pages, which may be NULL) get up to max chunks;
+ * returns how many there are (more than max: only max written), -1 for bad arguments.
+ * Give the chunks ids VI_ID(doc, page, chunk) - 1024 pages a document, 1024 chunks a page - and then:
+ * vi_search_grouped(db, q, k, 10, ...) is the k best pages, shift 20 the k best documents, and vi_context with
+ * shift 10 keeps the neighbours of a hit on its page (20: in its document). */
+#define VI_ID(doc, page, chunk) (((vi_i64)(doc) << 20) | ((vi_i64)(page) << 10) | (vi_i64)(chunk))
+VI_API int vi_chunk(const char *text, int len, int max_bytes, int overlap, int *offs, int *lens, int *pages, int max);
 
 /* ---- RAG: what happens to the hits before a model reads them, done in the store ----
  * Ids as above: doc << shift | chunk (shift 20: a million chunks a document), so a document is an id range. */

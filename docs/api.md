@@ -75,6 +75,8 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_set_tag`, `vi_get_tag` | a 64-bit tag per row |
 | `vi_set_num(db, id, num)`, `vi_get_num(db, id, &num)`, `vi_search_range(db, q, k, lo, hi, ids, scores)` | a 64-bit number per row (0 until set), and a search over the rows whose number is in `[lo, hi]` |
 | `vi_set_int`, `vi_set_float`, `vi_set_str(db, id, name, v)`, `vi_unset`, `vi_get_int`, `vi_get_float`, `vi_get_str_key`, `vi_field(db, name, type)`, `vi_field_info` | payload: named, typed fields on a row (an int, a float or a string; at most 16 a store), declared by the first set; journaled, saved and checked with the row |
+| `vi_batch_set_int`, `vi_batch_set_float`, `vi_batch_set_str(b, id, name, v)` | a field in a write batch, applied at commit with the batch's rows (the field is declared at once) |
+| `vi_chunk(text, len, max_bytes, overlap, offs, lens, pages, max)`, `VI_ID(doc, page, chunk)` | a document cut into pages (form feeds, as `pdftotext` writes them) and chunks at the best boundary, never inside a UTF-8 character; with `VI_ID` ids, `vi_search_grouped` with shift 10 searches by page, 20 by document |
 | `vi_filter_parse(db, expr, &f)`, `vi_search_filter(db, q, k, &f, ids, scores)`, `vi_match(db, id, &f)` | a filter over the fields - `lang = "c" and ext in (".h", ".c") and year >= 2020 and not draft` - compiled once, tested inside the scan; also `filter` of `vi_search_mmr` and `vi_ctx_opts` |
 | `vi_search_where(db, q, k, all, any, none, lo, hi, ids, scores)` | labels (as `vi_search_labeled`) and a number range in one search, both tested in the scan |
 | `vi_add_ns(db, ns, id, vec, text, len)`, `vi_search_ns(db, ns, q, k, ids, scores)`, `vi_set_ns`, `vi_get_ns`, `vi_delete_ns(db, ns)`, `vi_count_ns(db, ns)`, `vi_batch_set_ns` | namespaces: many tenants in one store; a search in a namespace sees only its rows (a small one searched exactly over its own rows, a big one through the scan with the namespace inside it); `vi_add` over a row keeps its namespace; `vi_delete_ns` drops a tenant in one journal record |
@@ -226,6 +228,26 @@ rustc -O demo.rs -L .build -o demo && LD_LIBRARY_PATH=.build ./demo
 
 Other languages follow the same pattern through their own FFI (Node with koffi or N-API, Java with the FFM API, C#
 with P/Invoke, Zig with `@cImport`, Lua with LuaJIT's FFI); those were not run here.
+
+## Documents into pages and chunks
+
+`vi_chunk` cuts a document for the embedding model, page by page: a form feed (`\f`, which `pdftotext` puts
+between a PDF's pages) always ends a page, and a chunk ends at the best boundary in the last third of its window - a
+blank line, a line end, a sentence end, a space - or at `max_bytes`, never inside a UTF-8 character. Ids made with
+`VI_ID(doc, page, chunk)` (`doc << 20 | page << 10 | chunk`: 1024 pages a document, 1024 chunks a page) make a page an
+id range: `vi_search_grouped(db, q, k, 10, ...)` is the k best pages, shift 20 the k best documents, and
+`vi_context` with shift 10 keeps a hit's neighbours on its page.
+
+```c
+int o[256], l[256], p[256], n, i, c = 0;
+n = vi_chunk(text, -1, 1200, 150, o, l, p, 256);            /* pdftotext's output: \f between pages */
+for (i = 0; i < n && i < 256; ++i) {
+    c = i && p[i] == p[i - 1] ? c + 1 : 0;                   /* the chunk's number on its page */
+    embed(text + o[i], l[i], v);                              /* the caller's model */
+    vi_add_text(db, VI_ID(doc, p[i], c), v, text + o[i], l[i]);
+}
+n = vi_search_grouped(db, q, 5, 10, ids, sc);                /* the five best pages, one chunk each */
+```
 
 ## Texts: from a small chunk to the whole document
 

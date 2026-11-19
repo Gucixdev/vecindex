@@ -182,6 +182,9 @@ fi
 "$CC" "${CFLAGS[@]}" -Iinclude tests/graph_test.c "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/graph_test" \
     && "./$OUT/graph_test" 2>&1 | tee "$OUT/log_graph.txt" && rec "graph" ok "$(okn "$OUT/log_graph.txt") checks: links, expand, PPR against power iteration, the log file" \
     || { echo "  ^ graph FAILED"; fail=1; rec "graph" FAIL; }
+"$CC" "${CFLAGS[@]}" -Iinclude tests/chunk_test.c "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/chunk_test" \
+    && "./$OUT/chunk_test" 2>&1 | tee "$OUT/log_chunk.txt" && rec "chunks" ok "$(okn "$OUT/log_chunk.txt") checks: pages, boundaries, UTF-8, overlap, search by page" \
+    || { echo "  ^ chunks FAILED"; fail=1; rec "chunks" FAIL; }
 echo
 
 # ---- compatibility: every release's files open with every value; a newer build's are refused; the API of every

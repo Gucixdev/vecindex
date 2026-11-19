@@ -557,6 +557,34 @@ static int vi_fset_(vi_db *db, vi_i64 id, const char *name, i32 type, u64 code)
     return 0;
 }
 
+static int vi_bfset_(vi_batch *b, vi_i64 id, const char *name, i32 type, u64 code)
+{
+    i32 r;
+    if (!b) return vi_fail_(-1, VI_NOB, (const char *)0, (const char *)0);
+    if (!name) return vi_fail_(-1, "the field's name is NULL", (const char *)0, (const char *)0);
+    r = store_batch_set_field(&b->w, (i64)id, name, (i32)strlen(name), type, code);
+    if (r == -2) return vi_fail_(-1, "the field \"", name, "\" exists with another type");
+    if (r == -3) return vi_fail_(-1, "the store has 16 fields already (STORE_FIELDS): no room for \"", name, "\"");
+    if (r == -4) return vi_fail_(-1, "not a field name (1 to 31 of A-Z a-z 0-9 _, no digit first, not and/or/not/in/has/true/false): \"", name, "\"");
+    if (r < 0) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    return 0;
+}
+VI_API int vi_batch_set_int(vi_batch *b, vi_i64 id, const char *name, vi_i64 v)
+{
+    if ((u64)v == ((u64)1 << 63)) return vi_fail_(-1, "INT64_MIN cannot be stored in a field (its code means \"not set\")", (const char *)0, (const char *)0);
+    return vi_bfset_(b, id, name, STORE_FT_INT, store_enc_int_((i64)v));
+}
+VI_API int vi_batch_set_float(vi_batch *b, vi_i64 id, const char *name, double v)
+{
+    if (v != v) return vi_fail_(-1, "NaN cannot be stored in a field", (const char *)0, (const char *)0);
+    return vi_bfset_(b, id, name, STORE_FT_FLOAT, store_enc_f64_(v));
+}
+VI_API int vi_batch_set_str(vi_batch *b, vi_i64 id, const char *name, const char *v, int len)
+{
+    if (!v) return vi_fail_(-1, "the string is NULL", (const char *)0, (const char *)0);
+    return vi_bfset_(b, id, name, STORE_FT_STR, store_enc_str_(v, vi_len_(v, len)));
+}
+
 VI_API int vi_field(vi_db *db, const char *name, int type)
 {
     i32 f;
@@ -691,6 +719,58 @@ VI_API int vi_search_filter(vi_db *db, const float *query, int k, const vi_filte
     n = store_search_flt(db->s, query, (i32)k, x, (i64 *)ids, scores);
     vi_cos_(db, scores, n);
     return n;
+}
+
+/* ---- vi_chunk ---- */
+
+static int vi_ws_(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v'; }
+
+/* the best end of a chunk in [lo, hi): after a blank line, a line end, a sentence end, a space; 0 none */
+static i32 vi_cut_(const char *t, i32 lo, i32 hi)
+{
+    i32 i, k;
+    for (k = 0; k < 4; ++k)
+        for (i = hi - 1; i > lo; --i) {
+            if (k == 0 && t[i] == '\n' && t[i - 1] == '\n') return i + 1;
+            if (k == 1 && t[i] == '\n') return i + 1;
+            if (k == 2 && t[i] == ' ' && (t[i - 1] == '.' || t[i - 1] == '?' || t[i - 1] == '!')) return i + 1;
+            if (k == 3 && vi_ws_(t[i])) return i + 1;
+        }
+    return 0;
+}
+
+VI_API int vi_chunk(const char *text, int len, int max_bytes, int overlap, int *offs, int *lens, int *pages, int max)
+{
+    i32 L, pos = 0, page = 0, n = 0;
+    if (!text || max_bytes < 16 || overlap < 0 || overlap > max_bytes / 2 || max < 0 || (max > 0 && (!offs || !lens)))
+        return vi_fail_(-1, "text, max_bytes >= 16, overlap 0 to max_bytes / 2, offs and lens for max chunks", (const char *)0, (const char *)0);
+    L = vi_len_(text, len);
+    while (pos < L) {
+        i32 pe = pos, end, a, b;
+        if (text[pos] == '\f') { ++pos; ++page; continue; }
+        while (pe < L && text[pe] != '\f') ++pe;                /* the end of this page */
+        while (pos < pe && vi_ws_(text[pos])) ++pos;
+        while (pos < pe) {                                       /* the chunks of the page */
+            if (pe - pos <= max_bytes) end = pe;
+            else {
+                end = vi_cut_(text, pos + max_bytes * 2 / 3, pos + max_bytes);
+                if (!end) { end = pos + max_bytes; while (end > pos + 1 && ((u8)text[end] & 0xc0u) == 0x80u) --end; }
+            }
+            a = pos; b = end;
+            while (b > a && vi_ws_(text[b - 1])) --b;
+            if (b > a) {
+                if (n < max) { offs[n] = (int)a; lens[n] = (int)(b - a); if (pages) pages[n] = (int)page; }
+                ++n;
+            }
+            if (end >= pe) break;
+            a = end - overlap;                                   /* the next starts overlap bytes back, on a character */
+            while (a < end && ((u8)text[a] & 0xc0u) == 0x80u) ++a;
+            pos = a > pos ? a : end;
+            while (pos < pe && vi_ws_(text[pos])) ++pos;
+        }
+        pos = pe;
+    }
+    return (int)n;
 }
 
 /* ---- RAG (store_rag.c) ---- */

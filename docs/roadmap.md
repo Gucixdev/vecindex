@@ -73,6 +73,10 @@ Done since 2026-11-19 (built and its own test run here, `tests/rag_test.c` under
   > >= in, not in, has, and, or, not, parentheses) compiled to a postfix program and tested inside the scan through
   `TqFilt.ok`; `vi_search_filter`, `vi_match`, and the filter of `vi_search_mmr` and `vi_context`.
   `tests/meta_test.c` (42 checks, run here, ASan and UBSan too)
+- documents into pages and chunks (`vi_chunk`, `VI_ID`; asked in his braindump): form feeds end pages, boundaries
+  blank line > line end > sentence end > space, UTF-8 whole, overlap; search by page = `vi_search_grouped` shift 10.
+  `tests/chunk_test.c` 12 checks. Fields in write batches (`vi_batch_set_int/float/str`, the journal's `V` record
+  inside the batch's frame; meta_test +6, the replay of a batch-only field checked)
 - the graph (`include/graph.h`, `src/graph.c`, a module of its own): typed, weighted links between ids in a log
   file with CRCs (torn tail cut, compaction by rename), `vg_links`, `vg_expand` (levels, types, direction, weights,
   budget), `vg_ppr` (personalized PageRank by local push). `tests/graph_test.c` (29 checks; PPR within 5e-8 of
@@ -126,7 +130,7 @@ Open, in the order they are planned:
 14. **The live visualisation from the real engine** (WASM)
 15. **Ternary codes**, measured before any code: as a first sieve for row-to-centroid comparisons at build and
     split time (`trash/src/q3.c` has the packing). Not for the scan's codes or the rows: Config.lean shows why
-16. **Fields, next**: in write batches (`vi_batch_set_*`), in vserv and the bindings; an index on a field (sorted
+16. **Fields, next**: in vserv and the bindings; an index on a field (sorted
     row lists) so a very selective filter starts from its rows instead of widening the scan; the filter in
     `vi_search_exact` (the certified search) and `vi_search_hybrid`; strings kept whole on demand, beside the key
 17. **Compressed texts** (asked 2026-11-19, next): the documents stay apart from the vectors, as now, and their heap

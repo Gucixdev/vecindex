@@ -167,6 +167,21 @@ i32 store_batch_set_ns(StoreWb *b, i64 id, i64 ns)
     return 0;
 }
 
+/* a row's field (store_meta.c), set when the batch reaches it, as store_batch_set_num: the field is declared now (its
+ * own journal record, ahead of the batch's), the value applied at commit. 0, -1 no memory, -2..-4 as
+ * store_field_decl (another type, no room, not a name). The record: 'V' id field(u8) code(u64), the journal's own. */
+i32 store_batch_set_field(StoreWb *b, i64 id, const char *nm, i32 n, i32 type, u64 code)
+{
+    u8 op = 'V', fb;
+    i32 f = store_field_decl(b->s, nm, n, type);
+    if (f < 0) return f;
+    if (store_batch_room_(b, 18) != 0) return -1;
+    fb = (u8)f;
+    store_batch_w_(b, &op, 1); store_batch_w_(b, &id, 8); store_batch_w_(b, &fb, 1); store_batch_w_(b, &code, 8);
+    ++b->n;
+    return 0;
+}
+
 /* bytes of the record at r */
 static size_t store_batch_reclen_(const RagStore *s, const u8 *r)
 {
@@ -174,6 +189,7 @@ static size_t store_batch_reclen_(const RagStore *s, const u8 *r)
     u32 n;
     if (r[0] == 'D') return 9;
     if (r[0] == 'R' || r[0] == 'N' || r[0] == 'S') return 17;
+    if (r[0] == 'V') return 18;
     if (r[0] == 'P' || r[0] == 'U') return 17 + vb;
     memcpy(&n, r + 17 + vb, 4);                                  /* 'Q' */
     return 21 + vb + n;
@@ -301,6 +317,7 @@ i32 store_batch_commit(StoreWb *b, i32 sync)
         rl = store_batch_reclen_(s, r);
         memcpy(&id, r + 1, 8);
         if (r[0] == 'D') { store_kill_id_locked_(s, id); continue; }
+        if (r[0] == 'V') { u64 code; memcpy(&code, r + 10, 8); store_field_set_locked_(s, id, (i32)r[9], code, 0); continue; }
         memcpy(&meta, r + 9, 8);
         if (r[0] == 'N') { store_set_num_locked_(s, id, meta); continue; }
         if (r[0] == 'S') { store_set_ns_locked_(s, id, meta); continue; }
