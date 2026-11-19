@@ -90,8 +90,15 @@ Open, in the order they are planned:
    counterexample (a re-rank depth below the candidate count). Measure each count instead
 6. **Splits, finished**: a moved row should take a free slot of its new cluster (24,000 added rows left 28,500
    holes, and a quarter of the slots empty forces the rebuild splits were to avoid); merge clusters that shrank
-7. **SPANN, the rest**: rows near a cluster boundary kept in several lists. A row in more than one slot touches
-   search with a proof, compaction and splits - to be done with tests running, not blind
+7. **SPANN, the rest, filtered** (asked 2026-11-19): rows near a cluster boundary kept in several lists. A row in more
+   than one slot touches search with a proof, compaction and splits - to be done with tests running, not blind.
+   Filtered: (a) a summary a cluster, beside its centroid - the OR of its rows' tags, min and max of the number and of
+   each field's code, a small Bloom filter of the string keys - so a filter skips a cluster that cannot match before
+   any of its codes is read (from RAM or the disk); widened on every write to a row of the cluster, never narrowed
+   until a rebuild; (b) filter-aware probing: past a skipped cluster the next nearest one, until the probes hold
+   enough matching rows or the query's read budget is spent; (c) a filter the summaries count as very selective
+   (under ~0.5% of the rows) goes the way a small namespace does: an index of the field's rows, scored exactly; (d)
+   the same summaries a store in a directory, so `vi_dir_search` and a router skip whole shards
 8. **One measurement at scale**: 100M to 1B rows from disk with the top cells, splits and pruning on; the factor in
    `4 sqrt(n)` swept (`Config.lean`: the best one is sqrt(b p / a) for the measured costs, 4 is a rule of thumb)
 9. **Profile the query path, then SIMD where it shows**: the per-query tables (rotation, 16 entries a column), the
@@ -130,7 +137,14 @@ Open from before, not yet placed in that order:
   1-bit cascade) = 25 GB: the codes read by cluster from the disk instead of mapped whole (the probed clusters only,
   read ahead in one request), the build streamed in passes over the rows instead of holding them, the shards searched
   on threads. 10^12 rows is 25 TB: a few disks, still shards as files on one machine - no object store, no cluster.
-  10^15 (25 PB) is out of scope
+  10^15 (25 PB) is out of scope.
+  Mixed machines (2026-11-19: a trillion is the target, across Raspberry Pis and bigger boxes): each node sizes its
+  own shard and clusters from its `VI_RAM_LIMIT_MB` (centroids and summaries in RAM, codes and rows on its disk),
+  publishes a coarse sketch of its centroids and summaries, and a router asks only the nodes whose sketch is near
+  the query and can match its filter; a slow node gets a time budget, and a result that misses a node says so
+  (recall reported, never assumed). Honest sizes at d=384: 4-bit codes 192 B, int8 row 388 B, id, tag and check
+  20 B - about 600 B a row, 1.6 billion rows a TB; 10^12 rows is about 600 TB, so hundreds of Pi-class nodes with a
+  TB each, or fewer bigger ones; 1-bit codes with no stored rows (no exact re-score) is ~70 B a row, ~70 TB
 - p99 under a steady write load: a burst faster than one core indexes waits in the exact-scan tail, and a rebuild
   holds two indexes; index bursts on more cores and bound the tail
 - the cascade's benchmark, and its shortlist tuned rather than fixed at 8 x R
