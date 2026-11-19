@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# ./run: builds pocket against vecindex two levels up (VECINDEX=... for another copy), runs the self-test, then the
+# CLI end to end on photos made by ImageMagick (three scenes, each with a resized, a re-encoded and a brighter copy).
+# ./run asan: the self-test under ASan and UBSan too.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+vi=${VECINDEX:-../..}
+out=.build
+mkdir -p "$out"
+cc=${CC:-gcc}
+flags=(-std=c89 -pedantic -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200112L -O2 -I"$vi/include")
+
+"$cc" "${flags[@]}" -I"$vi/src" -c "$vi/src/vecindex.c" -o "$out/vecindex.o"
+"$cc" "${flags[@]}" src/pocket.c tests/pocket_test.c "$out/vecindex.o" -lm -lpthread -o "$out/pocket_test"
+"$cc" "${flags[@]}" src/pocket.c src/pocket_cli.c "$out/vecindex.o" -lm -lpthread -o "$out/pocket"
+"./$out/pocket_test"
+
+if [[ ${1:-} == asan ]]; then
+    san=("-fsanitize=address,undefined" -fno-sanitize-recover=all -g -O1)
+    "$cc" "${flags[@]}" "${san[@]}" -I"$vi/src" "$vi/src/vecindex.c" src/pocket.c tests/pocket_test.c -lm -lpthread \
+        -o "$out/pocket_test_asan"
+    "./$out/pocket_test_asan" | tail -1
+fi
+
+if command -v convert >/dev/null || command -v magick >/dev/null; then
+    im=convert
+    command -v magick >/dev/null && im=magick
+    d=$(mktemp -d)
+    trap 'rm -rf "$d"' EXIT
+    mkdir -p "$d/photos"
+    for s in 1 2 3; do
+        "$im" -seed "$s" -size 800x600 plasma:fractal "$d/photos/scene$s.png"
+        "$im" "$d/photos/scene$s.png" -resize 50% "$d/photos/scene${s}_small.jpg"
+        "$im" "$d/photos/scene$s.png" -quality 55 "$d/photos/scene${s}_q55.jpg"
+        "$im" "$d/photos/scene$s.png" -modulate 115 "$d/photos/scene${s}_bright.png"
+    done
+    POCKET="$out/pocket" bin/pocket-scan "$d/p.vxi" "$d/photos" >/dev/null
+    POCKET="$out/pocket" bin/pocket-scan "$d/p.vxi" "$d/photos" >/dev/null     # again: nothing added twice
+    "$out/pocket" dups "$d/p.vxi" -t > "$d/groups.tsv"
+    "$out/pocket" dups "$d/p.vxi"
+    groups=$(cut -f1 "$d/groups.tsv" | sort -u | wc -l)
+    keeps=$(awk -F'\t' '$2 == "keep"' "$d/groups.tsv" | wc -l)
+    rows=$(wc -l < "$d/groups.tsv")
+    mixed=$(awk -F'\t' '{ s = $4; sub(/.*scene/, "", s); s = substr(s, 1, 1); if (g[$1] && g[$1] != s) bad = 1; g[$1] = s }
+                       END { print bad + 0 }' "$d/groups.tsv")
+    kept_small=$(awk -F'\t' '$2 == "keep" && $4 ~ /_small|_q55/' "$d/groups.tsv" | wc -l)
+    if [[ $groups == 3 && $keeps == 3 && $rows == 12 && $mixed == 0 && $kept_small == 0 ]]; then
+        echo "  ok   CLI: 12 photos, scanned twice, in 3 groups of 4, one scene each, neither the half size nor the re-encode kept"
+    else
+        echo "  FAIL CLI: groups $groups keeps $keeps rows $rows mixed $mixed kept_small $kept_small"
+        exit 1
+    fi
+fi

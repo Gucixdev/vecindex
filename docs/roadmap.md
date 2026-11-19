@@ -6,7 +6,8 @@ still to run on his machine.
 Scope: vecindex is a database for RAG and LLMs, with no dependencies, built as one project, in a repository of its
 own (github.com/Gucixdev/vecindex) again. What a RAG pipeline does with the hits before a model reads them is part of
 it (2026-11-19: `store_rag.c`, below); the note database, agent memory (mem.c and its rule engine) and the
-cross-encoder re-rank stay in `examples/agent_launcher/`, a separate program that uses vecindex as a library.
+cross-encoder re-rank stay in `examples/agent_launcher/`, a separate program that uses vecindex as a library;
+`examples/pocket/` (photo cleanup now, a document scanner and offline transcription next) uses it the same way.
 Embedding models, tokenizers and answer generation stay outside.
 
 Done and tested: quantization with an exact re-rank (4, 2 and 1-bit codes), SIMD (AVX-512, AVX2, NEON, a scalar path

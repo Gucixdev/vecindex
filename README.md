@@ -18,7 +18,7 @@ them. What a store scans is 4, 2 or 1 bit a dimension (`vi_set_layout`), what it
 
 Its home is this repository. It grew in [holyc](https://github.com/Gucixdev/holyc) as `ragdb/`, and has moved
 between the two since; the note database and agent memory that grew on top of it are
-[`examples/agent_launcher`](examples/agent_launcher), a separate program that uses vecindex as a library.
+[`examples/agent_launcher`](examples/agent_launcher), a program on vecindex as a library, as is [`examples/pocket`](examples/pocket).
 
 ## Layout
 

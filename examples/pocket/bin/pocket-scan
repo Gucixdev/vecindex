@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# pocket-scan DB DIR...: every photo under DIR into DB - each decoded to a PNM at most 1024 px on its longer side
+# by ffmpeg or ImageMagick, whichever is there, and given to `pocket add` with the original's path, size and time.
+# Then: pocket dups DB. POCKET=path/to/pocket when it is not next to this script.
+set -euo pipefail
+
+if (( $# < 2 )); then
+    echo "usage: pocket-scan DB DIR..." >&2
+    exit 2
+fi
+db=$1
+shift
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+pocket=${POCKET:-$here/../.build/pocket}
+[[ -x $pocket ]] || { echo "pocket-scan: no $pocket (build it: ./run)" >&2; exit 1; }
+
+if command -v ffmpeg >/dev/null; then
+    decode() { ffmpeg -nostdin -v error -y -i "$1" -frames:v 1 -vf "scale='min(1024,iw)':'min(1024,ih)':force_original_aspect_ratio=decrease" -pix_fmt rgb24 -f image2 -c:v ppm "$2"; }
+elif command -v magick >/dev/null; then
+    decode() { magick "$1[0]" -auto-orient -resize '1024x1024>' "ppm:$2"; }
+elif command -v convert >/dev/null; then
+    decode() { convert "$1[0]" -auto-orient -resize '1024x1024>' "ppm:$2"; }
+else
+    echo "pocket-scan: needs ffmpeg or ImageMagick to decode photos" >&2
+    exit 1
+fi
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+n=0 bad=0
+while IFS= read -r -d '' f; do
+    if decode "$f" "$tmp/p.ppm" 2>/dev/null && "$pocket" add "$db" "$f" "$tmp/p.ppm"; then
+        n=$((n + 1))
+    else
+        bad=$((bad + 1))
+        echo "pocket-scan: skipped $f" >&2
+    fi
+done < <(find "$@" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \
+                            -o -iname '*.heic' -o -iname '*.ppm' -o -iname '*.pgm' \) -print0 | sort -z)
+echo "pocket-scan: $n photos in $db, $bad skipped"
