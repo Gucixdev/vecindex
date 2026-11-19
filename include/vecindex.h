@@ -344,6 +344,13 @@ VI_API void vi_ctx_defaults(vi_ctx_opts *o);
 VI_API int vi_context(vi_db *db, const float *query, const char *text, int tlen, const vi_ctx_opts *o,
                       vi_ctx_span *spans, int max_spans, char *buf, int cap, int *used);
 
+/* The same context from hits the caller already has - a reranker's, a graph walk's (graph.h's vg_context): ids[0, n)
+ * (at most 256) best first, their scores (NULL: 1 / (rank + 1)), each id once (a repeat is skipped). o: shift,
+ * before and after as vi_context (NULL: the defaults; k, lambda, dup and filter are not used). An id without a row
+ * is skipped. Returns how many spans, or -1 (vi_error()). */
+VI_API int vi_context_ids(vi_db *db, const vi_i64 *ids, const float *scores, int n, const vi_ctx_opts *o,
+                          vi_ctx_span *spans, int max_spans, char *buf, int cap, int *used);
+
 /* nq queries (queries: nq x dim) on up to threads threads (0: every core); ids and scores (cosines) get k slots a
  * query, a missing hit has id -1 and score -1. 0, or -1 when an argument or a query is wrong. */
 VI_API int vi_search_batch(vi_db *db, const float *queries, int nq, int k, vi_i64 *ids, float *scores, int threads);

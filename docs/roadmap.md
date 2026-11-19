@@ -76,8 +76,11 @@ Done since 2026-11-19 (built and its own test run here, `tests/rag_test.c` under
 - the graph (`include/graph.h`, `src/graph.c`, a module of its own): typed, weighted links between ids in a log
   file with CRCs (torn tail cut, compaction by rename), `vg_links`, `vg_expand` (levels, types, direction, weights,
   budget), `vg_ppr` (personalized PageRank by local push). `tests/graph_test.c` (29 checks; PPR within 5e-8 of
-  power iteration), ASan and UBSan too. Next: the walks inside `vi_context` (hits, then their links, then the
-  budget), the ablation A-D (IVF + BM25, + expansion, + PPR, + both) at one context budget, vserv and the bindings
+  power iteration), ASan and UBSan too. Then `vg_context` (the store's hits seed a walk, its best nodes go to the
+  new `vi_context_ids` with the same budget) and `bench/graph_ablation.c`: A-D at one budget on synthetic two-hop
+  data - A 0% complete, B, C, D 100%; expansion costs nothing over the search (p50 91 us), PPR ~400 us more at
+  eps 1e-4. Next: the ablation on real documents with real links (citations, a code base's includes), the graph in
+  vserv and the bindings, PPR's eps tuned for latency
 - the hyperbolic metric (`VI_LORENTZ`, metric 3): rows as tangent vectors at the origin, the exact score a
   cancellation-free line in the cosine (so the certified search holds), the distance out. `tests/lorentz_test.c`:
   recall@10 500/500 after a build on 20,000 random points (33 dims); real hyperbolic embeddings not measured yet. (A

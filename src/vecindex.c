@@ -761,7 +761,7 @@ VI_API int vi_context(vi_db *db, const float *query, const char *text, int tlen,
     if (!spans || max_spans < 1) return vi_fail_(-1, "spans is NULL or max_spans below 1", (const char *)0, (const char *)0);
     if (cap < 0 || (cap > 0 && !buf)) return vi_fail_(-1, "buf is NULL or cap below 0", (const char *)0, (const char *)0);
     if (max_spans > VI_CTX_HITS_MAX) max_spans = VI_CTX_HITS_MAX;   /* a span holds a hit: never more than k */
-    n = store_context(db->s, query, text, vi_len_(text, tlen), x, (i32)d.k, (i32)d.shift, (i32)d.before, (i32)d.after,
+    n = store_context(db->s, query, text, vi_len_(text, tlen), x, (const i64 *)0, (const f32 *)0, (i32)d.k, (i32)d.shift, (i32)d.before, (i32)d.after,
                       d.lambda, d.dup, sp, (i32)max_spans, buf, (i32)cap, &u);
     if (n < 0) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
     for (i = 0; i < n; ++i) {
@@ -772,6 +772,35 @@ VI_API int vi_context(vi_db *db, const float *query, const char *text, int tlen,
     if (!text || vi_len_(text, tlen) == 0) for (i = 0; i < n; ++i) spans[i].score = store_score_out(db->s, spans[i].score);
     if (used) *used = (int)u;
     return (int)n;
+}
+
+VI_API int vi_context_ids(vi_db *db, const vi_i64 *ids, const float *scores, int n, const vi_ctx_opts *o,
+                          vi_ctx_span *spans, int max_spans, char *buf, int cap, int *used)
+{
+    vi_ctx_opts d;
+    StoreSpan sp[VI_CTX_HITS_MAX];
+    i32 m, i, u = 0;
+    if (used) *used = 0;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    vi_ctx_defaults(&d);
+    if (o) d = *o;
+    if (n < 0 || n > VI_CTX_HITS_MAX || (n > 0 && !ids)) return vi_fail_(-1, "ids holds 0 to 256 hits (VI_CTX_HITS_MAX)", (const char *)0, (const char *)0);
+    if (d.shift < 0 || d.shift > 63) return vi_fail_(-1, "shift must be 0 to 63", (const char *)0, (const char *)0);
+    if (d.before < -1 || d.after < -1) return vi_fail_(-1, "before and after are 0 or more, or -1 (the whole document)", (const char *)0, (const char *)0);
+    if (!spans || max_spans < 1) return vi_fail_(-1, "spans is NULL or max_spans below 1", (const char *)0, (const char *)0);
+    if (cap < 0 || (cap > 0 && !buf)) return vi_fail_(-1, "buf is NULL or cap below 0", (const char *)0, (const char *)0);
+    if (n == 0) return 0;
+    if (max_spans > VI_CTX_HITS_MAX) max_spans = VI_CTX_HITS_MAX;
+    m = store_context(db->s, (const f32 *)0, (const char *)0, 0, (const StoreFlt *)0, (const i64 *)ids, scores, (i32)n, (i32)d.shift,
+                      (i32)d.before, (i32)d.after, 1.0f, 0.0f, sp, (i32)max_spans, buf, (i32)cap, &u);
+    if (m < 0) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    for (i = 0; i < m; ++i) {
+        spans[i].doc = (vi_i64)sp[i].doc; spans[i].first = (vi_i64)sp[i].first; spans[i].last = (vi_i64)sp[i].last;
+        spans[i].hit = (vi_i64)sp[i].hit; spans[i].score = sp[i].score; spans[i].chunks = (int)sp[i].chunks;
+        spans[i].off = (int)sp[i].off; spans[i].len = (int)sp[i].len;
+    }
+    if (used) *used = (int)u;
+    return (int)m;
 }
 
 VI_API int vi_set_tag(vi_db *db, vi_i64 id, vi_i64 tag)

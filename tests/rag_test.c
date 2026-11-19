@@ -121,6 +121,13 @@ int main(void)
         for (i = 0, same = n == 3; same && i < n; ++i) same = (ids[i] >> 20) == 2;
         check(same, "vi_search_mmr with a filter: every hit passes");
         vi_ctx_defaults(&o); }
+    {   vi_i64 given[4];                                         /* the caller's own hits: in its order, repeats once */
+        given[0] = ID(2, 5); given[1] = ID(1, 5); given[2] = ID(2, 5); given[3] = ID(9, 9);
+        vi_ctx_defaults(&o); o.before = o.after = 0;
+        n = vi_context_ids(db, given, (const float *)0, 4, &o, sp, 8, buf, (int)sizeof buf, &used);
+        check(n == 2 && sp[0].hit == ID(2, 5) && sp[1].hit == ID(1, 5) && used == 10 && memcmp(buf, "d2c5;d1c5;", 10) == 0,
+              "vi_context_ids: the given hits in their order, a repeat and an id without a row passed over");
+        vi_ctx_defaults(&o); }
     o.k = 0;
     check(vi_context(db, q, (const char *)0, 0, &o, sp, 8, buf, (int)sizeof buf, &used) == -1, "vi_context k 0 is an error");
 

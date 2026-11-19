@@ -95,4 +95,23 @@ VI_API void vg_ppr_defaults(vg_ppr_opts *o);
 VI_API int vg_ppr(vg_graph *g, const vi_i64 *seeds, const float *seed_w, int ns, const vg_ppr_opts *o,
                   vi_i64 *ids, float *scores, int max);
 
+/* A context for a model through the graph: the store's diverse hits (vi_search_mmr, as vi_context's co asks: k,
+ * lambda, dup, filter) seed a walk - vg_expand, vg_ppr, or both with their lists fused by reciprocal rank - whose
+ * best `hits` nodes, the seeds among them, are built into one context to cap bytes by vi_context_ids (co's shift,
+ * before and after: each hit's neighbour chunks; the hits' own chunks first, best first). The seeds weigh 1 / (rank
+ * + 1). The filter chooses the seeds; what they link to comes regardless, as neighbours do. A linked id with no row
+ * in the store is passed over. Returns how many spans, -1 (vg_error()). */
+#define VG_WALK_EXPAND 1
+#define VG_WALK_PPR    2
+#define VG_WALK_BOTH   3
+typedef struct {
+    int walk;               /* default VG_WALK_EXPAND */
+    int hits;               /* the walk's best nodes the context is built from, 1 to 256 (default 16) */
+    vg_expand_opts expand;  /* default vg_expand_defaults */
+    vg_ppr_opts ppr;        /* default vg_ppr_defaults */
+} vg_ctx_opts;
+VI_API void vg_ctx_defaults(vg_ctx_opts *o);
+VI_API int vg_context(vg_graph *g, vi_db *db, const float *query, const char *text, int tlen, const vi_ctx_opts *co,
+                      const vg_ctx_opts *go, vi_ctx_span *spans, int max_spans, char *buf, int cap, int *used);
+
 #endif

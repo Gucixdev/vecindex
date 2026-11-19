@@ -138,7 +138,8 @@ static int store_run_cmp_(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
-/* A context for a model: the k hits of store_search_mmr (flt: of the rows that pass it; the neighbours are the hits'
+/* A context for a model: the k hits of store_search_mmr - or, given non-0, the caller's k hits given[0, k) with
+ * their scores gsc (0: 1 / (rank + 1)), in that order, repeats once (flt: of the rows that pass it; the neighbours are the hits'
  * own document's chunks, filter or not); around each hit its window of before / after chunks
  * (store_win_; below 0: the whole document, at most VI_CTX_SIDE_MAX ids a side); windows of one document that
  * overlap or touch merged. Then the budget, cap bytes of buf: every hit's own chunk first, best hit first; then the
@@ -146,8 +147,8 @@ static int store_run_cmp_(const void *a, const void *b)
  * already in, so a span is always unbroken text. Spans (at most maxsp, best hit first) get their chunks' texts as
  * stored, one after another, nothing added between them. *used: bytes written. Returns how many spans, -1 out of
  * memory. */
-i32 store_context(RagStore *s, const f32 *q, const char *text, i32 tlen, const StoreFlt *flt, i32 k, i32 shift, i32 before, i32 after,
-                  f32 lambda, f32 dup, StoreSpan *sp, i32 maxsp, char *buf, i32 cap, i32 *used)
+i32 store_context(RagStore *s, const f32 *q, const char *text, i32 tlen, const StoreFlt *flt, const i64 *given, const f32 *gsc,
+                  i32 k, i32 shift, i32 before, i32 after, f32 lambda, f32 dup, StoreSpan *sp, i32 maxsp, char *buf, i32 cap, i32 *used)
 {
     i64 *hid, *cl;
     f32 *hsc;
@@ -172,7 +173,13 @@ i32 store_context(RagStore *s, const f32 *q, const char *text, i32 tlen, const S
     w = (StoreWin *)scr_take_(&a, (size_t)k * sizeof(StoreWin));
     ord = (i32 *)scr_take_(&a, (size_t)k * sizeof(i32));
     run = (StoreRun *)scr_take_(&a, (size_t)k * sizeof(StoreRun));
-    if ((m = store_search_mmr(s, q, text, tlen, flt, k, lambda, dup, hid, hsc)) <= 0) { scr_put_(&a); return m; }
+    if (given) {                                                 /* the caller's hits, in its order, each once */
+        for (i = m = 0; i < k; ++i) {
+            for (j = 0; j < m && hid[j] != given[i]; ++j) {}
+            if (j < m) continue;
+            hid[m] = given[i]; hsc[m] = gsc ? gsc[i] : 1.0f / (f32)(i + 1); ++m;
+        }
+    } else if ((m = store_search_mmr(s, q, text, tlen, flt, k, lambda, dup, hid, hsc)) <= 0) { scr_put_(&a); return m; }
     for (i = 0; i < m; ++i) {
         h[i].id = hid[i]; h[i].score = hsc[i]; h[i].rank = i; h[i].pos = -1;
         store_win_(hid[i], shift, before, after, &h[i].lo, &h[i].hi);

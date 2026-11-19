@@ -667,3 +667,69 @@ VI_API int vg_ppr(vg_graph *g, const vi_i64 *seeds, const float *seed_w, int ns,
     gen_free_(&a);
     return out;
 }
+
+/* ---- a context through the graph: the store's public API only ---- */
+
+#define VG_CTX_MAX 256              /* as VI_CTX_HITS_MAX */
+
+VI_API void vg_ctx_defaults(vg_ctx_opts *o)
+{
+    if (!o) return;
+    o->walk = VG_WALK_EXPAND; o->hits = 16;
+    vg_expand_defaults(&o->expand);
+    vg_ppr_defaults(&o->ppr);
+}
+
+typedef struct { i64 id; f32 sc; } VgFz;
+static int vg_fz_cmp_(const void *a, const void *b)
+{
+    const VgFz *x = (const VgFz *)a, *y = (const VgFz *)b;
+    if (x->sc != y->sc) return x->sc > y->sc ? -1 : 1;
+    return x->id < y->id ? -1 : x->id > y->id;
+}
+
+VI_API int vg_context(vg_graph *g, vi_db *db, const float *query, const char *text, int tlen, const vi_ctx_opts *co,
+                      const vg_ctx_opts *go, vi_ctx_span *spans, int max_spans, char *buf, int cap, int *used)
+{
+    vi_ctx_opts c;
+    vg_ctx_opts o;
+    vi_i64 sid[VG_CTX_MAX], wid[VG_CTX_MAX], pid[VG_CTX_MAX];
+    float ssc[VG_CTX_MAX], wsc[VG_CTX_MAX], psc[VG_CTX_MAX];
+    VgFz fz[2 * VG_CTX_MAX];
+    i32 ns, nw = 0, np = 0, i, j, nf, r;
+    if (used) *used = 0;
+    if (!g || !db) return vg_fail_("the graph or the store is NULL", (const char *)0);
+    vi_ctx_defaults(&c); if (co) c = *co;
+    vg_ctx_defaults(&o); if (go) o = *go;
+    if (c.k < 1 || c.k > VG_CTX_MAX) return vg_fail_("co's k (the seeds) is 1 to 256", (const char *)0);
+    if (o.hits < 1 || o.hits > VG_CTX_MAX) return vg_fail_("hits is 1 to 256", (const char *)0);
+    if (o.walk < VG_WALK_EXPAND || o.walk > VG_WALK_BOTH) return vg_fail_("walk is VG_WALK_EXPAND, VG_WALK_PPR or VG_WALK_BOTH", (const char *)0);
+    if ((ns = vi_search_mmr(db, query, text, tlen, c.filter, c.k, c.lambda, c.dup, sid, ssc)) < 0) return vg_fail_("the search: ", vi_error());
+    if (ns == 0) return 0;
+    for (i = 0; i < ns; ++i) ssc[i] = 1.0f / (float)(i + 1);     /* any metric's scores as weights: by rank */
+    if (o.walk & VG_WALK_EXPAND) {
+        if (o.expand.max_nodes < o.hits) o.expand.max_nodes = o.hits;
+        if ((nw = vg_expand(g, sid, ssc, ns, &o.expand, wid, wsc, (int *)0, VG_CTX_MAX)) < 0) return -1;
+    }
+    if (o.walk & VG_WALK_PPR) {
+        if (o.ppr.max_nodes < o.hits) o.ppr.max_nodes = o.hits;
+        if ((np = vg_ppr(g, sid, ssc, ns, &o.ppr, pid, psc, VG_CTX_MAX)) < 0) return -1;
+    }
+    if (o.walk == VG_WALK_BOTH) {                                /* reciprocal rank fusion of the two lists */
+        for (i = nf = 0; i < nw; ++i) { fz[nf].id = (i64)wid[i]; fz[nf].sc = 1.0f / (60.0f + (float)i); ++nf; }
+        for (i = 0; i < np; ++i) {
+            for (j = 0; j < nf && fz[j].id != (i64)pid[i]; ++j) {}
+            if (j == nf) { fz[nf].id = (i64)pid[i]; fz[nf].sc = 0.0f; ++nf; }
+            fz[j].sc += 1.0f / (60.0f + (float)i);
+        }
+        qsort(fz, (size_t)nf, sizeof(VgFz), vg_fz_cmp_);
+        for (i = 0; i < nf && i < VG_CTX_MAX; ++i) { wid[i] = (vi_i64)fz[i].id; wsc[i] = fz[i].sc; }
+        nw = nf < VG_CTX_MAX ? nf : VG_CTX_MAX;
+    } else if (o.walk == VG_WALK_PPR) {
+        for (i = 0; i < np; ++i) { wid[i] = pid[i]; wsc[i] = psc[i]; }
+        nw = np;
+    }
+    if (nw > o.hits) nw = o.hits;
+    r = vi_context_ids(db, wid, wsc, nw, &c, spans, max_spans, buf, cap, used);
+    return r < 0 ? vg_fail_("the context: ", vi_error()) : r;
+}

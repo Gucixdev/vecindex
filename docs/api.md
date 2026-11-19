@@ -297,6 +297,22 @@ with a CRC-32C: a torn or damaged end is cut at the last whole record, `vg_sync`
 rewrites it with the live links only (a temporary file, fsync, rename). Memory from the OS's pages, no recursion.
 When a row is deleted from the store, `vg_drop` its id.
 
+`vg_context` does it in one call: the store's diverse hits seed a walk (`VG_WALK_EXPAND`, `VG_WALK_PPR`, or
+`VG_WALK_BOTH`, the two lists fused by reciprocal rank), and its best nodes go to `vi_context_ids` - the context
+from hits the caller already has, which a reranker can use as well - with each hit's neighbour chunks and the same
+byte budget, hits first. `bench/graph_ablation.c` fills one budget four ways on synthetic data built so that an
+answer needs one hop (20,000 chunks, 500 questions, 256 bytes):
+
+| variant | both pieces of evidence | p50 | p95 |
+|---|---|---|---|
+| A the store alone (`vi_context`) | 0% | 99 us | 134 us |
+| B + expansion | 100% | 91 us | 132 us |
+| C + personalized PageRank | 100% | 480 us | 532 us |
+| D + both, fused | 100% | 502 us | 557 us |
+
+That is what the walk costs and that the budget takes the hit's link before weaker hits; it is not a measure of
+retrieval quality, which depends on the links a caller makes of its own documents.
+
 ### Hyperbolic embeddings
 
 `vi_open(path, dim, VI_LORENTZ)` makes a store for points of the Lorentz model of hyperbolic space, the geometry of

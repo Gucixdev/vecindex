@@ -172,6 +172,41 @@ int main(void)
               "vi_search's hit, then vg_expand: the chunk it references, its text from the store");
         vg_close(g); vi_close(db); }
 
+    /* vg_context: the hits, then what they link to, into one budget */
+    {   vi_db *db = vi_open((const char *)0, 8, 0);
+        vi_ctx_opts co;
+        vg_ctx_opts go;
+        vi_ctx_span sp[8];
+        float v[8];
+        char b[256];
+        int used, d, c, mode, okm = 1;
+        g = vg_open((const char *)0);
+        for (d = 1; d <= 3; ++d)
+            for (c = 0; c < 4; ++c) {
+                char t[16];
+                memset(v, 0, sizeof v); v[2 * (d - 1)] = 1.0f; v[2 * (d - 1) + 1] = 0.1f * (float)c;
+                sprintf(t, "d%dc%d;", d, c);
+                vi_add_text(db, ((vi_i64)d << 20) | c, v, t, -1);
+            }
+        vg_link(g, ((vi_i64)1 << 20) | 0, ((vi_i64)3 << 20) | 2, 1, 1.0f);   /* d1c0 references d3c2, far in the vectors */
+        memset(v, 0, sizeof v); v[0] = 1.0f;
+        vi_ctx_defaults(&co); co.k = 1; co.before = co.after = 0;
+        n = vi_context(db, v, (const char *)0, 0, &co, sp, 8, b, (int)sizeof b, &used);
+        check(n == 1 && used == 5 && memcmp(b, "d1c0;", 5) == 0, "vi_context alone: the hit, not what it references");
+        for (mode = VG_WALK_EXPAND; mode <= VG_WALK_BOTH; ++mode) {
+            vg_ctx_defaults(&go); go.walk = mode;
+            n = vg_context(g, db, v, (const char *)0, 0, &co, &go, sp, 8, b, (int)sizeof b, &used);
+            okm &= n == 2 && used == 10 && memcmp(b, "d1c0;d3c2;", 10) == 0;
+        }
+        check(okm, "vg_context (expand, PPR, both): the hit, then the chunk it references, in that order");
+        vg_ctx_defaults(&go);
+        n = vg_context(g, db, v, (const char *)0, 0, &co, &go, sp, 8, b, 7, &used);
+        check(n == 1 && used == 5, "vg_context in 7 bytes: the hit's own chunk first, the linked one does not fit");
+        co.before = co.after = 1;
+        n = vg_context(g, db, v, (const char *)0, 0, &co, &go, sp, 8, b, (int)sizeof b, &used);
+        check(n == 2 && sp[1].chunks == 3 && sp[1].first == (((vi_i64)3 << 20) | 1), "and the linked chunk's own neighbours with it");
+        vg_close(g); vi_close(db); }
+
     printf("graph: %s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
 }
