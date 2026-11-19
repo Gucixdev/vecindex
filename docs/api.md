@@ -69,6 +69,9 @@ L2 store's vectors as they came. A file keeps the metric it was made with; openi
 | `vi_batch_begin(db)`, `vi_batch_add(b, id, vec)`, `vi_batch_add_text(b, id, vec, text, len)`, `vi_batch_delete(b, id)`, `vi_batch_delete_range(b, lo, hi)`, `vi_batch_set_num(b, id, num)` | a write batch: its changes are copied in as they are added and wait |
 | `vi_batch_commit(b, sync)`, `vi_batch_abort(b)` | applies the batch as one change - searches see none of it before and all of it after, and a crash leaves all or none of it (one journal record with a CRC-32C) - and frees it; `sync` 1: on the disk before it returns. The number of changes, -1 refused with nothing applied (a NaN, a bad text, no memory), -2 applied but the fsync failed |
 | `vi_search_hybrid(db, q, text, tlen, k, ids, scores)` | the vector and the words (BM25 over the texts), fused by rank; either side may be left out |
+| `vi_search_mmr(db, q, text, tlen, k, lambda, dup, ids, scores)` | diverse hits (maximal marginal relevance) from 4 k candidates of the vector, the words or both: each hit chosen for `lambda` x relevance - (1 - `lambda`) x its highest cosine to a hit already chosen; `dup` > 0 drops a candidate that close to a chosen one as a near-duplicate |
+| `vi_neighbors(db, id, shift, before, after, ids, max)` | the chunks around a hit in its document (`id >> shift`): `before` and `after` a side, never past the document's edges; -1: to the edge |
+| `vi_context(db, q, text, tlen, opts, spans, max_spans, buf, cap, &used)`, `vi_ctx_defaults(&opts)` | a context for a model to a byte budget: MMR hits, their neighbours, overlapping windows of one document merged into one span of unbroken text; the hits' own chunks first, then rings of neighbours while they fit |
 | `vi_set_tag`, `vi_get_tag` | a 64-bit tag per row |
 | `vi_set_num(db, id, num)`, `vi_get_num(db, id, &num)`, `vi_search_range(db, q, k, lo, hi, ids, scores)` | a 64-bit number per row (0 until set), and a search over the rows whose number is in `[lo, hi]` |
 | `vi_search_where(db, q, k, all, any, none, lo, hi, ids, scores)` | labels (as `vi_search_labeled`) and a number range in one search, both tested in the scan |
@@ -268,6 +271,32 @@ The query vector is closest to chunk 1; the word "oxidised" picks chunk 2. `vi_s
 fuses them by rank (reciprocal rank fusion with weights measured on Wikipedia: words 1.5, vector 0.6, plus up to 2 for a
 side whose best hit stands well clear of its runner-up), so an exact name, a number or a rare word is found where the
 embedding blurs it. Pass `NULL` for the words to search by the vector alone, or for the vector to search by words.
+
+### The context in one call
+
+`vi_context` does what a RAG pipeline does with the hits before a model reads them, inside the store: the k best
+hits, diverse and without near-duplicates (`vi_search_mmr`), the chunks around each (`vi_neighbors`), the windows of
+one document that overlap or touch merged into one span, and all of it cut to a byte budget - every hit's own chunk
+first, best hit first, then the neighbours one ring at a time, best hit first, each only next to what is already in,
+so a span is always unbroken text. The working memory comes from the scratch pool, no malloc; `VI_MMR_POOL`,
+`VI_CTX_HITS_MAX` and `VI_CTX_SIDE_MAX` in `src/config.h` bound it.
+
+```c
+vi_ctx_opts o;
+vi_ctx_span sp[8];
+char buf[16384];
+int n, i, used;
+vi_ctx_defaults(&o);                  /* k 8, shift 20, one chunk a side, lambda 0.7, dup 0.97 */
+o.before = 2; o.after = 2;
+n = vi_context(db, q, "oxidised", -1, &o, sp, 8, buf, (int)sizeof buf, &used);
+for (i = 0; i < n; ++i)               /* best span first: hand them to the model in this order */
+    printf("[doc %lld, chunks %lld-%lld] %.*s\n", (long long)sp[i].doc, (long long)(sp[i].first & 0xfffff),
+           (long long)(sp[i].last & 0xfffff), sp[i].len, buf + sp[i].off);
+```
+
+The budget is in bytes, not tokens: the tokenizer is the model's, and the store does not pretend to know it. English
+runs about 4 bytes a token, so 4 x the tokens the model should read is a start. A span's text is its chunks' texts as
+stored, nothing added between them: keep a chunk's own separator (a newline, a space) at the end of its text.
 
 Texts are journaled with their row (one record, so a crash keeps both or neither), saved in the file and mapped from
 it on open, so nothing is read until it is asked for; texts added since the last save live in memory (spilled to a

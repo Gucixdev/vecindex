@@ -71,4 +71,23 @@
 #define VI_TOP_MIN 16384
 #endif
 
+/* --- RAG (store_rag.c) ------------------------------------------------------------------------------------- */
+
+/* candidates a diverse search (vi_search_mmr, vi_context) ranks for every hit it returns: MMR can only choose among
+ * what the search found, so more is more variety and more re-reading of rows (k x this x dim floats per query) */
+#ifndef VI_MMR_POOL
+#define VI_MMR_POOL 4
+#endif
+
+/* the most hits one context is built from (vi_context's k) */
+#ifndef VI_CTX_HITS_MAX
+#define VI_CTX_HITS_MAX 256
+#endif
+
+/* "the whole document" (before or after -1) reads at most this many chunk ids on each side of a hit: a bound on
+ * the working memory of one context (hits x (2 x this + 1) x 13 bytes) */
+#ifndef VI_CTX_SIDE_MAX
+#define VI_CTX_SIDE_MAX 2048
+#endif
+
 #endif

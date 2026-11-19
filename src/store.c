@@ -1800,6 +1800,7 @@ static i32 store_cnf_ok_(const RagStore *s, const StoreCnf *c, i32 row)
 #include "store_exact.c"
 
 #include "store_text.c"
+#include "store_rag.c"
 
 #include "store_label.c"
 

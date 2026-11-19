@@ -1,17 +1,23 @@
 # vecindex
 
-A vector database in C89 for approximate nearest-neighbour search: a TurboQuant-style rotated 4-bit (or 2-bit, or
-1-bit in front of the 4-bit) fast-scan with exact re-scoring, IVF clustering, bit-packed 1-8 bit quantizers and BM25
-hybrid search; cosine, inner product or Euclidean distance; string keys, labels in a hierarchy, a number a row for
-range filters and grouped search (one hit a document); and search with a proof (`vi_search_exact`: the exact k best,
-every other row ruled out by a bound proved in Lean). It runs inside a program in any language through its C API (`include/vecindex.h`, one shared or
-static library), or as `vserv`, a small epoll server (Unix and TCP sockets, a binary protocol and HTTP/1.1, TLS 1.2
-through the vendored BearSSL). Nothing beyond libc, libm and pthreads (and BearSSL for TLS).
+A vector database in C89 for RAG and LLMs: approximate nearest-neighbour search on a TurboQuant-style rotated
+fast-scan - 4-bit codes, or 2-bit, or 1-bit (alone, or as a first pass in front of the 4-bit ones: the cascade) -
+over IVF clusters, with the candidates re-scored exactly from f32 or int8 rows; BM25 hybrid search; cosine, inner
+product or Euclidean distance; string keys, labels in a hierarchy, a number a row for range filters, namespaces and
+grouped search (one hit a document); search with a proof (`vi_search_exact`: the exact k best, every other row
+ruled out by a bound proved in Lean); and what a RAG pipeline does with the hits before a model reads them: diverse
+hits without near-duplicates (MMR), the chunks around a hit, and a context built to a byte budget (`vi_context`).
 
-It is part of [holyc](https://github.com/Gucixdev/holyc): it lived there as `ragdb/`, was its own repository
-(github.com/Gucixdev/vecindex) from 2026-10-17 to 2026-11-01 and came back as `vecindex/`, history included. The note
-database and agent memory that grew on top of it are [`examples/agent_launcher`](examples/agent_launcher), which uses vecindex as a
-library.
+It runs inside a program in any language through its C API (`include/vecindex.h`, one shared or static library), or
+as `vserv`, a small epoll server (Unix and TCP sockets, a binary protocol and HTTP/1.1, TLS 1.2 through the vendored
+BearSSL). Nothing beyond libc, libm and pthreads (and BearSSL for TLS).
+
+The 1-8 bit packed quantizers (q1-q5, qmix) of the first engine are retired to `trash/`: nothing in `src/` uses
+them. What a store scans is 4, 2 or 1 bit a dimension (`vi_set_layout`), what it re-scores f32 or int8.
+
+Its home is this repository. It grew in [holyc](https://github.com/Gucixdev/holyc) as `ragdb/`, and has moved
+between the two since; the note database and agent memory that grew on top of it are
+[`examples/agent_launcher`](examples/agent_launcher), a separate program that uses vecindex as a library.
 
 ## Layout
 
@@ -20,7 +26,7 @@ See [docs/layout.md](docs/layout.md): the repository layout and the source files
 ## Build and test
 
 ```sh
-git clone https://github.com/Gucixdev/holyc && cd holyc/vecindex
+git clone https://github.com/Gucixdev/vecindex && cd vecindex
 ./run            # self-tests, sanitizer, thread and crash-safety tests, the damage battletest, the fuzzers' regression
                  # inputs, the server end to end (needs bash and gcc)
 ./run stress     # plus the churn / oracle stress tests
@@ -62,8 +68,10 @@ cc -Iinclude demo.c -L.build -lvecindex -lm -lpthread -o demo && LD_LIBRARY_PATH
 2 0.110
 ```
 
-For an LLM, each row can carry its text: `vi_add_text`, then `vi_search_hybrid` (the vector and BM25 over the texts,
-fused by rank) and `vi_range` over a document's ids to hand the model the chunks around a hit, or the whole document.
+For an LLM, each row can carry its text: `vi_add_text` with ids made as `doc << 20 | chunk`, then `vi_context` - the
+best hits, diverse and without near-duplicates, each with the chunks around it, one span of unbroken text per run of
+a document's chunks, cut to the bytes the model may read - or the parts of it on their own: `vi_search_hybrid` (the
+vector and BM25 over the texts, fused by rank), `vi_search_mmr`, `vi_neighbors`, `vi_range` (a whole document).
 `.build/vfind docs.vxi` searches those texts as you type, like fzf: a few lines of each hit, Enter opens the whole
 document, Enter again prints the choice. The same from Python (ctypes), Go (cgo) and Rust (`extern "C"`), every
 function, texts, and how durability works: [docs/api.md](docs/api.md). Inside a C program the library can also be

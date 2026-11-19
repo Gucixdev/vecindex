@@ -524,6 +524,83 @@ VI_API int vi_search_hybrid(vi_db *db, const float *query, const char *text, int
     return store_search_hybrid(db->s, query, text, vi_len_(text, tlen), (i32)k, (i64 *)ids, scores);
 }
 
+/* ---- RAG (store_rag.c) ---- */
+
+static int vi_rag_args_(vi_db *db, const float *query, const char *text, int tlen, float lambda, float dup)
+{
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (query && vi_vec_ok_(db, query, "the query")) return -1;
+    if (!query && (!text || vi_len_(text, tlen) == 0)) return vi_fail_(-1, "give the query vector, the words, or both", (const char *)0, (const char *)0);
+    if (!(lambda >= 0.0f && lambda <= 1.0f)) return vi_fail_(-1, "lambda must be 0 to 1 (1: relevance alone)", (const char *)0, (const char *)0);
+    if (!(dup >= 0.0f && dup <= 1.0f)) return vi_fail_(-1, "dup must be 0 to 1 (0: keep near-duplicates)", (const char *)0, (const char *)0);
+    return 0;
+}
+
+/* a vector alone: the internal scores as callers see them (vi_search); with words: the fused rank as it is */
+static void vi_rag_scores_(vi_db *db, const char *text, int tlen, float *sc, int n)
+{
+    if (!text || vi_len_(text, tlen) == 0) vi_cos_(db, sc, n);
+}
+
+VI_API int vi_search_mmr(vi_db *db, const float *query, const char *text, int tlen, int k, float lambda, float dup,
+                         vi_i64 *ids, float *scores)
+{
+    i32 n;
+    if (vi_rag_args_(db, query, text, tlen, lambda, dup)) return -1;
+    if (k < 1) return vi_fail_(-1, "k must be 1 or more", (const char *)0, (const char *)0);
+    if (!ids || !scores) return vi_fail_(-1, "ids and scores must hold k values each", (const char *)0, (const char *)0);
+    if ((n = store_search_mmr(db->s, query, text, vi_len_(text, tlen), (i32)k, lambda, dup, (i64 *)ids, scores)) < 0)
+        return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    vi_rag_scores_(db, text, tlen, scores, n);
+    return n;
+}
+
+VI_API int vi_neighbors(vi_db *db, vi_i64 id, int shift, int before, int after, vi_i64 *ids, int max)
+{
+    i32 r;
+    if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);
+    if (shift < 0 || shift > 63) return vi_fail_(-1, "shift must be 0 to 63", (const char *)0, (const char *)0);
+    if (!ids || max < 1) return vi_fail_(-1, "ids is NULL or max below 1", (const char *)0, (const char *)0);
+    if (store_get_text(db->s, (i64)id, (char *)0, 0) < 0) return vi_norow_(db, id);
+    r = store_neighbors(db->s, (i64)id, (i32)shift, (i32)before, (i32)after, (i64 *)ids, (i32)max);
+    return r >= 0 ? r : vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+}
+
+VI_API void vi_ctx_defaults(vi_ctx_opts *o)
+{
+    if (!o) return;
+    o->k = 8; o->shift = 20; o->before = 1; o->after = 1; o->lambda = 0.7f; o->dup = 0.97f;
+}
+
+VI_API int vi_context(vi_db *db, const float *query, const char *text, int tlen, const vi_ctx_opts *o,
+                      vi_ctx_span *spans, int max_spans, char *buf, int cap, int *used)
+{
+    vi_ctx_opts d;
+    StoreSpan sp[VI_CTX_HITS_MAX];
+    i32 n, i, u = 0;
+    if (used) *used = 0;
+    vi_ctx_defaults(&d);
+    if (o) d = *o;
+    if (vi_rag_args_(db, query, text, tlen, d.lambda, d.dup)) return -1;
+    if (d.k < 1 || d.k > VI_CTX_HITS_MAX) return vi_fail_(-1, "k must be 1 to 256 (VI_CTX_HITS_MAX)", (const char *)0, (const char *)0);
+    if (d.shift < 0 || d.shift > 63) return vi_fail_(-1, "shift must be 0 to 63", (const char *)0, (const char *)0);
+    if (d.before < -1 || d.after < -1) return vi_fail_(-1, "before and after are 0 or more, or -1 (the whole document)", (const char *)0, (const char *)0);
+    if (!spans || max_spans < 1) return vi_fail_(-1, "spans is NULL or max_spans below 1", (const char *)0, (const char *)0);
+    if (cap < 0 || (cap > 0 && !buf)) return vi_fail_(-1, "buf is NULL or cap below 0", (const char *)0, (const char *)0);
+    if (max_spans > VI_CTX_HITS_MAX) max_spans = VI_CTX_HITS_MAX;   /* a span holds a hit: never more than k */
+    n = store_context(db->s, query, text, vi_len_(text, tlen), (i32)d.k, (i32)d.shift, (i32)d.before, (i32)d.after,
+                      d.lambda, d.dup, sp, (i32)max_spans, buf, (i32)cap, &u);
+    if (n < 0) return vi_fail_(-1, "out of memory", (const char *)0, (const char *)0);
+    for (i = 0; i < n; ++i) {
+        spans[i].doc = (vi_i64)sp[i].doc; spans[i].first = (vi_i64)sp[i].first; spans[i].last = (vi_i64)sp[i].last;
+        spans[i].hit = (vi_i64)sp[i].hit; spans[i].score = sp[i].score; spans[i].chunks = (int)sp[i].chunks;
+        spans[i].off = (int)sp[i].off; spans[i].len = (int)sp[i].len;
+    }
+    if (!text || vi_len_(text, tlen) == 0) for (i = 0; i < n; ++i) spans[i].score = store_score_out(db->s, spans[i].score);
+    if (used) *used = (int)u;
+    return (int)n;
+}
+
 VI_API int vi_set_tag(vi_db *db, vi_i64 id, vi_i64 tag)
 {
     if (!db) return vi_fail_(-1, VI_NODB, (const char *)0, (const char *)0);

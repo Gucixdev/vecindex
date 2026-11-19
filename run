@@ -170,6 +170,9 @@ fi
     && LD_LIBRARY_PATH="$OUT" "./$OUT/api_test_so" 2>&1 | tee "$OUT/log_capi.txt" && rec "C API shared" ok "$(notes "C API")" || { echo "  ^ C API (shared) FAILED"; fail=1; rec "C API shared" FAIL; }
 "$CC" "${CFLAGS[@]}" -Iinclude tests/api_test.c "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/api_test_a" \
     && "./$OUT/api_test_a" > /dev/null && rec "C API static" ok "same checks, static lib" || { echo "  ^ C API (static) FAILED"; fail=1; rec "C API static" FAIL; }
+"$CC" "${CFLAGS[@]}" -Iinclude tests/rag_test.c "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/rag_test" \
+    && "./$OUT/rag_test" 2>&1 | tee "$OUT/log_rag.txt" && rec "RAG" ok "$(okn "$OUT/log_rag.txt") checks: neighbours, MMR, context to a budget" \
+    || { echo "  ^ RAG FAILED"; fail=1; rec "RAG" FAIL; }
 echo
 
 # ---- compatibility: every release's files open with every value; a newer build's are refused; the API of every

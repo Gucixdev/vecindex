@@ -238,6 +238,59 @@ VI_API int vi_search_hybrid(vi_db *db, const float *query, const char *text, int
  * a shift outside 0-63). */
 VI_API int vi_search_grouped(vi_db *db, const float *query, int k, int shift, vi_i64 *ids, float *scores);
 
+/* ---- RAG: what happens to the hits before a model reads them, done in the store ----
+ * Ids as above: doc << shift | chunk (shift 20: a million chunks a document), so a document is an id range. */
+
+/* Diverse hits (maximal marginal relevance). From the k x 4 best candidates of the vector query and the words, as
+ * vi_search_hybrid takes them (either may be NULL; words: fused by rank), k are chosen one at a time, each for
+ * lambda x its relevance - (1 - lambda) x its highest cosine to a hit already chosen: lambda 1 is relevance alone,
+ * 0.5 to 0.7 the usual trade, 0 variety alone. dup in (0, 1]: a candidate whose cosine to a chosen hit is dup or more
+ * is dropped as a near-duplicate (a chunk stored twice, a page quoted in two documents; 0.97 is a good start); 0
+ * keeps them. lambda 1 with dup 0.97 is vi_search without the duplicates. Scores: as vi_search for a vector alone,
+ * the fused rank of vi_search_hybrid with words. Returns how many (fewer than k when duplicates went), or -1 (as
+ * vi_search, or lambda or dup outside [0, 1]). */
+VI_API int vi_search_mmr(vi_db *db, const float *query, const char *text, int tlen, int k, float lambda, float dup,
+                         vi_i64 *ids, float *scores);
+
+/* The chunks around id in its document (the ids sharing id >> shift): those from id - before to id + after that have
+ * a row, ascending, at most max, never past the document's edges (before or after -1: to that edge). id is among
+ * them. Returns how many, or -1 (no row with id, shift outside 0-63, ids NULL or max below 1). */
+VI_API int vi_neighbors(vi_db *db, vi_i64 id, int shift, int before, int after, vi_i64 *ids, int max);
+
+/* A context for a model, built to a byte budget, in one call: the k hits of vi_search_mmr; around each hit before
+ * and after chunks of its document (small-to-big: search small chunks, hand the model bigger text; -1 a side: the
+ * whole document, at most 2048 chunk ids that side, VI_CTX_SIDE_MAX); windows of one document that overlap or touch
+ * become one span. Then cap bytes of buf: every hit's own chunk first, best hit first, then the neighbours one ring
+ * at a time around every hit, best hit first, while they fit - and only next to what is in, so a span is always
+ * unbroken text. A span's text is its chunks' texts as stored, one after another, nothing added between them (keep a
+ * chunk's own separator in its text). Bytes, not tokens: the tokenizer is the model's; English runs about 4 bytes a
+ * token, so a budget of 4 x the model's tokens is a start. */
+typedef struct {
+    int k;                  /* hits to build from: 1 to 256 (default 8) */
+    int shift;              /* the document of an id: id >> shift, 0 to 63 (default 20; 0: no documents, no neighbours) */
+    int before, after;      /* neighbour chunks a side of each hit (default 1 and 1; -1: to the document's edge) */
+    float lambda;           /* as vi_search_mmr (default 0.7) */
+    float dup;              /* as vi_search_mmr (default 0.97) */
+} vi_ctx_opts;
+
+typedef struct {
+    vi_i64 doc;             /* id >> shift */
+    vi_i64 first, last;     /* its chunks: every id from first to last that has a row, in order */
+    vi_i64 hit;             /* the best hit in it */
+    float score;            /* that hit's score, as vi_search_mmr gives it */
+    int chunks;             /* how many chunks */
+    int off, len;           /* its text: buf[off, off + len) */
+} vi_ctx_span;
+
+/* o's defaults (the values above) */
+VI_API void vi_ctx_defaults(vi_ctx_opts *o);
+
+/* The context: query and text as vi_search_mmr (either may be NULL), o NULL for the defaults. spans gets up to
+ * max_spans of them, best hit first; buf the texts (cap bytes, no 0 added); *used (may be NULL) the bytes written.
+ * Returns how many spans (0: nothing found, or not even the best hit's chunk fits cap), or -1 (vi_error()). */
+VI_API int vi_context(vi_db *db, const float *query, const char *text, int tlen, const vi_ctx_opts *o,
+                      vi_ctx_span *spans, int max_spans, char *buf, int cap, int *used);
+
 /* nq queries (queries: nq x dim) on up to threads threads (0: every core); ids and scores (cosines) get k slots a
  * query, a missing hit has id -1 and score -1. 0, or -1 when an argument or a query is wrong. */
 VI_API int vi_search_batch(vi_db *db, const float *queries, int nq, int k, vi_i64 *ids, float *scores, int threads);

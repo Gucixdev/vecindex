@@ -3,9 +3,11 @@
 The owner's list and where each item stands (2026-11-14). "Not run" means written and compiled, tests and benchmarks
 still to run on his machine.
 
-Scope: vecindex is the vector database alone, with no dependencies, built as one project. The note database, agent
-memory (mem.c and its rule engine) and the cross-encoder re-rank moved to `examples/agent_launcher/` in this repo,
-a separate project that uses vecindex as a library; vecindex itself is back in holyc as `vecindex/`.
+Scope: vecindex is a database for RAG and LLMs, with no dependencies, built as one project, in a repository of its
+own (github.com/Gucixdev/vecindex) again. What a RAG pipeline does with the hits before a model reads them is part of
+it (2026-11-19: `store_rag.c`, below); the note database, agent memory (mem.c and its rule engine) and the
+cross-encoder re-rank stay in `examples/agent_launcher/`, a separate program that uses vecindex as a library.
+Embedding models, tokenizers and answer generation stay outside.
 
 Done and tested: quantization with an exact re-rank (4, 2 and 1-bit codes), SIMD (AVX-512, AVX2, NEON, a scalar path
 elsewhere), hybrid BM25 search, concurrent updates (one rwlock, live indexing), background snapshots, a line protocol beside binary and HTTP, system logs instead of users and roles, any language through
@@ -59,6 +61,14 @@ Xeon unless a line says otherwise):
 - no malloc on any search path (`src/scratch.h`) and none in the scan index (`src/mem.h`: arenas over the OS's
   pages; `tq.c`, `tq_add.c`, `tq_split.c`, `tq_top.c`)
 
+Done since 2026-11-19 (built and its own test run here, `tests/rag_test.c` under ASan and UBSan too; the rest of
+`./run` not run):
+- RAG in the store (`src/store_rag.c`): `vi_search_mmr` (diverse hits by maximal marginal relevance, near-duplicates
+  dropped by cosine), `vi_neighbors` (the chunks around a hit, never past its document), `vi_context` (MMR hits, their
+  neighbours, one span a run of a document's chunks, cut to a byte budget with the hits' own chunks first). No
+  malloc: the scratch pool. Not in vserv or the bindings yet
+- the three branches (main, merged, needmerge) one: main
+
 Open, in the order they are planned:
 1. **The rest of the code off malloc** (158 call sites): the store (`store.c`, `store_disk.c`, `store_exact.c`,
    `store_tune.c`, `store_sum.c`), then the text index and the id table (`lex.c`, `hdict.c`), then the server. A
@@ -91,7 +101,10 @@ Open, in the order they are planned:
 14. **The live visualisation from the real engine** (WASM)
 15. **Ternary codes**, measured before any code: as a first sieve for row-to-centroid comparisons at build and
     split time (`trash/src/q3.c` has the packing). Not for the scan's codes or the rows: Config.lean shows why
-16. Housekeeping: `Codes.lean` still proves the digit tables of the retired q1-q5; `src/fine_grained.h` (a thread
+16. **RAG, next**: `vi_context` and `vi_search_mmr` in vserv (line, binary, HTTP) and the Python/Rust/JS bindings;
+    MMR over the 1-bit or 4-bit codes instead of the f32 rows when the rows are cold (k x 4 x dim floats read a
+    query today); a dedup of exact text copies by their check without the vectors
+17. Housekeeping: `Codes.lean` still proves the digit tables of the retired q1-q5; `src/fine_grained.h` (a thread
     pool) has no user left in `src/`; `src/arena_alloc.h` holds only the store's own struct (`store_new`) and
     should give way to `mem.h`
 
