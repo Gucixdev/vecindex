@@ -87,6 +87,7 @@
 #include "print.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -290,7 +291,9 @@ typedef struct {
     SCol     vsc;           /* int8 rows only: the f32 scale of each row */
     SCol     rck;           /* a 32-bit check of each row (its vector, id and tag), tested whenever a search uses it */
     SCol     nrm;           /* dot and L2 stores only: each row's length before it was normalised */
-    i32      metric;        /* 0 cosine, 1 inner product, 2 L2 distance (store_set_metric; saved in the file) */
+    i32      metric;        /* 0 cosine, 1 inner product, 2 L2 distance, 3 hyperbolic (Lorentz model: a row is kept as
+                             * its tangent vector at the origin, direction and radius - store_lor_in_) (store_set_metric;
+                             * saved in the file) */
     char     lab_name[STORE_LABELS][STORE_LABEL_NAME];   /* labels: the name of each tag bit ("": free) */
     u64      lab_par[STORE_LABELS];   /* and the bits of its parents */
     i32      nlab;          /* labels in use */
@@ -1308,6 +1311,55 @@ static i32 store_row_bad_(RagStore *s, i32 r)
     return !healed;
 }
 
+/* ---- the hyperbolic metric (3): points of the Lorentz model kept as tangent vectors at the origin ----
+ * A point x (x0 > 0, x0^2 > |xs|^2: the upper sheet; any curvature, taken as its ray's point on the unit hyperboloid)
+ * is kept as r u: u = xs / |xs| its direction, r = asinh |xs| its distance from the origin (x0 = cosh r, xs = sinh r u),
+ * coordinate 0 left 0. The index then finds candidates by direction - and in hyperbolic space near points must share
+ * one, the more so the farther out - and the exact score is a line in the cosine c of the directions:
+ *     cosh d - 1 = 2 sinh^2((rq - rx) / 2) + sinh rq sinh rx (1 - c)
+ * every term >= 0, so close points cost no cancellation of large numbers. The score is minus that (bigger is better);
+ * callers see d = acosh(1 + A). */
+static void store_lor_in_(f32 *v, i32 dim)
+{
+    f64 t = v[0], sp = 0.0, n, r, k;
+    i32 i;
+    for (i = 1; i < dim; ++i) sp += (f64)v[i] * v[i];
+    k = t * t - sp;
+    k = k > 0.0 && t > 0.0 ? 1.0 / sqrt(k) : 0.0;                /* onto the unit hyperboloid (refused upstream if not on a sheet) */
+    n = sqrt(sp) * k;                                            /* |xs| there = sinh r */
+    r = log(n + sqrt(n * n + 1.0));                              /* asinh: exact near 0 too */
+    v[0] = 0.0f;
+    if (n > 0.0) for (i = 1; i < dim; ++i) v[i] = (f32)((f64)v[i] * k / n * r);
+    if (!(n > 0.0) || !(r > 1e-30)) { for (i = 1; i < dim; ++i) v[i] = 0.0f; if (dim > 1) v[1] = 1e-30f; }   /* the origin: any direction */
+}
+static void store_lor_out_(f32 *v, i32 dim)                      /* r u back to (cosh r, sinh r u) */
+{
+    f64 r = 0.0, e, sh;
+    i32 i;
+    for (i = 1; i < dim; ++i) r += (f64)v[i] * v[i];
+    r = sqrt(r);
+    e = exp(r); sh = 0.5 * (e - 1.0 / e);
+    v[0] = (f32)(0.5 * (e + 1.0 / e));
+    if (r > 0.0) for (i = 1; i < dim; ++i) v[i] = (f32)((f64)v[i] / r * sh);
+}
+/* the score as a * c + b in the cosine c of the directions, for radii rq and rx: a = sinh rq sinh rx >= 0 */
+static void store_lor_line_(f32 rq, f32 rx, f64 *a, f64 *b)
+{
+    f64 eq = exp((f64)rq), ex = exp((f64)rx), h = 0.5 * ((f64)rq - (f64)rx), eh = exp(h), sh = 0.5 * (eh - 1.0 / eh);
+    *a = 0.25 * (eq - 1.0 / eq) * (ex - 1.0 / ex);
+    *b = -(2.0 * sh * sh + *a);
+}
+/* a query as the rows are kept: into qn (dim), its unit direction; returns its length (its radius, hyperbolic) */
+static f32 store_query_prep_(const RagStore *s, const f32 *q, f32 *qn)
+{
+    f32 l;
+    if (qn != q) memcpy(qn, q, (size_t)s->dim * sizeof(f32));
+    if (s->metric == 3) store_lor_in_(qn, s->dim);
+    l = (f32)eng_sqrt_(eng_ssq_(qn, s->dim));
+    store_normalise_(qn, s->dim);
+    return l;
+}
+
 /* The score a search ranks by, bigger is better: cosine stores 2 cos - 2 (-|q - v|^2 of the unit vectors), dot
  * stores the inner product of the vectors as they came, L2 stores minus their squared distance. qn: the unit query,
  * qlen its length before. */
@@ -1317,6 +1369,7 @@ static f32 store_score_(const RagStore *s, const f32 *qn, f32 qlen, i32 r)
     if (!s->metric) return 2.0f * c - 2.0f;
     vl = STORE_NRM(s, r);
     if (s->metric == 1) return qlen * vl * c;
+    if (s->metric == 3) { f64 a, b; store_lor_line_(qlen, vl, &a, &b); return (f32)(a * c + b); }
     return -(qlen * qlen + vl * vl - 2.0f * qlen * vl * c);
 }
 
@@ -1325,15 +1378,17 @@ f32 store_score_out(const RagStore *s, f32 x)
 {
     if (!s->metric) return 1.0f + 0.5f * x;
     if (s->metric == 1) return x;
+    if (s->metric == 3) { f64 A = x < 0.0f ? -(f64)x : 0.0; return (f32)log(1.0 + A + sqrt(A * (A + 2.0))); }   /* acosh(1 + A) */
     return x < 0.0f ? (f32)eng_sqrt_((f64)-x) : 0.0f;
 }
 
-/* the metric of an empty store: 0 cosine, 1 inner product, 2 L2. 0, or -1 when it has rows or m is not one of these */
+/* the metric of an empty store: 0 cosine, 1 inner product, 2 L2, 3 hyperbolic (Lorentz). 0, or -1 when it has rows or m
+ * is not one of these */
 i32 store_set_metric(RagStore *s, i32 m)
 {
     i32 r = 0;
     pthread_rwlock_wrlock(&s->lock);
-    if (m < 0 || m > 2 || s->count > 0 || s->vec.nchunk > 0) r = -1; else s->metric = m;
+    if (m < 0 || m > 3 || s->count > 0 || s->vec.nchunk > 0) r = -1; else s->metric = m;
     pthread_rwlock_unlock(&s->lock);
     return r;
 }
@@ -1391,6 +1446,7 @@ static void store_append_locked_(RagStore *s, const f32 *vec, i64 doc_id, i64 me
     f32 len = 0.0f;
     i32 d;
     memcpy(v, vec, (size_t)s->dim * sizeof(f32));
+    if (s->metric == 3) store_lor_in_(v, s->dim);                /* the point as its tangent vector */
     if (s->metric) len = (f32)eng_sqrt_(eng_ssq_(v, s->dim));          /* dot and L2 rank by the length too */
     store_normalise_(v, s->dim);
     store_put_row_(s, r, v);
@@ -1403,6 +1459,7 @@ static void store_append_locked_(RagStore *s, const f32 *vec, i64 doc_id, i64 me
     for (d = 0; d < s->nfld; ++d) STORE_FLD(s, d, r) = 0;
     STORE_RCK(s, r) = store_rck_row_(s, r);
     if (s->metric) for (d = 0; d < s->dim; ++d) v[d] *= len;     /* the journal gets the row as it came */
+    if (s->metric == 3) store_lor_out_(v, s->dim);               /* (a hyperbolic one as its point of the unit hyperboloid) */
     s->dead[r >> 6] &= ~((u64)1 << (r & 63));
     store_note_row_(s, r);
     s->live += 1;
@@ -1613,6 +1670,7 @@ i32 store_get_vec(RagStore *s, i64 doc_id, f32 *out)
     if (r >= 0 && store_row_bad_(s, r)) r = -1;                  /* damaged: not served */
     if (r >= 0) { const f32 *v = store_row_(s, r, out); if (v != out) memcpy(out, v, (size_t)s->dim * sizeof(f32)); }
     if (r >= 0 && s->metric) { i32 d; f32 l = STORE_NRM(s, r); for (d = 0; d < s->dim; ++d) out[d] *= l; }   /* as it came */
+    if (r >= 0 && s->metric == 3) store_lor_out_(out, s->dim);
     pthread_rwlock_unlock(&s->lock);
     return r >= 0 ? 0 : -1;
 }

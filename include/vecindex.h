@@ -61,6 +61,15 @@ typedef struct vi_db vi_db;
  * returns a dot or L2 store's vectors as they came, a cosine store's normalised. */
 #define VI_DOT    4
 #define VI_L2     8
+/* VI_LORENTZ: points of the Lorentz model of hyperbolic space, x[0] the time coordinate, on the upper sheet: x[0] > 0
+ * and x0^2 > x1^2 + ... (a vector off it is refused, a query too). Any curvature: a point is taken as its ray's point on
+ * the unit hyperboloid, which keeps every ranking (for curvature -1/c the true distance is sqrt(c) x the score). The
+ * score is the hyperbolic distance on the unit hyperboloid, smaller is closer - best first, as L2. Rows are kept as
+ * tangent vectors at the origin (direction and radius), so the index finds candidates by direction - near points in
+ * hyperbolic space share one - and re-scores them exactly; filters, MMR, the context and the exact search work on it.
+ * vi_get gives the point on the unit hyperboloid. The embeddings must come from a hyperbolic model (HypRAG's HyTE,
+ * say): a Euclidean model's vectors are not points of it. */
+#define VI_LORENTZ 16
 
 /* The library's version, VI_VERSION of the build. */
 VI_API const char *vi_version(void);

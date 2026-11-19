@@ -34,9 +34,7 @@ static i32 store_search_impl_(RagStore *s, const f32 *query, i32 k,
     if (scr_get_(&scr, scr_need_((size_t)dim * sizeof(f32)) + scr_need_((size_t)Rs * sizeof(i32))) != 0) { pthread_rwlock_unlock(&s->lock); return 0; }
     qn = (f32 *)scr_take_(&scr, (size_t)dim * sizeof(f32));
     rows = (i32 *)scr_take_(&scr, (size_t)Rs * sizeof(i32));
-    memcpy(qn, query, (size_t)dim * sizeof(f32));
-    qlen = (f32)eng_sqrt_(eng_ssq_(qn, dim));
-    store_normalise_(qn, dim);
+    qlen = store_query_prep_(s, query, qn);
     if (s->tune_target > 0.0f) store_qlog_(s, qn);
     mcol = store_tqcol_(&s->metac);
     memset(&tf, 0, sizeof(tf));
@@ -160,7 +158,7 @@ void store_search_batch(RagStore *s, const f32 *Q, i32 nq, i32 k, i64 *out_ids, 
     for (i = 0; i < nq; ++i) {                                   /* a query that is not finite: scanned as zeros */
         f32 *q = qn + (size_t)i * dim;
         if (!store_finite_(q, dim)) { memset(q, 0, (size_t)dim * sizeof(f32)); ql[i] = 0.0f; continue; }
-        ql[i] = (f32)eng_sqrt_(eng_ssq_(q, dim)); store_normalise_(q, dim);
+        ql[i] = store_query_prep_(s, q, q);
     }
     pthread_rwlock_rdlock(&s->lock);
     if (s->tune_target > 0.0f) for (i = 0; i < nq; i += 1 + nq / STORE_QLOG) store_qlog_(s, qn + (size_t)i * dim);

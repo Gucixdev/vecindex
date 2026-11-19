@@ -73,6 +73,11 @@ Done since 2026-11-19 (built and its own test run here, `tests/rag_test.c` under
   > >= in, not in, has, and, or, not, parentheses) compiled to a postfix program and tested inside the scan through
   `TqFilt.ok`; `vi_search_filter`, `vi_match`, and the filter of `vi_search_mmr` and `vi_context`.
   `tests/meta_test.c` (42 checks, run here, ASan and UBSan too)
+- the hyperbolic metric (`VI_LORENTZ`, metric 3): rows as tangent vectors at the origin, the exact score a
+  cancellation-free line in the cosine (so the certified search holds), the distance out. `tests/lorentz_test.c`:
+  recall@10 500/500 after a build on 20,000 random points (33 dims); real hyperbolic embeddings not measured yet. (A
+  first try - an inner-product store with x0 negated - gave 47/500 after a build: the index ranks by direction, and
+  Lorentz products are negative and fall with the norm)
 
 Open, in the order they are planned:
 1. **The rest of the code off malloc** (158 call sites): the store (`store.c`, `store_disk.c`, `store_exact.c`,

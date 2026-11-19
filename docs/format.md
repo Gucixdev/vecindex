@@ -43,6 +43,7 @@ that change, report a damaged journal (`vi_integrity`: `journal_damaged`) and ke
 | 9 | 0.3.0, and 0.4.0 for stores without what v10 adds | block digests, Reed-Solomon parity, the rows' checks, the metric, labels | yes: 0.3.0 (cosine; int8 rows with L2), 0.4.0 |
 | 10 | 0.4.0 | numbers, namespaces, CRCs of the texts | yes: 0.4.0 (cosine; int8 rows with L2) |
 | 10, flag 64 | after 0.4.0, not released | the scan index carries its top cells (`src/tq_top.c`); only a store of 16384 clusters or more (about 16M rows) has them, so smaller files are unchanged; 0.4.0 refuses the flag | no: `tests/top_test.c` saves and loads one |
+| 10, metric 3 | after 0.4.0, not released | the hyperbolic metric (`VI_LORENTZ`): the extension's metric word 3, rows kept as tangent vectors at the origin (direction in the rows, the radius in the lengths column the dot and L2 stores already have); 0.4.0 refuses the metric | no: `tests/lorentz_test.c` saves and loads one |
 | 10, flag 128 | after 0.4.0, not released | payload fields (`src/store_meta.c`): after the texts' CRCs, a table of 16 slots of a name (32 bytes, 0-padded, the declared ones first) and a type (u64: 1 int, 2 float, 3 string), then for each declared field a column of u64 a row, 64-byte aligned; only a store with fields has it; 0.4.0 refuses the flag | no: `tests/meta_test.c` saves, compacts and loads one |
 
 Journals: `VXJ1` (bound to the file by its size), `VXJ2` (by the stamp), `VXJ3` (a header with its CRC, then frames

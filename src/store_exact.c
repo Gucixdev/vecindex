@@ -157,6 +157,7 @@ static void store_ex_line_(const RagStore *s, f32 qlen, i32 r, f64 *a, f64 *b)
     if (!s->metric) { *a = 2.0; *b = -2.0; return; }
     vl = STORE_NRM(s, r);
     if (s->metric == 1) { *a = (f64)qlen * vl; *b = 0.0; return; }
+    if (s->metric == 3) { store_lor_line_(qlen, (f32)vl, a, b); return; }
     *a = 2.0 * (f64)qlen * vl; *b = -((f64)qlen * qlen + vl * vl);
 }
 
@@ -411,7 +412,7 @@ i32 store_search_exact_batch(RagStore *s, const f32 *queries, i32 nq, i32 k, i64
     i32 dim = s->dim, q0, q, i, rc = 0, nqb, *hv;
     size_t lsz;
     Scr ba;
-    f32 *qn, *isc;
+    f32 *qn, *isc, *ql;
     i64 *irow, *chk;
     u8 *lut;
     StoreExQy *qy;
@@ -422,8 +423,9 @@ i32 store_search_exact_batch(RagStore *s, const f32 *queries, i32 nq, i32 k, i64
     lsz = s->tq ? (size_t)(s->tq->vd * 16 + 32) : 1;
     if (scr_get_(&ba, scr_need_((size_t)nq * dim * sizeof(f32)) + scr_need_((size_t)nqb * sizeof(StoreExQy)) + scr_need_((size_t)nqb * k * sizeof(i64))
                       + scr_need_((size_t)nqb * k * sizeof(f32)) + scr_need_((size_t)nq * sizeof(i32)) + scr_need_((size_t)nq * sizeof(i64))
-                      + scr_need_((size_t)nqb * lsz)) != 0) { pthread_rwlock_unlock(&s->lock); return -1; }
+                      + scr_need_((size_t)nqb * lsz) + scr_need_((size_t)nq * sizeof(f32))) != 0) { pthread_rwlock_unlock(&s->lock); return -1; }
     qn = (f32 *)scr_take_(&ba, (size_t)nq * dim * sizeof(f32));
+    ql = (f32 *)scr_take_(&ba, (size_t)nq * sizeof(f32));
     qy = (StoreExQy *)scr_take_(&ba, (size_t)nqb * sizeof(StoreExQy));
     irow = (i64 *)scr_take_(&ba, (size_t)nqb * k * sizeof(i64)); isc = (f32 *)scr_take_(&ba, (size_t)nqb * k * sizeof(f32));
     hv = (i32 *)scr_take_(&ba, (size_t)nq * sizeof(i32)); chk = (i64 *)scr_take_(&ba, (size_t)nq * sizeof(i64));
@@ -431,15 +433,13 @@ i32 store_search_exact_batch(RagStore *s, const f32 *queries, i32 nq, i32 k, i64
     memset(qy, 0, (size_t)nqb * sizeof(StoreExQy)); memset(hv, 0, (size_t)nq * sizeof(i32)); memset(chk, 0, (size_t)nq * sizeof(i64));
     for (q = 0; rc == 0 && q < nq; ++q) {
         f32 *v = qn + (size_t)q * dim;
-        memcpy(v, queries + (size_t)q * dim, (size_t)dim * sizeof(f32));
-        store_normalise_(v, dim);
+        ql[q] = store_query_prep_(s, queries + (size_t)q * dim, v);
     }
     for (q0 = 0; rc == 0 && q0 < nq; q0 += nqb) {
         i32 m = nq - q0 < nqb ? nq - q0 : nqb;
         for (q = 0; q < m; ++q) {
-            const f32 *v = queries + (size_t)(q0 + q) * dim;
             qy[q].qn = qn + (size_t)(q0 + q) * dim;
-            qy[q].qlen = (f32)eng_sqrt_(eng_ssq_(v, dim));
+            qy[q].qlen = ql[q0 + q];
             qy[q].irow = irow + (size_t)q * k; qy[q].isc = isc + (size_t)q * k;
             if (s->tq && s->built_upto > 0) { qy[q].lut = lut + (size_t)q * lsz; if (store_ex_query_(s->tq, qy[q].qn, qy[q].lut, &qy[q].eq) != 0) rc = -1; }
         }

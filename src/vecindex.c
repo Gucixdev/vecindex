@@ -78,7 +78,14 @@ static int vi_vec_ok_(const vi_db *db, const float *v, const char *what)
         if (!(v[i] - v[i] == 0.0f)) { sprintf(nb, "%d", i); return vi_fail_(-1, what, " has a NaN or an infinity at index ", nb); }
         if (v[i] != 0.0f) any = 1;
     }
-    return any ? 0 : vi_fail_(-1, what, " is all zeros: it has no direction to compare", (const char *)0);
+    if (!any) return vi_fail_(-1, what, " is all zeros: it has no direction to compare", (const char *)0);
+    if (db->s->metric == 3) {                                        /* a point of the hyperboloid's upper sheet */
+        f64 sp = 0.0;
+        for (i = 1; i < db->s->dim; ++i) sp += (f64)v[i] * v[i];
+        if (!(v[0] > 0.0f) || !((f64)v[0] * v[0] > sp))
+            return vi_fail_(-1, what, " is not a point of the Lorentz model: x[0] > 0 and x0^2 > x1^2 + ... are needed", (const char *)0);
+    }
+    return 0;
 }
 
 /* why a row could not be read: none with that id, or it failed its check */
@@ -144,14 +151,15 @@ VI_API vi_db *vi_open(const char *path, int dim, int flags)
         }
     } else
         db->s = store_new(&db->arena, (i32)dim);
-    {   int want = (flags & VI_DOT) ? 1 : ((flags & VI_L2) ? 2 : 0);   /* the metric: asked for, or the file's */
-        static const char *const mn[3] = { "cosine", "dot", "L2" };
-        if ((flags & VI_DOT) && (flags & VI_L2)) {
-            vi_fail_(0, "VI_DOT and VI_L2 together: a store has one metric", (const char *)0, (const char *)0);
+    {   int want = (flags & VI_DOT) ? 1 : ((flags & VI_L2) ? 2 : ((flags & VI_LORENTZ) ? 3 : 0));   /* asked for, or the file's */
+        int have = db->s->metric;
+        static const char *const mn[4] = { "cosine", "dot", "L2", "Lorentz" };
+        if (((flags & VI_DOT) != 0) + ((flags & VI_L2) != 0) + ((flags & VI_LORENTZ) != 0) > 1) {
+            vi_fail_(0, "VI_DOT, VI_L2 and VI_LORENTZ: one of them, a store has one metric", (const char *)0, (const char *)0);
             store_destroy(db->s); arena_free(&db->arena); free(db->path); free(db); return (vi_db *)0;
         }
-        if (exists && want && want != db->s->metric) {
-            vi_fail_(0, path, " is a ", mn[db->s->metric]);
+        if (exists && want && want != have) {
+            vi_fail_(0, path, " is a ", mn[have]);
             {   char *e = vi_ebuf_(); if (e && strlen(e) + 40 < VI_EMAX) { strcat(e, " store, not "); strcat(e, mn[want]); } }
             store_destroy(db->s); arena_free(&db->arena); free(db->path); free(db); return (vi_db *)0;
         }
@@ -269,8 +277,8 @@ VI_API int vi_dir_search(vi_dir *d, const float *query, int k, vi_i64 *ids, floa
         if ((n = vi_search(db, query, k, ci, cs)) < 0) { r = -1; break; }
         for (i = 0; i < n; ++i) {                                /* into the merged top k, best first */
             float x = cs[i];
-            if (have == k && (metric == 2 ? x >= scores[k - 1] : x <= scores[k - 1])) break;   /* the rest are worse */
-            for (j = have < k ? have++ : k - 1; j > 0 && (metric == 2 ? scores[j - 1] > x : scores[j - 1] < x); --j) {
+            if (have == k && (metric >= 2 ? x >= scores[k - 1] : x <= scores[k - 1])) break;   /* the rest are worse */
+            for (j = have < k ? have++ : k - 1; j > 0 && (metric >= 2 ? scores[j - 1] > x : scores[j - 1] < x); --j) {
                 ids[j] = ids[j - 1]; scores[j] = scores[j - 1];
             }
             ids[j] = ci[i]; scores[j] = x;

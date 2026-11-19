@@ -560,7 +560,7 @@ static i32 store_write_file_(RagStore *s, const char *path, const char *tmp, u64
     if (!f) return -1;
     hdr[0] = (i32)STORE_MAGIC; hdr[2] = s->dim; hdr[3] = live;
     ext[0] = (s->vbytes == 1 ? 1 : 0) | (s->has_text ? 2 : 0) | (s->nlab ? 4 : 0) | (s->has_num ? 8 : 0) | (s->has_ns ? 16 : 0) | (s->has_text ? 32 : 0)
-           | (s->nfld ? STORE_F_FIELDS : 0) | (kind == 2 && s->tq->nc > 1 && s->tq->top ? STORE_F_TOP : 0); ext[1] = s->metric;   /* v9: 0 cosine, 1 dot, 2 L2 */
+           | (s->nfld ? STORE_F_FIELDS : 0) | (kind == 2 && s->tq->nc > 1 && s->tq->top ? STORE_F_TOP : 0); ext[1] = s->metric;   /* v9: 0 cosine, 1 dot, 2 L2; 3 hyperbolic (a reader before it refuses the file) */
     hdr[1] = (ext[0] & ~STORE_FLAGS_V9) ? STORE_VERSION10 : STORE_VERSION9;   /* the oldest version that holds it */
     ext[2] = (i32)(u32)(stamp & 0xffffffffu); ext[3] = (i32)(u32)(stamp >> 32);
     bad = STORE_W32(f, hdr, 4) || STORE_W32(f, ext, 4) || store_goal_w_(f, &s->goal)
@@ -1045,7 +1045,7 @@ static RagStore *store_load_v5_(Arena *a, const char *path, FILE *f, const i32 *
     o_kind = o_meta + (size_t)live * 8;
     if (STORE_V9UP(hdr[1])) { o_rck = STORE_AL(o_kind); o_kind = o_rck + (size_t)live * 4; }   /* the rows' checks */
     if (STORE_V9UP(hdr[1]) && ext[1]) {                    /* a dot or L2 store: the rows' lengths */
-        if (ext[1] < 0 || ext[1] > 2) { fclose(f); store_destroy(s); return (RagStore *)0; }
+        if (ext[1] < 0 || ext[1] > 3) { fclose(f); store_destroy(s); return (RagStore *)0; }
         s->metric = ext[1];
         o_nrm = STORE_AL(o_kind); o_kind = o_nrm + (size_t)live * 4;
     }

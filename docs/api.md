@@ -274,6 +274,20 @@ fuses them by rank (reciprocal rank fusion with weights measured on Wikipedia: w
 side whose best hit stands well clear of its runner-up), so an exact name, a number or a rare word is found where the
 embedding blurs it. Pass `NULL` for the words to search by the vector alone, or for the vector to search by words.
 
+### Hyperbolic embeddings
+
+`vi_open(path, dim, VI_LORENTZ)` makes a store for points of the Lorentz model of hyperbolic space, the geometry of
+hierarchies: x[0] the time coordinate, x[0] > 0 and x0^2 > x1^2 + ... (any curvature: a point is taken as its
+ray's point on the unit hyperboloid, which keeps every ranking). Scores are the hyperbolic distance, smaller is
+closer, best first. A row is kept as its tangent vector at the origin, direction and radius, so the index finds
+candidates by direction - near points in hyperbolic space share one, the more so the farther out - and re-scores
+them by `cosh d - 1 = 2 sinh^2((rq - rx)/2) + sinh rq sinh rx (1 - cos)`, every term non-negative, so near points
+cost no cancellation. That score is a line in the cosine, which is all the certified search needs, so
+`vi_search_exact` works here too. Measured on 20,000 random points in 33 dimensions (`tests/lorentz_test.c`):
+recall@10 500/500 against brute force after a build. The vectors must come from a hyperbolic model, such as
+HypRAG's HyTE: a Euclidean model's vectors are not points of it. MMR's diversity on such a store compares the
+points' coordinates, not hyperbolic angles.
+
 ### Fields and filters
 
 A row can carry up to 16 named fields of its own: ints (a year, a size, a flag), floats (a score, a price) and
