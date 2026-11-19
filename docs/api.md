@@ -274,6 +274,29 @@ fuses them by rank (reciprocal rank fusion with weights measured on Wikipedia: w
 side whose best hit stands well clear of its runner-up), so an exact name, a number or a rare word is found where the
 embedding blurs it. Pass `NULL` for the words to search by the vector alone, or for the vector to search by words.
 
+### The graph beside a store
+
+`include/graph.h` is a module of its own (`src/graph.c`, built into libvecindex): directed, typed (0 to 31),
+weighted links between ids - a store's chunks, documents, memories - in a file of its own (`NAME.vxg`). It keeps only
+the ids, so the store does not change, and a walk starts from whatever a search found:
+
+```c
+vg_graph *g = vg_open("docs.vxg");
+vg_link(g, chunk, page, 1, 1.0f);                        /* 1: references, as the caller names its types */
+n = vi_search(db, q, 8, ids, sc);
+n = vg_expand(g, ids, (const float *)0, n, (const vg_expand_opts *)0, out, osc, odepth, 64);
+/* or what a random walk that keeps going back to the hits spends its time on: */
+n = vg_ppr(g, ids, (const float *)0, n, (const vg_ppr_opts *)0, out, osc, 64);
+```
+
+`vg_expand` walks level by level (`max_depth`, `max_nodes`, a mask of types, a direction, `min_weight`, `decay` a
+step) and gives back the seeds too, best score first. `vg_ppr` is personalized PageRank by local push (Andersen,
+Chung and Lang): it touches only the neighbourhood the mass reaches, bounded by `eps` and `max_nodes`; against power
+iteration on a 20-node graph it is off by 5e-8 (`tests/graph_test.c`). The file is a log of 32-byte records, each
+with a CRC-32C: a torn or damaged end is cut at the last whole record, `vg_sync` makes writes durable, `vg_compact`
+rewrites it with the live links only (a temporary file, fsync, rename). Memory from the OS's pages, no recursion.
+When a row is deleted from the store, `vg_drop` its id.
+
 ### Hyperbolic embeddings
 
 `vi_open(path, dim, VI_LORENTZ)` makes a store for points of the Lorentz model of hyperbolic space, the geometry of

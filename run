@@ -163,8 +163,8 @@ echo "C API: libvecindex.so, libvecindex.a"
 if command -v nm >/dev/null; then
     # __gcov_* and mangle_path come from libgcov when tools/cov builds with --coverage
     extra=$(nm -D --defined-only "$OUT/libvecindex.so" | awk '{print $3}' \
-            | grep -v -E '^(vi_[a-z_]+|_init|_fini|_edata|_end|__bss_start|__gcov_[a-z_]+|mangle_path)$' || true)
-    if [[ -z $extra ]]; then echo "  ok   only vi_* exported"; else echo "  FAIL exported beyond vi_*: $extra"; fail=1; rec "C API exports" FAIL; fi
+            | grep -v -E '^(vi_[a-z_]+|vg_[a-z_]+|_init|_fini|_edata|_end|__bss_start|__gcov_[a-z_]+|mangle_path)$' || true)
+    if [[ -z $extra ]]; then echo "  ok   only vi_* and vg_* exported"; else echo "  FAIL exported beyond vi_* and vg_*: $extra"; fail=1; rec "C API exports" FAIL; fi
 fi
 "$CC" "${CFLAGS[@]}" -Iinclude tests/api_test.c -L"$OUT" -lvecindex -lm -lpthread -o "$OUT/api_test_so" \
     && LD_LIBRARY_PATH="$OUT" "./$OUT/api_test_so" 2>&1 | tee "$OUT/log_capi.txt" && rec "C API shared" ok "$(notes "C API")" || { echo "  ^ C API (shared) FAILED"; fail=1; rec "C API shared" FAIL; }
@@ -179,6 +179,9 @@ fi
 "$CC" "${CFLAGS[@]}" -Iinclude tests/lorentz_test.c "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/lorentz_test" \
     && "./$OUT/lorentz_test" 2>&1 | tee "$OUT/log_lorentz.txt" && rec "Lorentz" ok "$(okn "$OUT/log_lorentz.txt") checks: hyperbolic metric against brute force" \
     || { echo "  ^ Lorentz FAILED"; fail=1; rec "Lorentz" FAIL; }
+"$CC" "${CFLAGS[@]}" -Iinclude tests/graph_test.c "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/graph_test" \
+    && "./$OUT/graph_test" 2>&1 | tee "$OUT/log_graph.txt" && rec "graph" ok "$(okn "$OUT/log_graph.txt") checks: links, expand, PPR against power iteration, the log file" \
+    || { echo "  ^ graph FAILED"; fail=1; rec "graph" FAIL; }
 echo
 
 # ---- compatibility: every release's files open with every value; a newer build's are refused; the API of every

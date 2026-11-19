@@ -1130,3 +1130,6 @@ VI_API int vi_search_where(vi_db *db, const float *query, int k, const char *all
     vi_cos_(db, scores, n);
     return n;
 }
+
+/* the graph beside a store (include/graph.h): a module of its own, built into the same library */
+#include "graph.c"

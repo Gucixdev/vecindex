@@ -3,11 +3,11 @@
 A vector database in C89 for RAG and LLMs: approximate nearest-neighbour search on a TurboQuant-style rotated
 fast-scan - 4-bit codes, or 2-bit, or 1-bit (alone, or as a first pass in front of the 4-bit ones: the cascade) -
 over IVF clusters, with the candidates re-scored exactly from f32 or int8 rows; BM25 hybrid search; cosine, inner
-product, Euclidean or hyperbolic (Lorentz) distance; string keys, labels in a hierarchy, typed fields a row (int, float, string) with a
-filter language tested inside the scan (`lang = "c" and year >= 2020 and not draft`), namespaces and grouped search
-(one hit a document); search with a proof (`vi_search_exact`: the exact k best, every other row
-ruled out by a bound proved in Lean); and what a RAG pipeline does with the hits before a model reads them: diverse
-hits without near-duplicates (MMR), the chunks around a hit, and a context built to a byte budget (`vi_context`).
+product, Euclidean or hyperbolic (Lorentz) distance; string keys, labels in a hierarchy, typed fields a row with a
+filter language tested inside the scan (`lang = "c" and year >= 2020 and not draft`), namespaces, grouped search;
+search with a proof (`vi_search_exact`: the exact k best, every other row ruled out by a bound proved in Lean); MMR
+without near-duplicates, the chunks around a hit and a context built to a byte budget (`vi_context`); and a graph
+beside the store (`include/graph.h`): typed links between rows, walks and personalized PageRank.
 
 It runs inside a program in any language through its C API (`include/vecindex.h`, one shared or static library), or
 as `vserv`, a small epoll server (Unix and TCP sockets, a binary protocol and HTTP/1.1, TLS 1.2 through the vendored
