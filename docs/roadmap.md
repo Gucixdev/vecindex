@@ -187,4 +187,14 @@ Open from before, not yet placed in that order:
 - SSD and SATA disks as the index's home, not only RAM (cold rows are on disk already; codes read by block next)
 - a fuzzer for the store's file loader and the server's protocols (the fuzzers left with the agent layer)
 - packages over the C ABI for Python, Rust and Go (the bindings in `docs/api.md` are run by hand)
+- space and time (asked 2026-11-19, a "WorldLayer" proposal): entities, observations and events where they happened
+  and when, for a RAG over places and history. Not a new engine: it is fields, id ranges and the graph that exist.
+  An observation is a row `entity << 20 | n` with fields `lat`, `lon` (fixed point, int), `t` and `kind`; a track is
+  `vi_range` of an entity; a box and a time window are the filter (`lat >= .. && t >= ..`); the state at a time is
+  the filter `t <= T` with `vi_search_grouped` shift 20 (one row an entity: still needs "the latest", not "the
+  nearest"); related events are `vg_link`s and `vg_expand`. New, in this order: `kind` as a convention of every
+  ingested fact - observed, estimated, interpolated, simulated, derived - carried into `vi_context` so a model never
+  reads a guess as a fact; a geo cell (a Z-order of lat/lon, int field) for coarse prefilters and a radius filter
+  (haversine) in the filter language; latest-per-group in `vi_search_grouped`; a `vi_context` that puts place, time
+  and kind beside each hit. Data sources (ADS-B, AIS, quakes) stay outside, as embedding models do
 - the constraint over all of it: nothing that needs an IT department to run

@@ -16,9 +16,8 @@ BearSSL). Nothing beyond libc, libm and pthreads (and BearSSL for TLS).
 The 1-8 bit packed quantizers (q1-q5, qmix) of the first engine are retired to `trash/`: nothing in `src/` uses
 them. What a store scans is 4, 2 or 1 bit a dimension (`vi_set_layout`), what it re-scores f32 or int8.
 
-Its home is this repository. It grew in [holyc](https://github.com/Gucixdev/holyc) as `ragdb/`, and has moved
-between the two since; the note database and agent memory that grew on top of it are
-[`examples/agent_launcher`](examples/agent_launcher), a program on vecindex as a library, as is [`examples/pocket`](examples/pocket).
+It grew in [holyc](https://github.com/Gucixdev/holyc) as `ragdb/`. Programs on it as a library: notes and agent
+memory, [`examples/agent_launcher`](examples/agent_launcher); phone photo cleanup, [`examples/pocket`](examples/pocket).
 
 ## Layout
 
