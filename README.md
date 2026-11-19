@@ -73,6 +73,7 @@ For an LLM, each row can carry its text: `vi_add_text` with ids made as `doc << 
 best hits, diverse and without near-duplicates, each with the chunks around it, one span of unbroken text per run of
 a document's chunks, cut to the bytes the model may read - or the parts of it on their own: `vi_search_hybrid` (the
 vector and BM25 over the texts, fused by rank), `vi_search_mmr`, `vi_neighbors`, `vi_range` (a whole document).
+`vi_ingest_file` (`include/ingest.h`) puts a `.md` or `.json` file in, sections as pages, the model a callback.
 `.build/vfind docs.vxi` searches those texts as you type, like fzf: a few lines of each hit, Enter opens the whole
 document, Enter again prints the choice. The same from Python (ctypes), Go (cgo) and Rust (`extern "C"`), every
 function, texts, and how durability works: [docs/api.md](docs/api.md). Inside a C program the library can also be

@@ -77,6 +77,12 @@ Done since 2026-11-19 (built and its own test run here, `tests/rag_test.c` under
   blank line > line end > sentence end > space, UTF-8 whole, overlap; search by page = `vi_search_grouped` shift 10.
   `tests/chunk_test.c` 12 checks. Fields in write batches (`vi_batch_set_int/float/str`, the journal's `V` record
   inside the batch's frame; meta_test +6, the replay of a batch-only field checked)
+- files in (`include/ingest.h`, `src/ingest.c`; asked: ".md and .json in C, the rest in Python by the same
+  technique"): Markdown front matter to fields and headings to sections, JSON/JSONL to `path: value` elements, one
+  batch a file (replace on re-ingest, nothing on a parse error), the model a callback. `tests/ingest_test.c` 24 checks
+  with 3000 mutated inputs under ASan/UBSan; Python `ingest_text`/`ingest_file`/`ingest_remove` and
+  `vecindex.convert` (txt, HTML, PDF by pages, `register` for more), 7 tests. Next: the same in Go and Rust
+  bindings, vserv's `ingest` command
 - the graph (`include/graph.h`, `src/graph.c`, a module of its own): typed, weighted links between ids in a log
   file with CRCs (torn tail cut, compaction by rename), `vg_links`, `vg_expand` (levels, types, direction, weights,
   budget), `vg_ppr` (personalized PageRank by local push). `tests/graph_test.c` (29 checks; PPR within 5e-8 of

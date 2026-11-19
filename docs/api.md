@@ -249,6 +249,45 @@ for (i = 0; i < n && i < 256; ++i) {
 n = vi_search_grouped(db, q, 5, 10, ids, sc);                /* the five best pages, one chunk each */
 ```
 
+## Files in: Markdown and JSON (`include/ingest.h`)
+
+`vi_ingest_file` puts a `.md`, `.json`, `.jsonl` or `.ndjson` file into a store in one write batch: what the file
+put in before goes, the new rows come, and a file that fails to parse leaves the store as it was (the error names the
+byte). The file's name owns 1024 document numbers (`vi_ingest_range`); the rows' ids are `VI_ID(doc, page, chunk)`,
+so search by section is `vi_search_grouped` shift 10 and a whole file is one id range.
+
+- Markdown: front matter (`---` ... `---`) becomes fields; each ATX heading outside a code fence starts a section,
+  which is a page; the section's heading path (`# Guide > ## Install`) goes in front of each chunk for the model
+  only, the stored text is the file's own.
+- JSON: a top-level array is one document element per item, anything else one element; each element is a page of
+  `path: value` lines (`author.name: Ada`, array indices left out). JSONL: one element a line.
+- `fields` lists keys kept as payload fields (`"year,author.name"` -> `year`, `author_name`); every row gets `path`.
+
+```c
+vi_ingest_opts o;
+vi_ingest_stats st;
+vi_ingest_defaults(&o);
+o.embed = my_model;                 /* int my_model(void *ctx, const char *text, int len, float *out, int dim) */
+o.embed_ctx = model;                /* default embed: vi_embed_hash, words and word pairs (a test model, no ML) */
+o.fields = "year,tags";
+if (vi_ingest_file(db, "notes/guide.md", &o, &st) != 0) fprintf(stderr, "%s\n", vi_error());
+vi_ingest_text(db, "api.json", buf, len, VI_JSON, &o, &st);   /* text from anywhere, under a name */
+vi_ingest_remove(db, "notes/guide.md");                        /* the rows it put in, all of them */
+```
+
+Every other format is the same technique one level up: convert it to Markdown (headings become sections, `\f` or
+`# Page N` pages) or to JSONL (records), then `vi_ingest_text`. The Python package does that for `.txt`, `.html` and
+`.pdf` (`pdftotext`) in `vecindex.convert`, takes any Python function as the model, and a new format is one function:
+
+```python
+db.ingest_file("paper.pdf", embed=model.encode)           # each PDF page a section, so a hit says its page
+db.ingest_text("crm.jsonl", "\n".join(json.dumps(r) for r in rows), "jsonl", fields="year")
+
+@vecindex.convert.register(".docx")
+def docx(path):
+    return subprocess.run(["pandoc", "-t", "gfm", path], capture_output=True, text=True, check=True).stdout
+```
+
 ## Texts: from a small chunk to the whole document
 
 A model answers better from a whole passage than from the sentence that matched, and an embedding matches a short

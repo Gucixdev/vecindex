@@ -2,8 +2,9 @@
 
 | path | what is there |
 |---|---|
-| `include/vecindex.h` | the C API: one opaque handle, plain C types; `libvecindex.so` / `.a` export nothing else but it and `graph.h` |
+| `include/vecindex.h` | the C API: one opaque handle, plain C types; `libvecindex.so` / `.a` export nothing else but it, `graph.h` and `ingest.h` |
 | `include/graph.h` | the graph beside a store: typed, weighted links between ids, `vg_expand` and personalized PageRank (`src/graph.c`, built into the same library) |
+| `include/ingest.h` | documents into a store: `.md` and `.json`/`.jsonl` parsed in C, the embedding model a callback (`src/ingest.c`, built into the same library) |
 | `src/` | the library and the programs: headers, quantizers, indexes, the store, the C API, `vserv.c`, `vfind.c` |
 | `tests/` | one self-test per module (`NAME_test.c`), plus the crash and stress tests, the server's tests, the damage battletest (`battle_damage.c`) and the fuzz targets (`fuzz_*.c`, their seeds and every input that once failed in `tests/fuzz/`) |
 | `bench/` | benchmark programs in C; `./run compare` runs every measurement in [docs/benchmarks.md](docs/benchmarks.md) |
@@ -28,5 +29,6 @@ part of `LAYER.c`, which includes it; it is not compiled on its own.
 | `store.c`, `store_tune.c`, `store_live.c`, `store_search.c`, `store_meta.c`, `store_text.c`, `store_rag.c`, `store_disk.c` | the vector store: rows, ids, build; self-tuning; live mode; search; payload fields and their filters; texts, id ranges and hybrid search; RAG (MMR, near-duplicates, neighbour chunks, a context to a byte budget); the file and its journal |
 | `vecindex.c` | the C API of `include/vecindex.h` over the store |
 | `graph.c` | the graph of `include/graph.h`: its own memory, its own file (a log of CRC'd records), no part of the store |
+| `ingest.c` | the ingest of `include/ingest.h`: front matter and ATX headings into sections (pages), an iterative JSON parser (its own 64-level stack), one write batch a file, the hash embedder; only the public API underneath |
 | `vfind.c` | search a store's texts as you type, like fzf; Enter opens the whole document |
 | `vserv.c`, `vserv_proto.c`, `vserv_text.c`, `vserv_log.c`, `vserv_pem.c` | the server: sockets, workers, TLS; the line, binary and HTTP protocols; texts and JSON; the log; certificates and keys |

@@ -185,6 +185,9 @@ fi
 "$CC" "${CFLAGS[@]}" -Iinclude tests/chunk_test.c "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/chunk_test" \
     && "./$OUT/chunk_test" 2>&1 | tee "$OUT/log_chunk.txt" && rec "chunks" ok "$(okn "$OUT/log_chunk.txt") checks: pages, boundaries, UTF-8, overlap, search by page" \
     || { echo "  ^ chunks FAILED"; fail=1; rec "chunks" FAIL; }
+"$CC" "${CFLAGS[@]}" -Iinclude tests/ingest_test.c "$OUT/libvecindex.a" -lm -lpthread -o "$OUT/ingest_test" \
+    && "./$OUT/ingest_test" 2>&1 | tee "$OUT/log_ingest.txt" && rec "ingest" ok "$(okn "$OUT/log_ingest.txt") checks: Markdown sections, JSON/JSONL, fields, replace, 3000 mutated inputs" \
+    || { echo "  ^ ingest FAILED"; fail=1; rec "ingest" FAIL; }
 echo
 
 # ---- compatibility: every release's files open with every value; a newer build's are refused; the API of every

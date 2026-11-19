@@ -1242,3 +1242,6 @@ VI_API int vi_search_where(vi_db *db, const float *query, int k, const char *all
 
 /* the graph beside a store (include/graph.h): a module of its own, built into the same library */
 #include "graph.c"
+
+/* documents into a store (include/ingest.h): Markdown and JSON, on the public API above */
+#include "ingest.c"
