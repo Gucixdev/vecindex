@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /bindings/rust
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /bindings/js
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /bindings/python
+    schedule:
+      interval: weekly
