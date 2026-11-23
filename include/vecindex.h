@@ -238,6 +238,30 @@ VI_API int vi_search_hybrid(vi_db *db, const float *query, const char *text, int
  * a shift outside 0-63). */
 VI_API int vi_search_grouped(vi_db *db, const float *query, int k, int shift, vi_i64 *ids, float *scores);
 
+/* Pages: a document is cut into pages at once, a page being a group of chunks. Make the ids
+ *     doc << 20 | page << 10 | chunk        VI_ID(doc, page, chunk): page and chunk 0..1023
+ * and one store answers at three levels: vi_search finds chunks, vi_search_grouped(.., VI_PAGE_SHIFT, ..) the best chunk
+ * of each of the k nearest pages, vi_search_grouped(.., VI_DOC_SHIFT, ..) the best chunk of each of the k nearest
+ * documents. vi_range(db, VI_PAGE_LO(doc, page), VI_PAGE_HI(doc, page), ..) lists one page, VI_DOC_LO / VI_DOC_HI the
+ * document, and vi_delete_range takes the same bounds. Nothing else changed: a store whose ids are the flat
+ * doc << 20 | chunk is already paged (chunk n reads as page n >> 10, chunk n & 1023).
+ * VI_PAGED_ID(doc, n, per_page): the id of the n-th chunk of a document cut into pages of per_page chunks (1..1024), so
+ * chunk 0..per_page-1 is page 0, the next per_page chunks page 1, and so on; n / per_page must stay below 1024. The
+ * macros evaluate their arguments more than once: pass plain values. */
+#define VI_CHUNK_BITS 10
+#define VI_PAGE_BITS 10
+#define VI_PAGE_SHIFT VI_CHUNK_BITS
+#define VI_DOC_SHIFT (VI_CHUNK_BITS + VI_PAGE_BITS)
+#define VI_ID(doc, page, chunk) ((((vi_i64)(doc)) << VI_DOC_SHIFT) | (((vi_i64)(page)) << VI_CHUNK_BITS) | (vi_i64)(chunk))
+#define VI_DOC_OF(id) (((vi_i64)(id)) >> VI_DOC_SHIFT)
+#define VI_PAGE_OF(id) ((((vi_i64)(id)) >> VI_CHUNK_BITS) & (((vi_i64)1 << VI_PAGE_BITS) - 1))
+#define VI_CHUNK_OF(id) (((vi_i64)(id)) & (((vi_i64)1 << VI_CHUNK_BITS) - 1))
+#define VI_PAGE_LO(doc, page) VI_ID(doc, page, 0)
+#define VI_PAGE_HI(doc, page) VI_ID(doc, page, ((vi_i64)1 << VI_CHUNK_BITS) - 1)
+#define VI_DOC_LO(doc) VI_ID(doc, 0, 0)
+#define VI_DOC_HI(doc) VI_ID(doc, ((vi_i64)1 << VI_PAGE_BITS) - 1, ((vi_i64)1 << VI_CHUNK_BITS) - 1)
+#define VI_PAGED_ID(doc, n, per_page) VI_ID(doc, (n) / (per_page), (n) % (per_page))
+
 /* nq queries (queries: nq x dim) on up to threads threads (0: every core); ids and scores (cosines) get k slots a
  * query, a missing hit has id -1 and score -1. 0, or -1 when an argument or a query is wrong. */
 VI_API int vi_search_batch(vi_db *db, const float *queries, int nq, int k, vi_i64 *ids, float *scores, int threads);

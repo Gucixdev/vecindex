@@ -230,6 +230,16 @@ document - `doc << 20 | chunk` - so the chunks around a hit, or all of them, com
 document holds many close chunks, `vi_search_grouped(db, q, k, 20, ids, scores)` returns k documents, each by its
 best chunk, instead of k chunks of the same one.
 
+### Pages
+
+Cut a document into pages as it goes in: ids `doc << 20 | page << 10 | chunk` (`VI_ID(doc, page, chunk)`, page and
+chunk 0-1023, `VI_PAGED_ID(doc, n, per_page)` for "the n-th chunk, pages of per_page"). The same store then answers at
+three levels with the calls above: `vi_search` finds chunks, `vi_search_grouped(db, q, k, VI_PAGE_SHIFT, ...)` the best
+chunk of each of the k nearest pages, `...VI_DOC_SHIFT...` of the k nearest documents. `vi_range` and `vi_delete_range`
+take `VI_PAGE_LO/HI(doc, page)` for one page and `VI_DOC_LO/HI(doc)` for the whole document. The server and the
+bindings need nothing new: `group K 10` is by page, `group K 20` by document. A store with the flat `doc << 20 | chunk`
+ids is already paged (chunk n is page n >> 10); the macros only name the bits.
+
 ```c
 #include "vecindex.h"
 #include <stdio.h>

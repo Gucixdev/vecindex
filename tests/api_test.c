@@ -243,6 +243,34 @@ int main(void)
             check(vi_search_grouped(db, v, 3, 0, gi, gs) == 3 && gi[0] == all[0] && gi[1] == all[1], "vi_search_grouped shift 0: vi_search");
             check(vi_search_grouped(db, v, 3, 64, gi, gs) == -1 && strstr(vi_error(), "shift") != 0, "vi_search_grouped shift 64: refused");
         }
+        {   /* pages: 3 documents of 20 chunks cut into pages of 5, by page and by document */
+            vi_db *m = vi_open((const char *)0, DIM, 0);
+            vi_i64 gi[16], rid[32];
+            float gs[16], q[DIM];
+            int j, d, nr, ok = 1;
+            check(VI_PAGED_ID(7, 0, 5) == VI_ID(7, 0, 0) && VI_PAGED_ID(7, 12, 5) == VI_ID(7, 2, 2) && VI_PAGED_ID(7, 19, 5) == VI_ID(7, 3, 4),
+                  "VI_PAGED_ID: chunk n of pages of 5 lands on page n / 5, chunk n % 5");
+            check(VI_DOC_OF(VI_ID(9, 3, 4)) == 9 && VI_PAGE_OF(VI_ID(9, 3, 4)) == 3 && VI_CHUNK_OF(VI_ID(9, 3, 4)) == 4
+                  && VI_ID(2, 0, 7) == (((vi_i64)2 << 20) | 7), "VI_ID and its parts; page 0 is the flat doc << 20 | chunk");
+            for (j = 0; m && j < 60; ++j) {
+                vec_(7000 + j, w);
+                if (vi_add(m, VI_PAGED_ID(j / 20, j % 20, 5), w) != 0) ok = 0;
+            }
+            check(m != (vi_db *)0 && ok, "60 chunks added under paged ids");
+            vec_(7000 + 33, q);                                      /* document 1, chunk 13: page 2 */
+            nr = m ? vi_range(m, VI_PAGE_LO(1, 2), VI_PAGE_HI(1, 2), rid, 32) : 0;
+            check(nr == 5 && rid[0] == VI_ID(1, 2, 0) && rid[4] == VI_ID(1, 2, 4), "vi_range over one page: its 5 chunks");
+            nr = m ? vi_range(m, VI_DOC_LO(1), VI_DOC_HI(1), rid, 32) : 0;
+            check(nr == 20, "vi_range over one document: its 20 chunks");
+            j = m ? vi_search_grouped(m, q, 12, VI_PAGE_SHIFT, gi, gs) : 0;
+            for (d = 0, ok = 1; d < j; ++d) { int e; for (e = 0; e < d; ++e) ok &= (gi[e] >> VI_PAGE_SHIFT) != (gi[d] >> VI_PAGE_SHIFT); }
+            check(j == 12 && ok && gi[0] == VI_ID(1, 2, 3), "search by page: 12 different pages, the best chunk of the nearest first");
+            j = m ? vi_search_grouped(m, q, 12, VI_DOC_SHIFT, gi, gs) : 0;
+            check(j == 3 && VI_DOC_OF(gi[0]) == 1 && gi[0] == VI_ID(1, 2, 3), "search by document: the 3 documents, document 1 first");
+            check(m && vi_delete_range(m, VI_PAGE_LO(1, 2), VI_PAGE_HI(1, 2)) == 5 && vi_range(m, VI_DOC_LO(1), VI_DOC_HI(1), rid, 32) == 15,
+                  "vi_delete_range takes one page out and leaves the rest of the document");
+            if (m) vi_close(m);
+        }
         {   /* one document crowds the top: 600 chunks next to the query, three more documents further off */
             vi_db *m = vi_open((const char *)0, DIM, 0);
             vi_i64 gi[4];
